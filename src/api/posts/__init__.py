@@ -1,0 +1,3 @@
+"""
+Posts routes and logic.
+"""

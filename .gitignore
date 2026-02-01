@@ -1,0 +1,18 @@
+.venv
+venv
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment files with secrets - don't commit!
+.env.dev
+.env.test
+.env.stage
+.env.prod
+
+# Keep these as templates (create .env.example versions to commit)
+# .env is base template - ok to commit if no secrets
+
+# Log files
+logs/
+*.log
