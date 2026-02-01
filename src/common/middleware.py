@@ -85,3 +85,98 @@ class AccessLogMiddleware(BaseHTTPMiddleware):
             return request.client.host
         
         return "-"
+
+
+class MetricsMiddleware(BaseHTTPMiddleware):
+    """
+    Middleware to collect HTTP metrics automatically.
+    """
+    
+    def __init__(self, app, registry = None):
+        super().__init__(app)
+        from src.common.metrics import REGISTRY
+        self.registry = registry or REGISTRY
+    
+    async def dispatch(self, request: Request, call_next):
+        # Skip metrics collection for the metrics endpoint itself
+        if request.url.path == "/metrics":
+            return await call_next(request)
+        
+        from src.common.metrics import (
+            HTTP_REQUESTS_TOTAL, HTTP_REQUEST_DURATION_SECONDS,
+            HTTP_REQUEST_SIZE_BYTES, HTTP_RESPONSE_SIZE_BYTES,
+            ACTIVE_CONNECTIONS, API_ERRORS_TOTAL
+        )
+        import time
+        
+        # Record start time
+        start_time = time.perf_counter()
+        
+        # Increment active connections
+        ACTIVE_CONNECTIONS.inc()
+        
+        try:
+            # Get request information
+            method = request.method
+            path_template = self._get_path_template(request)
+            
+            # Measure request size
+            request_size = int(request.headers.get('content-length', 0))
+            HTTP_REQUEST_SIZE_BYTES.labels(method=method, endpoint=path_template).observe(request_size)
+            
+            # Process the request
+            response: Response = await call_next(request)
+            
+            # Calculate processing time
+            duration = time.perf_counter() - start_time
+            
+            # Record metrics
+            status_code = str(response.status_code)
+            HTTP_REQUESTS_TOTAL.labels(method=method, endpoint=path_template, status_code=status_code).inc()
+            HTTP_REQUEST_DURATION_SECONDS.labels(method=method, endpoint=path_template).observe(duration)
+            
+            # Measure response size
+            response_size = int(response.headers.get('content-length', 0))
+            if response_size == 0 and hasattr(response, 'body'):
+                # Try to get size from body if content-length not set
+                try:
+                    response_size = len(response.body)
+                except (AttributeError, TypeError):
+                    response_size = 0
+            
+            HTTP_RESPONSE_SIZE_BYTES.labels(method=method, endpoint=path_template).observe(response_size)
+            
+            return response
+            
+        except Exception as e:
+            # Record error metrics
+            error_type = type(e).__name__
+            path_template = self._get_path_template(request)
+            API_ERRORS_TOTAL.labels(error_type=error_type, endpoint=path_template).inc()
+            raise
+        finally:
+            # Decrement active connections
+            ACTIVE_CONNECTIONS.dec()
+    
+    def _get_path_template(self, request: Request) -> str:
+        """
+        Get the path template for the request, falling back to the raw path.
+        This helps group similar paths together (e.g., /users/{id}).
+        """
+        try:
+            # Try to get the route pattern if available
+            if hasattr(request, 'route') and hasattr(request.route, 'path'):
+                return request.route.path
+        except AttributeError:
+            pass
+        
+        # Fallback to raw path
+        path = request.url.path
+        
+        # Simple path normalization for common patterns
+        # Convert paths like /users/123 to /users/{id}
+        import re
+        path = re.sub(r'/\d+', '/{id}', path)
+        path = re.sub(r'/[a-f0-9-]{36}', '/{uuid}', path)  # UUID pattern
+        
+        return path

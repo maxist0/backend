@@ -34,6 +34,9 @@ class Settings(BaseSettings):
     # Access Logging
     ACCESS_LOG_ENABLED: bool = True
     
+    # Metrics
+    METRICS_ENABLED: bool = True
+    
     # App
     DEBUG: bool = False
     APP_NAME: str = "api"
