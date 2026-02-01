@@ -45,6 +45,11 @@ class Settings(BaseSettings):
     PORT: int = 8000
     RELOAD: bool = False
     
+    @property
+    def is_production(self) -> bool:
+        """Check if the application is running in production mode."""
+        return self.ENVIRONMENT == Environment.PROD
+    
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
