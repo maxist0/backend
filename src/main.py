@@ -2,11 +2,14 @@
 
 from contextlib import asynccontextmanager
 import os
-from fastapi import FastAPI
+import time
+from fastapi import FastAPI, Request, Query
+from fastapi.responses import JSONResponse
 from src.common.logging import logger
 from src.common.config import settings
 from src.common.middleware import AccessLogMiddleware, MetricsMiddleware
 from src.common.metrics import init_metrics
+from src.common.responses import ok_response, paginated_response, SuccessResponse, PaginatedResponse
 from src.api.metrics.router import router as metrics_router
 
 
@@ -63,12 +66,17 @@ if settings.METRICS_ENABLED:
     app.include_router(metrics_router,prefix="/metrics", tags=["monitoring"])
 
 
-@app.get("/")
-async def root():
-    """Root endpoint."""
-    return {
+@app.get("/", response_model=SuccessResponse)
+async def root(request: Request):
+    """Root endpoint with standardized response."""
+    start_time = time.time()
+    
+    response_data = {
         "message": "Welcome to the FastAPI application with metrics!",
         "docs_url": "/docs" if not settings.is_production else None,
         "metrics_url": "/metrics" if settings.METRICS_ENABLED else None,
         "health_url": "/health"
     }
+    
+    return ok_response(data=response_data, request=request, start_time=start_time)
+
