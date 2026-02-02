@@ -21,6 +21,14 @@ class Settings(BaseSettings):
     
     # Database
     DATABASE_URL: str = "sqlite:///./dev.db"
+
+    # Cache
+    CACHE_HOST: str = "localhost"
+    CACHE_PORT: int = 6379
+    CACHE_DB: int = 0
+    CACHE_PASSWORD: Optional[str] = None
+    CACHE_MAX_CONNECTIONS: int = 10
+    
     
     # Security
     SECRET_KEY: str = "change-me-in-production"

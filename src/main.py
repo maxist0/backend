@@ -1,20 +1,36 @@
 #src/main.py
 
+"""
+Main application entry point for FastAPI app with metrics and logging.
+Sets up the FastAPI app, middleware, routes, and lifecycle events.
+"""
+
+# Imports
 from contextlib import asynccontextmanager
 import os
 import time
 from fastapi import FastAPI, Request, Query
 from fastapi.responses import JSONResponse
-from src.common.logging import logger
+from src.common.cache import init_cache_pool
+from src.common.logging import get_logger
 from src.common.config import settings
 from src.common.middleware import AccessLogMiddleware, MetricsMiddleware
 from src.common.metrics import init_metrics
-from src.common.responses import ok_response, paginated_response, SuccessResponse, PaginatedResponse
+from src.common.responses import ok_response, SuccessResponse
 from src.api.metrics.router import router as metrics_router
 
+# Logger for this module
+logger = get_logger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """
+    Manage application startup and shutdown events.
+
+    Set up resources like database connections, caches, and logging.
+
+    """
+
     # Startup
 
     # Initialize metrics
@@ -37,46 +53,78 @@ async def lifespan(app: FastAPI):
     logger.info(f"Reload Enabled: {settings.RELOAD}")
 
 
+    ## Initialize DB connection pools and chache
+    app.state.db = None  # Placeholder for DB connection pool
+    #app.state.cache = await init_cache_pool()
+    
     yield
+    
     # Shutdown
-    logger.info("Application shutting down")
+    logger.info("Application shutting down ...")
 
+    ## Close DB connection pools and cache
+    if app.state.db:
+        await app.state.db.close()
+        logger.info("Database connection pool closed.")
+    if app.state.cache:
+        await app.state.cache.close()
+        logger.info("Cache connection pool closed.")
+    
+    logger.info("Application shutdown complete.")
+
+
+## FastAPI Application Instance
+"""
+Create FastAPI application instance with metadata and lifecycle management.
+"""
 
 app = FastAPI(
     title=settings.APP_NAME,
     description=settings.APP_DESCRIPTION,
     version=settings.APP_VERSION,
     lifespan=lifespan,
-    # Disable Swagger UI and ReDoc in production
     docs_url=None if settings.is_production else "/docs",
     redoc_url=None if settings.is_production else "/redoc",
     openapi_url=None if settings.is_production else "/openapi.json",
 )
 
+
+## Middleware Configuration
+"""
+Configure middleware for metrics and access logging.
+"""
+
 # Add metrics middleware (before other middleware for accurate timing)
 if settings.METRICS_ENABLED:
     app.add_middleware(MetricsMiddleware)
-
 # Add access logging middleware
 if settings.ACCESS_LOG_ENABLED:
     app.add_middleware(AccessLogMiddleware)
 
+
+
 # Include API routes
+"""
+Include API routes for metrics and other functionalities.
+"""
 if settings.METRICS_ENABLED:
     app.include_router(metrics_router,prefix="/metrics", tags=["monitoring"])
 
 
+
+# Root Endpoint
+"""
+Define the root endpoint with standardized response.
+"""
 @app.get("/", response_model=SuccessResponse)
 async def root(request: Request):
     """Root endpoint with standardized response."""
     start_time = time.time()
-    
     response_data = {
         "message": "Welcome to the FastAPI application with metrics!",
         "docs_url": "/docs" if not settings.is_production else None,
         "metrics_url": "/metrics" if settings.METRICS_ENABLED else None,
         "health_url": "/health"
     }
-    
     return ok_response(data=response_data, request=request, start_time=start_time)
 
