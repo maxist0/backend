@@ -6,23 +6,71 @@ services:
       dockerfile: Dockerfile
       args:
         ENVIRONMENT: ${ENVIRONMENT:-prod}
-    container_name: fastapi-${ENVIRONMENT:-prod}
+    #container_name: fastapi-${ENVIRONMENT:-prod}
     ports:
-      - "${PORT:-8000}:8000"
-    volumes:
-      - ./logs:/app/logs
+      - 8000:80
     command: ["${ENVIRONMENT:-prod}"]
     restart: ${RESTART_POLICY:-always}
     networks:
       - api-network
+    
+    # --- Kubernetes Spezifische Konfiguration via Labels ---
     labels:
-      - "kompose.image-pull-policy=IfNotPresent"
-    profiles:
-      - test
-      - prod
-      - dev
-      - staging
+      kompose.image-pull-policy: "IfNotPresent"
+    
+    deploy:
+      replicas: 2 
+    
+    environment:
+      - MY_POD_NAME=placeholder_pod
+      - MY_NODE_NAME=placeholder_node
+    depends_on:
+      - redis-primary
+
+  redis-primary:
+    image: redis:latest
+    container_name: redis-primary
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - redis_primary_data:/data
+    restart: ${RESTART_POLICY:-always}
   
+  redis-replica:
+    image: redis:latest
+    depends_on:
+      redis-primary:
+        condition: service_healthy
+    command: redis-server --replicaof redis-primary 6379 --appendonly yes
+    ports:
+      - "6379"
+    deploy:
+      replicas: 2
+    labels:
+      kompose.controller.type: "statefulset"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    volumes:
+      - redis_replica_data:/data
+    restart: ${RESTART_POLICY:-always}
+
+
+
+
+
 networks:
   api-network:
     driver: bridge
+
+volumes:
+  redis_primary_data:
+  redis_replica_data:
