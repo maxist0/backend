@@ -3,6 +3,9 @@ venv
 __pycache__/
 *.pyc
 *.pyo
+*.egg-info/
+dist/
+build/
 
 # Environment files with secrets - don't commit!
 .env.dev
@@ -21,3 +24,8 @@ logs/
 api.egg-info/
 dist/
 build/
+
+.pytest_cache/
+
+k8n/
+scripts/

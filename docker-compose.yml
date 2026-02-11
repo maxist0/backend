@@ -1,0 +1,28 @@
+services:
+  api:
+    image: fastapi-${ENVIRONMENT:-prod}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        ENVIRONMENT: ${ENVIRONMENT:-prod}
+    container_name: fastapi-${ENVIRONMENT:-prod}
+    ports:
+      - "${PORT:-8000}:8000"
+    volumes:
+      - ./logs:/app/logs
+    command: ["${ENVIRONMENT:-prod}"]
+    restart: ${RESTART_POLICY:-always}
+    networks:
+      - api-network
+    labels:
+      - "kompose.image-pull-policy=IfNotPresent"
+    profiles:
+      - test
+      - prod
+      - dev
+      - staging
+  
+networks:
+  api-network:
+    driver: bridge
