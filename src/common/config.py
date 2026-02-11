@@ -30,9 +30,6 @@ class Settings(BaseSettings):
     CACHE_MAX_CONNECTIONS: int = 10
 
     
-    # Security
-    SECRET_KEY: str = "change-me-in-production"
-    
     # JWT Authentication
     JWT_SECRET_KEY: str = "your-super-secret-jwt-key-change-in-production"
     JWT_ALGORITHM: str = "HS256"
@@ -61,7 +58,7 @@ class Settings(BaseSettings):
     APP_VERSION: str = "0.1.0"
     
     # Server
-    HOST: str = "127.0.0.1"
+    HOST: str = "0.0.0.0"
     PORT: int = 8000
     RELOAD: bool = False
     

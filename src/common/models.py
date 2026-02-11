@@ -69,7 +69,7 @@ class ErrorResponse(BaseResponse):
     error: ErrorDetail = Field(..., description="Error details")
     
     class Config:
-        schema_extra = {
+        json_schema_extra = {
             "example": {
                 "success": False,
                 "metadata": {
@@ -98,7 +98,7 @@ class PaginatedResponse(BaseResponse):
     error: Optional[ErrorDetail] = Field(None, description="Error details (null for success)")
     
     class Config:
-        schema_extra = {
+        json_schema_extra = {
             "example": {
                 "success": True,
                 "data": [

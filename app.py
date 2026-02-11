@@ -63,6 +63,8 @@ def main():
         host=host,
         port=port,
         reload=reload_enabled,
+        log_config=None,  # Disable uvicorn's default logging configuration
+        reload_includes=["src/", "app.py"],  # Watch src/ and app.py for changes
     )
 
 

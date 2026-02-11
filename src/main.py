@@ -13,7 +13,7 @@ from fastapi import FastAPI, Request, Query
 from fastapi.responses import JSONResponse
 from src.common.cache import init_cache_pool
 from src.common.logging import get_logger
-from src.common.config import settings
+from src.common.config import settings,init_settings
 from src.common.middleware import AccessLogMiddleware, MetricsMiddleware
 from src.common.metrics import init_metrics
 from src.common.responses import ok_response, SuccessResponse
@@ -78,6 +78,12 @@ async def lifespan(app: FastAPI):
 """
 Create FastAPI application instance with metadata and lifecycle management.
 """
+
+# Check if settings is initialized, if not initialize with default environment
+if settings is None:
+    settings = init_settings("dev")
+
+
 
 app = FastAPI(
     title=settings.APP_NAME,
