@@ -28,10 +28,19 @@ class Settings(BaseSettings):
     CACHE_DB: int = 0
     CACHE_PASSWORD: Optional[str] = None
     CACHE_MAX_CONNECTIONS: int = 10
-    
+
     
     # Security
     SECRET_KEY: str = "change-me-in-production"
+    
+    # JWT Authentication
+    JWT_SECRET_KEY: str = "your-super-secret-jwt-key-change-in-production"
+    JWT_ALGORITHM: str = "HS256"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
+    REFRESH_TOKEN_EXPIRE_DAYS: int = 30
+    
+    # Password hashing
+    BCRYPT_ROUNDS: int = 12
     
     # Logging
     LOG_LEVEL: str = "INFO"

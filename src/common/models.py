@@ -38,7 +38,7 @@ class PaginationInfo(BaseModel):
 
 class ResponseMetadata(BaseModel):
     """Metadata information for API responses."""
-    timestamp: str = Field(default_factory=lambda: datetime.utcnow().isoformat(), description="Response timestamp")
+    timestamp: str = Field(default_factory=lambda: datetime.now().isoformat(), description="Response timestamp")
     request_id: Optional[str] = Field(None, description="Unique request identifier")
     version: Optional[str] = Field(None, description="API version")
     execution_time: Optional[float] = Field(None, description="Request execution time in seconds")

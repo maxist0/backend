@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional, Union
 from fastapi import Request
 from fastapi.responses import JSONResponse
 import time
+from datetime import datetime
 import uuid
 from .models import (
     SuccessResponse, ErrorResponse, PaginatedResponse, PaginationInfo,
@@ -15,7 +16,7 @@ from .config import settings
 
 def create_response_metadata(
     request: Optional[Request] = None,
-    start_time: Optional[float] = None
+    start_time: Optional[datetime] = None
 ) -> ResponseMetadata:
     """Create response metadata with optional request information."""
     metadata_dict = {
@@ -24,7 +25,7 @@ def create_response_metadata(
     }
     
     if start_time is not None:
-        metadata_dict["execution_time"] = time.time() - start_time
+        metadata_dict["execution_time"] = (datetime.now() - start_time).total_seconds()
     
     # Extract request ID from headers if available
     if request and hasattr(request, 'headers'):
@@ -38,7 +39,7 @@ def create_response_metadata(
 def success_response(
     data: Optional[Union[Dict[str, Any], List[Any], str, int, float, bool]] = None,
     request: Optional[Request] = None,
-    start_time: Optional[float] = None,
+    start_time: Optional[datetime] = None,
     status_code: int = 200
 ) -> JSONResponse:
     """Create a standardized success response."""
@@ -53,7 +54,7 @@ def error_response(
     field: Optional[str] = None,
     details: Optional[Dict[str, Any]] = None,
     request: Optional[Request] = None,
-    start_time: Optional[float] = None,
+    start_time: Optional[datetime] = None,
     status_code: int = 400
 ) -> JSONResponse:
     """Create a standardized error response."""
@@ -74,7 +75,7 @@ def paginated_response(
     current_page: int = 1,
     limit: int = 20,
     request: Optional[Request] = None,
-    start_time: Optional[float] = None,
+    start_time: Optional[datetime] = None,
     base_url: str = "/api"
 ) -> JSONResponse:
     """Create a standardized paginated response."""
@@ -115,7 +116,7 @@ def ok_response(
     data: Optional[Any] = None,
     message: Optional[str] = None,
     request: Optional[Request] = None,
-    start_time: Optional[float] = None
+    start_time: Optional[datetime] = None
 ) -> JSONResponse:
     """Create a 200 OK response."""
     if message and not data:
@@ -127,7 +128,7 @@ def created_response(
     data: Optional[Any] = None,
     message: str = "Resource created successfully",
     request: Optional[Request] = None,
-    start_time: Optional[float] = None
+    start_time: Optional[datetime] = None
 ) -> JSONResponse:
     """Create a 201 Created response."""
     if not data:
@@ -140,7 +141,7 @@ def bad_request_response(
     field: Optional[str] = None,
     details: Optional[Dict[str, Any]] = None,
     request: Optional[Request] = None,
-    start_time: Optional[float] = None
+    start_time: Optional[datetime] = None
 ) -> JSONResponse:
     """Create a 400 Bad Request response."""
     return error_response(
@@ -157,7 +158,7 @@ def bad_request_response(
 def unauthorized_response(
     message: str = "Unauthorized",
     request: Optional[Request] = None,
-    start_time: Optional[float] = None
+    start_time: Optional[datetime] = None
 ) -> JSONResponse:
     """Create a 401 Unauthorized response."""
     return error_response(
@@ -172,7 +173,7 @@ def unauthorized_response(
 def forbidden_response(
     message: str = "Forbidden",
     request: Optional[Request] = None,
-    start_time: Optional[float] = None
+    start_time: Optional[datetime] = None
 ) -> JSONResponse:
     """Create a 403 Forbidden response."""
     return error_response(
@@ -187,7 +188,7 @@ def forbidden_response(
 def not_found_response(
     message: str = "Resource not found",
     request: Optional[Request] = None,
-    start_time: Optional[float] = None
+    start_time: Optional[datetime] = None
 ) -> JSONResponse:
     """Create a 404 Not Found response."""
     return error_response(
@@ -202,7 +203,7 @@ def not_found_response(
 def conflict_response(
     message: str = "Resource conflict",
     request: Optional[Request] = None,
-    start_time: Optional[float] = None
+    start_time: Optional[datetime] = None
 ) -> JSONResponse:
     """Create a 409 Conflict response."""
     return error_response(
@@ -217,7 +218,7 @@ def conflict_response(
 def rate_limited_response(
     message: str = "Rate limit exceeded",
     request: Optional[Request] = None,
-    start_time: Optional[float] = None
+    start_time: Optional[datetime] = None
 ) -> JSONResponse:
     """Create a 429 Rate Limited response."""
     return error_response(
@@ -232,7 +233,7 @@ def rate_limited_response(
 def internal_error_response(
     message: str = "Internal server error",
     request: Optional[Request] = None,
-    start_time: Optional[float] = None
+    start_time: Optional[datetime] = None
 ) -> JSONResponse:
     """Create a 500 Internal Server Error response."""
     return error_response(

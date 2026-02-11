@@ -18,6 +18,7 @@ from src.common.middleware import AccessLogMiddleware, MetricsMiddleware
 from src.common.metrics import init_metrics
 from src.common.responses import ok_response, SuccessResponse
 from src.api.metrics.router import router as metrics_router
+from src.api.auth.router import router as auth_router
 
 # Logger for this module
 logger = get_logger(__name__)
@@ -55,7 +56,7 @@ async def lifespan(app: FastAPI):
 
     ## Initialize DB connection pools and chache
     app.state.db = None  # Placeholder for DB connection pool
-    #app.state.cache = await init_cache_pool()
+    app.state.cache = None  # Placeholder for cache connection
     
     yield
     
@@ -105,10 +106,13 @@ if settings.ACCESS_LOG_ENABLED:
 
 # Include API routes
 """
-Include API routes for metrics and other functionalities.
+Include API routes for metrics and authentication.
 """
 if settings.METRICS_ENABLED:
     app.include_router(metrics_router,prefix="/metrics", tags=["monitoring"])
+
+# Include authentication routes
+app.include_router(auth_router, prefix="/auth", tags=["authentication"])
 
 
 
@@ -121,10 +125,10 @@ async def root(request: Request):
     """Root endpoint with standardized response."""
     start_time = time.time()
     response_data = {
-        "message": "Welcome to the FastAPI application with metrics!",
+        "message": "Welcome to the FastAPI application with JWT authentication!",
         "docs_url": "/docs" if not settings.is_production else None,
         "metrics_url": "/metrics" if settings.METRICS_ENABLED else None,
-        "health_url": "/health"
+        "auth_url": "/auth"
     }
     return ok_response(data=response_data, request=request, start_time=start_time)
 
