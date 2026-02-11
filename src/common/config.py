@@ -104,13 +104,13 @@ def get_settings(env: Optional[str] = None) -> Settings:
         ENVIRONMENT=Environment(env),
     )
 
-
-# Global settings instance - will be set by app.py
-settings: Optional[Settings] = None
-
-
 def init_settings(env: str) -> Settings:
     """Initialize settings with the given environment."""
     global settings
     settings = get_settings(env)
     return settings
+
+# Global settings instance - will be set by app.py
+settings: Optional[Settings] = init_settings("dev")  # Default to dev, will be overridden by app.py
+
+

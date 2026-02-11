@@ -2,6 +2,7 @@
 """
 Metrics API endpoints.
 """
+from datetime import datetime
 import time
 from fastapi import APIRouter, Response, Request
 from src.common.metrics import get_metrics, get_metrics_content_type
@@ -31,7 +32,7 @@ async def health_check(request: Request):
     
     Simple endpoint to verify the API is running.
     """
-    start_time = time.time()
+    start_time = datetime.now()
     
     health_data = {
         "status": "healthy", 

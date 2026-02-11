@@ -7,6 +7,7 @@ Sets up the FastAPI app, middleware, routes, and lifecycle events.
 
 # Imports
 from contextlib import asynccontextmanager
+from datetime import datetime
 import os
 import time
 from fastapi import FastAPI, Request, Query
@@ -81,6 +82,7 @@ Create FastAPI application instance with metadata and lifecycle management.
 
 # Check if settings is initialized, if not initialize with default environment
 if settings is None:
+    print("Settings not initialized, initializing with default environment 'dev'")
     settings = init_settings("dev")
 
 
@@ -129,7 +131,7 @@ Define the root endpoint with standardized response.
 @app.get("/", response_model=SuccessResponse)
 async def root(request: Request):
     """Root endpoint with standardized response."""
-    start_time = time.time()
+    start_time = datetime.now()
     response_data = {
         "message": "Welcome to the FastAPI application with JWT authentication!",
         "docs_url": "/docs" if not settings.is_production else None,
