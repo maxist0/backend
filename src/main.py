@@ -1,4 +1,4 @@
-#src/main.py
+# src/main.py
 
 """
 Main application entry point for FastAPI app with metrics and logging.
@@ -9,12 +9,9 @@ Sets up the FastAPI app, middleware, routes, and lifecycle events.
 from contextlib import asynccontextmanager
 from datetime import datetime
 import os
-import time
-from fastapi import FastAPI, Request, Query
-from fastapi.responses import JSONResponse
-from src.common.cache import init_cache_pool
+from fastapi import FastAPI, Request
 from src.common.logging import get_logger
-from src.common.config import settings,init_settings
+from src.common.config import settings, init_settings
 from src.common.middleware import AccessLogMiddleware, MetricsMiddleware
 from src.common.metrics import init_metrics
 from src.common.responses import ok_response, SuccessResponse
@@ -23,6 +20,7 @@ from src.api.auth.router import router as auth_router
 
 # Logger for this module
 logger = get_logger(__name__)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -39,7 +37,7 @@ async def lifespan(app: FastAPI):
     init_metrics(
         app_name=app.title,
         app_version=app.version,
-        environment=settings.ENVIRONMENT.value
+        environment=settings.ENVIRONMENT.value,
     )
 
     # Log Start, PID,Port,IP etc.
@@ -54,13 +52,13 @@ async def lifespan(app: FastAPI):
     logger.info(f"Port: {settings.PORT}")
     logger.info(f"Reload Enabled: {settings.RELOAD}")
 
-
     ## Initialize DB connection pools and chache
     app.state.db = None  # Placeholder for DB connection pool
     app.state.cache = None  # Placeholder for cache connection
-    
+    app.state.start_time = datetime.now()
+
     yield
-    
+
     # Shutdown
     logger.info("Application shutting down ...")
 
@@ -71,7 +69,7 @@ async def lifespan(app: FastAPI):
     if app.state.cache:
         await app.state.cache.close()
         logger.info("Cache connection pool closed.")
-    
+
     logger.info("Application shutdown complete.")
 
 
@@ -84,7 +82,6 @@ Create FastAPI application instance with metadata and lifecycle management.
 if settings is None:
     print("Settings not initialized, initializing with default environment 'dev'")
     settings = init_settings("dev")
-
 
 
 app = FastAPI(
@@ -111,23 +108,23 @@ if settings.ACCESS_LOG_ENABLED:
     app.add_middleware(AccessLogMiddleware)
 
 
-
 # Include API routes
 """
 Include API routes for metrics and authentication.
 """
 if settings.METRICS_ENABLED:
-    app.include_router(metrics_router,prefix="/metrics", tags=["monitoring"])
+    app.include_router(metrics_router, prefix="/metrics", tags=["monitoring"])
 
 # Include authentication routes
 app.include_router(auth_router, prefix="/auth", tags=["authentication"])
-
 
 
 # Root Endpoint
 """
 Define the root endpoint with standardized response.
 """
+
+
 @app.get("/", response_model=SuccessResponse)
 async def root(request: Request):
     """Root endpoint with standardized response."""
@@ -136,7 +133,6 @@ async def root(request: Request):
         "message": "Welcome to the FastAPI application with JWT authentication!",
         "docs_url": "/docs" if not settings.is_production else None,
         "metrics_url": "/metrics" if settings.METRICS_ENABLED else None,
-        "auth_url": "/auth"
+        "auth_url": "/auth",
     }
     return ok_response(data=response_data, request=request, start_time=start_time)
-

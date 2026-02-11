@@ -1,10 +1,10 @@
-#app.py
+# app.py
 """
 Entry point for the API application.
 
 Usage:
     python app.py dev      # Development environment
-    python app.py test     # Test environment  
+    python app.py test     # Test environment
     python app.py stage    # Staging environment
     python app.py prod     # Production environment
 """
@@ -38,33 +38,36 @@ def main():
         default=None,
         help="Enable auto-reload (default: from settings)",
     )
-    
+
     args = parser.parse_args()
-    
+
     # Initialize settings BEFORE importing the app
     from src.common.config import init_settings
+
     settings = init_settings(args.env)
-    
+
     # Setup logging with file handlers using settings from config
     from src.common.logging import setup_logging
+
     _log_dir = setup_logging(settings)
-    
 
     # Now import and run the app
     import uvicorn
-    
+
     # Use command-line args if provided, otherwise use settings from config
     host = args.host if args.host is not None else settings.HOST
     port = args.port if args.port is not None else settings.PORT
     reload_enabled = args.reload if args.reload is not None else settings.RELOAD
-    
+
     uvicorn.run(
         "src.main:app",
         host=host,
         port=port,
         reload=reload_enabled,
         log_config=None,  # Disable uvicorn's default logging configuration
-        reload_includes=["src/", "app.py"] if reload_enabled else None,  # Watch src/ and app.py for changes
+        reload_includes=["src/", "app.py"]
+        if reload_enabled
+        else None,  # Watch src/ and app.py for changes
     )
 
 

@@ -1,4 +1,4 @@
-#src/common/cache.py
+# src/common/cache.py
 
 """
 Cache management module.
@@ -18,9 +18,10 @@ async def get_cache_connection(request: Request) -> Optional[redis.Redis]:
     """Dependency to get a cache connection from the app state."""
     return request.app.state.cache
 
+
 async def init_cache_pool() -> Optional[redis.Redis]:
     """Initialize the cache connection pool."""
-    
+
     pool = redis.ConnectionPool(
         host=settings.CACHE_HOST,
         port=settings.CACHE_PORT,
@@ -36,8 +37,6 @@ async def init_cache_pool() -> Optional[redis.Redis]:
         # Handle connection error (log or raise)
         logger.error(f"Failed to connect to cache: {e}")
         raise e
-    
+
     logger.info("Cache connection pool initialized.")
     return client
-
-
