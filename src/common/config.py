@@ -19,7 +19,13 @@ class Settings(BaseSettings):
     ENVIRONMENT: Environment = Environment.DEV
 
     # Database
-    DATABASE_URL: str = "sqlite:///./dev.db"
+    DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/api"
+
+    # Connection pool
+    DB_POOL_SIZE: int = 10
+    DB_MAX_OVERFLOW: int = 20
+    DB_POOL_TIMEOUT: int = 30          # seconds to wait for a connection
+    DB_POOL_RECYCLE: int = 1800        # recycle connections after 30 min
 
     # Cache
     CACHE_HOST: str = "localhost"

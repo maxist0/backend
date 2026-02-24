@@ -12,6 +12,7 @@ import os
 from fastapi import FastAPI, Request
 from src.common.logging import get_logger
 from src.common.config import settings, init_settings
+from src.common.database import init_db, close_db
 from src.common.middleware import AccessLogMiddleware, MetricsMiddleware
 from src.common.metrics import init_metrics
 from src.common.responses import ok_response, SuccessResponse
@@ -52,8 +53,8 @@ async def lifespan(app: FastAPI):
     logger.info(f"Port: {settings.PORT}")
     logger.info(f"Reload Enabled: {settings.RELOAD}")
 
-    ## Initialize DB connection pools and chache
-    app.state.db = None  # Placeholder for DB connection pool
+    ## Initialize DB connection pool
+    await init_db()
     app.state.cache = None  # Placeholder for cache connection
     app.state.start_time = datetime.now()
 
@@ -62,10 +63,8 @@ async def lifespan(app: FastAPI):
     # Shutdown
     logger.info("Application shutting down ...")
 
-    ## Close DB connection pools and cache
-    if app.state.db:
-        await app.state.db.close()
-        logger.info("Database connection pool closed.")
+    ## Close DB connection pool and cache
+    await close_db()
     if app.state.cache:
         await app.state.cache.close()
         logger.info("Cache connection pool closed.")
