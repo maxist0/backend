@@ -51,8 +51,8 @@ def success_response(
 
 
 def error_response(
-    error_code: ErrorCode,
     message: str,
+    error_code: ErrorCode = ErrorCode.INTERNAL_ERROR,
     field: Optional[str] = None,
     details: Optional[Dict[str, Any]] = None,
     request: Optional[Request] = None,

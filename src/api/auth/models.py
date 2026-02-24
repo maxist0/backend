@@ -47,3 +47,31 @@ class RefreshTokenRequest(BaseModel):
     """Refresh token request model."""
 
     refresh_token: str
+
+
+class RegisterRequest(BaseModel):
+    """User registration request model."""
+
+    username: str
+    password: str
+
+
+class LoginRequest(BaseModel):
+    """User login request model."""
+
+    username: str
+    password: str
+
+
+class LogoutRequest(BaseModel):
+    """Logout request model – revokes the provided refresh token."""
+
+    refresh_token: str
+
+
+class UserRecord(BaseModel):
+    """In-memory user record."""
+
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    username: str
+    password_hash: str

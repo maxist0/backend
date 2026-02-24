@@ -1,22 +1,21 @@
 # src/api/auth/jwt_utils.py
 
 """
-JWT and refresh token utility functions.
+JWT utility functions: create, validate, revoke and decode tokens.
+All persistence is delegated to crud.py.
 """
 
 import uuid
 import secrets
 from datetime import datetime, timedelta
-from typing import Optional, List
+from typing import Optional
 import jwt
 from src.common.config import settings
 from src.api.auth.models import TokenData, RefreshToken
+from src.api.auth import crud
 from src.common.logging import get_logger
 
 logger = get_logger(__name__)
-
-# In-memory storage for refresh tokens (replace with Redis in production)
-refresh_token_db: List[RefreshToken] = []
 
 
 def create_access_token(
@@ -58,11 +57,11 @@ def create_refresh_token(
     # Generate a secure random string for the opaque token
     opaque_token = secrets.token_urlsafe(32)
 
-    # Create and store the refresh token object
+    # Persist via crud
     refresh_token_obj = RefreshToken(
         user_id=user_id, username=username, token=opaque_token, expires_at=expire
     )
-    refresh_token_db.append(refresh_token_obj)
+    crud.save_refresh_token(refresh_token_obj)
 
     logger.info(
         f"Refresh token created for user {username} with ID {refresh_token_obj.id}"
@@ -72,21 +71,16 @@ def create_refresh_token(
 
 
 def validate_refresh_token(token: str) -> Optional[RefreshToken]:
-    """Validate an opaque refresh token."""
-    for rt in refresh_token_db:
-        if rt.token == token and not rt.revoked and rt.expires_at > datetime.utcnow():
-            return rt
-    return None
+    """Return the active RefreshToken for *token*, or None if invalid/expired."""
+    return crud.get_active_refresh_token(token)
 
 
 def revoke_refresh_token(token: str) -> bool:
-    """Revoke a refresh token."""
-    for rt in refresh_token_db:
-        if rt.token == token:
-            rt.revoked = True
-            logger.info(f"Refresh token {rt.id} revoked.")
-            return True
-    return False
+    """Revoke a refresh token. Returns True if the token was found."""
+    revoked = crud.revoke_refresh_token(token)
+    if revoked:
+        logger.info(f"Refresh token revoked: {token[:8]}...")
+    return revoked
 
 
 def decode_token(token: str) -> Optional[TokenData]:
@@ -99,10 +93,10 @@ def decode_token(token: str) -> Optional[TokenData]:
             token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM]
         )
 
-        user_id: str = payload.get("sub")
-        username: str = payload.get("username")
-        jti: str = payload.get("jti")
-        token_type: str = payload.get("type")
+        user_id: str = str(payload.get("sub"))
+        username: str = str(payload.get("username"))
+        jti: str = str(payload.get("jti"))
+        token_type: str = str(payload.get("type"))
 
         if user_id is None or username is None or jti is None or token_type != "access":
             logger.warning("Invalid access token")
