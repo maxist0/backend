@@ -29,3 +29,6 @@ build/
 
 k8n/
 scripts/
+
+.ruff_cache/
+.mypy_cache/

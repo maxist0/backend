@@ -89,14 +89,14 @@ def init_metrics(app_name: str, app_version: str, environment: str):
     )
 
 
-def get_metrics() -> str:
+def get_metrics() -> bytes:
     """
     Get metrics in Prometheus format.
     """
     return generate_latest(REGISTRY)
 
 
-def get_metrics_content_type() -> str:
+def get_metrics_content_type() -> bytes:
     """
     Get the content type for metrics.
     """
