@@ -6,19 +6,25 @@ Authentication routes for token generation and refresh.
 
 from datetime import datetime
 from typing import Any, Dict
-from fastapi import APIRouter, Request, status
+from fastapi import APIRouter, Request, status, Depends
+from fastapi.responses import JSONResponse
 
-from src.api.auth.models import TokenPair, RefreshTokenRequest, RegisterRequest, LoginRequest, LogoutRequest
+
+from src.api.auth.models import (
+    RegisterRequest,
+    UserRecord,
+    RefreshToken,
+)
 from src.api.auth.jwt_utils import (
     create_access_token,
     create_refresh_token,
-    validate_refresh_token,
     revoke_refresh_token,
 )
-from src.api.auth.service import register_user, authenticate_user
+from src.api.auth.service import register_user, add_refresh_token_to_cookie,delete_refresh_token_cookie
 from src.common.models import ErrorCode
-from src.common.responses import ok_response, error_response
+from src.common.responses import ok_response, error_response, success_response
 from src.common.logging import get_logger
+from src.api.auth.dependencies import authenticate_form_user, get_current_refresh_token_data, get_current_user
 
 logger = get_logger(__name__)
 router = APIRouter()
@@ -63,42 +69,54 @@ async def register(
         )
 
 
-@router.post("/login", response_model=Dict[str, Any])
-async def login(
-    login_request: LoginRequest, request: Request
+@router.get("/me", response_model=Dict[str, Any])
+async def me(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """
-    Authenticate a user and return an access + refresh token pair.
+    Return the currently authenticated user's profile.
+    Requires a valid Bearer access token.
+    """
+    start_time = datetime.now()
+    return ok_response(
+        data={"user": current_user},
+        request=request,
+        start_time=start_time,
+    )
+
+
+@router.post("/login", response_model=Dict[str, Any])
+async def login(
+    request: Request,
+    user: UserRecord = Depends(authenticate_form_user),
+) -> Dict[str, Any]:
+    """
+    Authenticate a user via OAuth2 password form.
+    Returns an OAuth2-compatible response with the access token at the top level
+    (required for Swagger / OpenAPI "Authorize" to capture it automatically).
+    The refresh token is set as an httpOnly secure cookie.
     """
     start_time = datetime.now()
 
     try:
-        user = authenticate_user(login_request.username, login_request.password)
-        if user is None:
-            return error_response(
-                message="Invalid username or password",
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                error_code=ErrorCode.UNAUTHORIZED,
-                request=request,
-                start_time=start_time,
-            )
-
         access_token = create_access_token(user.username, user.id)
         refresh_token = create_refresh_token(user.username, user.id)
 
         logger.info(f"User logged in: {user.username}")
 
-        return ok_response(
-            data={
+        # Return standard OAuth2 token response so Swagger captures access_token
+        # automatically and uses it as Authorization: Bearer <token>.
+        response = JSONResponse(
+            content={
+                "access_token": access_token,
+                "token_type": "bearer",
                 "user": {"id": user.id, "username": user.username},
-                "tokens": TokenPair(
-                    access_token=access_token, refresh_token=refresh_token
-                ),
             },
-            message="Login successful",
-            request=request,
-            start_time=start_time,
+            status_code=200,
         )
+        response = add_refresh_token_to_cookie(response, refresh_token)
+        return response
 
     except Exception as e:
         logger.error(f"Error during login: {e}")
@@ -111,17 +129,18 @@ async def login(
         )
 
 
-@router.post("/logout", response_model=Dict[str, Any])
+@router.post("/logout")
 async def logout(
-    logout_request: LogoutRequest, request: Request
+    request: Request,
+    refresh_token_data: RefreshToken = Depends(get_current_refresh_token_data),
 ) -> Dict[str, Any]:
     """
-    Revoke the provided refresh token, effectively logging the user out.
+    Revoke the current refresh token (read from cookie), effectively logging the user out.
     """
     start_time = datetime.now()
 
     try:
-        revoked = revoke_refresh_token(logout_request.refresh_token)
+        revoked = revoke_refresh_token(refresh_token_data.token)
         if not revoked:
             return error_response(
                 message="Refresh token not found or already revoked",
@@ -131,14 +150,16 @@ async def logout(
                 start_time=start_time,
             )
 
-        logger.info("User logged out – refresh token revoked")
+        logger.info("User logged out - refresh token revoked")
 
-        return ok_response(
-            data={},
-            message="Logged out successfully",
+        # Clear the refresh token cookie
+        response_data = success_response(
+            data={"message": "Logged out successfully"},
             request=request,
             start_time=start_time,
         )
+        response_data = delete_refresh_token_cookie(response_data)
+        return response_data
 
     except Exception as e:
         logger.error(f"Error during logout: {e}")
@@ -151,49 +172,41 @@ async def logout(
         )
 
 
-@router.post("/refresh", response_model=Dict[str, Any])
+@router.post("/refresh")
 async def refresh_tokens(
-    refresh_request: RefreshTokenRequest, request: Request
+    request: Request,
+    refresh_token_data: RefreshToken = Depends(get_current_refresh_token_data),
 ) -> Dict[str, Any]:
     """
-    Refresh access and refresh tokens using an opaque refresh token.
+    Issue a new access + refresh token pair using the refresh token from the cookie.
+    The old refresh token is revoked (rotation). No access token required.
     """
     start_time = datetime.now()
 
     try:
-        # Validate the opaque refresh token
-        refresh_token_obj = validate_refresh_token(refresh_request.refresh_token)
-        if not refresh_token_obj:
-            return error_response(
-                message="Invalid or expired refresh token",
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                request=request,
-                start_time=start_time,
-            )
-
-        # Revoke the old refresh token
-        revoke_refresh_token(refresh_request.refresh_token)
+        # Revoke the old refresh token (rotation)
+        revoke_refresh_token(refresh_token_data.token)
 
         # Create new tokens
         new_access_token = create_access_token(
-            refresh_token_obj.username, refresh_token_obj.user_id
+            refresh_token_data.username, refresh_token_data.user_id
         )
         new_refresh_token = create_refresh_token(
-            refresh_token_obj.username, refresh_token_obj.user_id
+            refresh_token_data.username, refresh_token_data.user_id
         )
 
-        logger.info(f"Tokens refreshed for user: {refresh_token_obj.username}")
+        logger.info(f"Tokens refreshed for user: {refresh_token_data.username}")
 
-        return ok_response(
-            data={
-                "tokens": TokenPair(
-                    access_token=new_access_token, refresh_token=new_refresh_token
-                )
+        # Return new access token in body; set new refresh token cookie
+        response_data = JSONResponse(
+            content={
+                "access_token": new_access_token,
+                "token_type": "bearer",
             },
-            message="Tokens refreshed successfully",
-            request=request,
-            start_time=start_time,
+            status_code=200,
         )
+        response_data = add_refresh_token_to_cookie(response_data, new_refresh_token)
+        return response_data
 
     except Exception as e:
         logger.error(f"Error during token refresh: {e}")

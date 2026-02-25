@@ -96,18 +96,18 @@ def decode_token(token: str) -> Optional[TokenData]:
         user_id: str = str(payload.get("sub"))
         username: str = str(payload.get("username"))
         jti: str = str(payload.get("jti"))
-        token_type: str = str(payload.get("type"))
+        
 
-        if user_id is None or username is None or jti is None or token_type != "access":
+        if user_id is None or username is None or jti is None:
             logger.warning("Invalid access token")
             return None
 
-        return TokenData(user_id=user_id, username=username, jti=jti, type=token_type)
+        return TokenData(user_id=user_id, username=username, jti=jti)
 
     except jwt.ExpiredSignatureError:
         logger.info("Access token has expired")
         return None
-    except jwt.JWTError as e:
+    except jwt.PyJWTError as e:
         logger.warning(f"JWT decode error: {e}")
         return None
     except Exception as e:

@@ -73,9 +73,7 @@ class SuccessResponse(BaseResponse):
     data: Optional[Union[Dict[str, Any], List[Any], str, int, float, bool]] = Field(
         None, description="Response data"
     )
-    error: Optional[ErrorDetail] = Field(
-        None, description="Error details (null for success)"
-    )
+    
 
 
 class ErrorResponse(BaseResponse):

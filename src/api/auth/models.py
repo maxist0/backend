@@ -15,14 +15,19 @@ class TokenData(BaseModel):
     user_id: str
     username: str
     jti: str  # JWT ID for token revocation
-    type: str  # "access" or "refresh"
 
-
+# Deprecated
 class TokenPair(BaseModel):
     """JWT token pair model."""
+    refresh_token: str
+    access_token: str
+    token_type: str = "bearer"
+
+
+class AccessToken(BaseModel):
+    """Access token model for response."""
 
     access_token: str
-    refresh_token: str
     token_type: str = "bearer"
 
 

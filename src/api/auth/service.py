@@ -61,7 +61,26 @@ def authenticate_user(username: str, password: str) -> Optional[UserRecord]:
     Verify credentials.
     Returns the UserRecord on success, None if credentials are invalid.
     """
+    print(f"Authenticating user: {username}")
+    print(f"password: {password}")
     user = crud.get_user_by_username(username)
     if user is None or not verify_password(password, user.password_hash):
         return None
     return user
+
+
+def add_refresh_token_to_cookie(response, refresh_token: str):
+    """Helper to set the refresh token cookie with secure settings."""
+    response.set_cookie(
+            key="refresh_token",
+            value=refresh_token,
+            httponly=True,
+            samesite="lax",
+            path="/auth", 
+        )
+    return response
+
+def delete_refresh_token_cookie(response):
+    """Helper to delete the refresh token cookie."""
+    response.delete_cookie(key="refresh_token", path="/auth")
+    return response
