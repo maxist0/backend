@@ -13,11 +13,13 @@ from fastapi import FastAPI, Request
 from src.common.logging import get_logger
 from src.common.config import settings, init_settings
 from src.common.database import init_db, close_db
+from src.common.cache import init_cache_pool, init_fastapi_cache
 from src.common.middleware import AccessLogMiddleware, MetricsMiddleware
 from src.common.metrics import init_metrics
 from src.common.responses import ok_response, SuccessResponse
 from src.api.metrics.router import router as metrics_router
 from src.api.auth.router import router as auth_router
+from fastapi_cache.decorator import cache
 
 # Logger for this module
 logger = get_logger(__name__)
@@ -55,7 +57,11 @@ async def lifespan(app: FastAPI):
 
     ## Initialize DB connection pool
     await init_db()
-    app.state.cache = None  # Placeholder for cache connection
+
+    ## Initialize Redis and fastapi-cache2
+    app.state.cache = await init_cache_pool()
+    init_fastapi_cache(app.state.cache)
+
     app.state.start_time = datetime.now()
 
     yield
@@ -125,6 +131,7 @@ Define the root endpoint with standardized response.
 
 
 @app.get("/", response_model=SuccessResponse)
+@cache(expire=60)  
 async def root(request: Request):
     """Root endpoint with standardized response."""
     start_time = datetime.now()

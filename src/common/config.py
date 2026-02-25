@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     CACHE_DB: int = 0
     CACHE_PASSWORD: Optional[str] = None
     CACHE_MAX_CONNECTIONS: int = 10
+    CACHE_KEY_PREFIX: str = "fastapi-cache"
 
     # JWT Authentication
     JWT_SECRET_KEY: str = "your-super-secret-jwt-key-change-in-production"
