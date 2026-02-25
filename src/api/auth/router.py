@@ -100,8 +100,11 @@ async def login(
     start_time = datetime.now()
 
     try:
+        redis_client = request.app.state.cache
         access_token = create_access_token(user.username, user.id)
-        refresh_token = create_refresh_token(user.username, user.id)
+        refresh_token = await create_refresh_token(
+            user.username, user.id, redis_client=redis_client, request=request
+        )
 
         logger.info(f"User logged in: {user.username}")
 
@@ -140,7 +143,8 @@ async def logout(
     start_time = datetime.now()
 
     try:
-        revoked = revoke_refresh_token(refresh_token_data.token)
+        redis_client = request.app.state.cache
+        revoked = await revoke_refresh_token(refresh_token_data.token, redis_client)
         if not revoked:
             return error_response(
                 message="Refresh token not found or already revoked",
@@ -184,15 +188,18 @@ async def refresh_tokens(
     start_time = datetime.now()
 
     try:
+        redis_client = request.app.state.cache
+
         # Revoke the old refresh token (rotation)
-        revoke_refresh_token(refresh_token_data.token)
+        await revoke_refresh_token(refresh_token_data.token, redis_client)
 
         # Create new tokens
         new_access_token = create_access_token(
             refresh_token_data.username, refresh_token_data.user_id
         )
-        new_refresh_token = create_refresh_token(
-            refresh_token_data.username, refresh_token_data.user_id
+        new_refresh_token = await create_refresh_token(
+            refresh_token_data.username, refresh_token_data.user_id,
+            redis_client=redis_client, request=request
         )
 
         logger.info(f"Tokens refreshed for user: {refresh_token_data.username}")

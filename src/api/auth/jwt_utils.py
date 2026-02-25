@@ -10,8 +10,10 @@ import secrets
 from datetime import datetime, timedelta
 from typing import Optional
 import jwt
+import redis.asyncio as redis
 from src.common.config import settings
 from src.api.auth.models import TokenData, RefreshToken
+from fastapi import Request
 from src.api.auth import crud
 from src.common.logging import get_logger
 
@@ -45,23 +47,31 @@ def create_access_token(
     return encoded_jwt
 
 
-def create_refresh_token(
-    username: str, user_id: str, expires_delta: Optional[timedelta] = None
+async def create_refresh_token(
+    username: str,
+    user_id: str,
+    redis_client: redis.Redis,
+    request: Optional[Request] = None,
+    expires_delta: Optional[timedelta] = None,
 ) -> str:
-    """Create an opaque refresh token and store it."""
+    """Create an opaque refresh token and store it in Redis."""
     if expires_delta is None:
         expires_delta = timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
 
     expire = datetime.utcnow() + expires_delta
-
-    # Generate a secure random string for the opaque token
     opaque_token = secrets.token_urlsafe(32)
 
-    # Persist via crud
     refresh_token_obj = RefreshToken(
-        user_id=user_id, username=username, token=opaque_token, expires_at=expire
+        user_id=user_id,
+        username=username,
+        token=opaque_token,
+        expires_at=expire,
+        device_id=request.headers.get("x-device-id") if request else None,
+        device_name=request.headers.get("x-device-name") if request else None,
+        ip_address=request.client.host if request and request.client else None,
+        user_agent=request.headers.get("user-agent") if request else None,
     )
-    crud.save_refresh_token(refresh_token_obj)
+    await crud.save_refresh_token(refresh_token_obj, redis_client)
 
     logger.info(
         f"Refresh token created for user {username} with ID {refresh_token_obj.id}"
@@ -70,14 +80,16 @@ def create_refresh_token(
     return opaque_token
 
 
-def validate_refresh_token(token: str) -> Optional[RefreshToken]:
+async def validate_refresh_token(
+    token: str, redis_client: redis.Redis
+) -> Optional[RefreshToken]:
     """Return the active RefreshToken for *token*, or None if invalid/expired."""
-    return crud.get_active_refresh_token(token)
+    return await crud.get_active_refresh_token(token, redis_client)
 
 
-def revoke_refresh_token(token: str) -> bool:
-    """Revoke a refresh token. Returns True if the token was found."""
-    revoked = crud.revoke_refresh_token(token)
+async def revoke_refresh_token(token: str, redis_client: redis.Redis) -> bool:
+    """Revoke a refresh token by deleting it from Redis. Returns True if found."""
+    revoked = await crud.revoke_refresh_token(token, redis_client)
     if revoked:
         logger.info(f"Refresh token revoked: {token[:8]}...")
     return revoked

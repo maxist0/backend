@@ -40,6 +40,17 @@ class RefreshToken(BaseModel):
     token: str
     expires_at: datetime
     revoked: bool = False
+    revoke_reason: str | None = None     # e.g. "logout", "reuse_detected", "admin"
+
+    # Lifecycle
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    revoked_at: datetime | None = None
+
+    # Context / fingerprinting
+    device_id: str | None = None
+    device_name: str | None = None        # e.g. "Chrome on macOS"
+    ip_address: str | None = None
+    user_agent: str | None = None
 
 
 class TokenRequest(BaseModel):

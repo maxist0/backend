@@ -33,4 +33,4 @@ scripts/
 .ruff_cache/
 .mypy_cache/
 
-todolist.txt
+implementation-plan/

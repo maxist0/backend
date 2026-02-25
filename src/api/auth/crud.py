@@ -2,24 +2,36 @@
 
 """
 Data-access layer for auth.
-All in-memory stores live here; swap these functions for real DB calls later.
+User records are kept in-memory (swap for a real DB later).
+Refresh tokens are stored in Redis with automatic TTL-based expiry.
 """
 
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, Optional
+
+import redis.asyncio as redis
 
 from src.api.auth.models import RefreshToken, UserRecord
 from src.common.logging import get_logger
 
 logger = get_logger(__name__)
 
+# ---------------------------------------------------------------------------
+# Redis key helpers
+# ---------------------------------------------------------------------------
+
+_RT_PREFIX = "rt:"
+
+
+def _rt_key(token: str) -> str:
+    return f"{_RT_PREFIX}{token}"
+
 
 # ---------------------------------------------------------------------------
-# In-memory stores (replace with DB / Redis later)
+# In-memory user store (replace with DB later)
 # ---------------------------------------------------------------------------
 
 user_db: Dict[str, UserRecord] = {}
-refresh_token_db: List[RefreshToken] = []
 
 
 # ---------------------------------------------------------------------------
@@ -39,27 +51,31 @@ def create_user(user: UserRecord) -> UserRecord:
 
 
 # ---------------------------------------------------------------------------
-# Refresh-token CRUD
+# Refresh-token CRUD (Redis-backed, async)
 # ---------------------------------------------------------------------------
 
 
-def save_refresh_token(rt: RefreshToken) -> None:
-    """Persist a new refresh token."""
-    refresh_token_db.append(rt)
+async def save_refresh_token(rt: RefreshToken, redis_client: redis.Redis) -> None:
+    """Persist a refresh token in Redis with a TTL derived from its expiry."""
+    ttl = int((rt.expires_at - datetime.utcnow()).total_seconds())
+    if ttl <= 0:
+        logger.warning(f"Refresh token already expired, not saving: {rt.id}")
+        return
+    await redis_client.set(_rt_key(rt.token), rt.model_dump_json(), ex=ttl)
+    logger.debug(f"Saved refresh token {rt.id} with TTL={ttl}s")
 
 
-def get_active_refresh_token(token: str) -> Optional[RefreshToken]:
-    """Return a non-revoked, non-expired refresh token, or None."""
-    for rt in refresh_token_db:
-        if rt.token == token and not rt.revoked and rt.expires_at > datetime.utcnow():
-            return rt
-    return None
+async def get_active_refresh_token(
+    token: str, redis_client: redis.Redis
+) -> Optional[RefreshToken]:
+    """Return the RefreshToken stored in Redis, or None if missing/expired."""
+    data = await redis_client.get(_rt_key(token))
+    if data is None:
+        return None
+    return RefreshToken.model_validate_json(data)
 
 
-def revoke_refresh_token(token: str) -> bool:
-    """Mark a refresh token as revoked. Returns True if found."""
-    for rt in refresh_token_db:
-        if rt.token == token:
-            rt.revoked = True
-            return True
-    return False
+async def revoke_refresh_token(token: str, redis_client: redis.Redis) -> bool:
+    """Delete the refresh token from Redis. Returns True if it existed."""
+    deleted = await redis_client.delete(_rt_key(token))
+    return deleted > 0

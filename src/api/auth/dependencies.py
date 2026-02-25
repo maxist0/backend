@@ -77,7 +77,8 @@ async def get_current_refresh_token_data(
     else:
         logger.info("No refresh token found in cookies")
         raise AuthenticationError("Refresh token missing")
-    refreshtoken = validate_refresh_token(refresh_token)
+    redis_client = request.app.state.cache
+    refreshtoken = await validate_refresh_token(refresh_token, redis_client)
     if not refreshtoken:
         raise AuthenticationError("Invalid or expired refresh token")
     return refreshtoken
