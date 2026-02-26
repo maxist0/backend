@@ -1,0 +1,112 @@
+# alembic/env.py
+"""
+Alembic environment for async (asyncpg) migrations.
+
+Run autogenerate:
+    alembic revision --autogenerate -m "description"
+
+Apply migrations:
+    alembic upgrade head
+
+Downgrade one step:
+    alembic downgrade -1
+"""
+
+import asyncio
+from logging.config import fileConfig
+
+from alembic import context
+from sqlalchemy import pool
+from sqlalchemy.engine import Connection
+from sqlalchemy.ext.asyncio import create_async_engine
+
+# ── Import the project's declarative Base so Alembic can detect schema changes.
+# Add additional model modules here as the project grows.
+from src.common.database import Base  # noqa: F401 – registers metadata
+from src.common.config import init_settings, settings
+
+# ── Import concrete model modules so their tables appear in Base.metadata.
+from src.api.auth.models import (  # noqa: F401
+    User, PasswordCredential, AuthAuditLog, EmailToken, Session,
+)
+
+
+
+settings = init_settings("test")
+# ---------------------------------------------------------------------------
+# Alembic Config object – gives access to values in alembic.ini
+# ---------------------------------------------------------------------------
+config = context.config
+
+# Inject the live DATABASE_URL so we never hard-code it in alembic.ini
+_url = settings.DATABASE_URL
+if _url.startswith("postgresql://") or _url.startswith("postgres://"):
+    _url = _url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    _url = _url.replace("postgres://", "postgresql+asyncpg://", 1)
+config.set_main_option("sqlalchemy.url", _url)
+
+# Set up Python logging from alembic.ini [loggers] section
+if config.config_file_name is not None:
+    fileConfig(config.config_file_name)
+
+# Metadata that Alembic inspects for autogenerate
+target_metadata = Base.metadata
+
+# ---------------------------------------------------------------------------
+# Offline migrations (no live DB connection)
+# ---------------------------------------------------------------------------
+
+def run_migrations_offline() -> None:
+    """Generate SQL scripts without a live connection."""
+    url = config.get_main_option("sqlalchemy.url")
+    context.configure(
+        url=url,
+        target_metadata=target_metadata,
+        literal_binds=True,
+        dialect_opts={"paramstyle": "named"},
+        compare_type=True,
+        compare_server_default=True,
+    )
+    with context.begin_transaction():
+        context.run_migrations()
+
+
+# ---------------------------------------------------------------------------
+# Online migrations (async engine)
+# ---------------------------------------------------------------------------
+
+def do_run_migrations(connection: Connection) -> None:
+    context.configure(
+        connection=connection,
+        target_metadata=target_metadata,
+        compare_type=True,
+        compare_server_default=True,
+    )
+    with context.begin_transaction():
+        context.run_migrations()
+
+
+async def run_async_migrations() -> None:
+    """Create an async engine and run migrations inside a sync wrapper."""
+    connectable = create_async_engine(
+        config.get_main_option("sqlalchemy.url"),  # type: ignore[arg-type]
+        poolclass=pool.NullPool,  # no pool needed for one-shot migration runs
+    )
+
+    async with connectable.connect() as connection:
+        await connection.run_sync(do_run_migrations)
+
+    await connectable.dispose()
+
+
+def run_migrations_online() -> None:
+    asyncio.run(run_async_migrations())
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+if context.is_offline_mode():
+    run_migrations_offline()
+else:
+    run_migrations_online()
