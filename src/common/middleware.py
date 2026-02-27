@@ -16,14 +16,10 @@ class AccessLogMiddleware(BaseHTTPMiddleware):
     - HTTP method and path
     - User agent
     - Response status code
-    - Processing time
     """
 
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
         access_logger = get_access_logger()
-
-        # Record start time
-        start_time = time.perf_counter()
 
         # Get client information
         client_ip = self._get_client_ip(request)
@@ -37,10 +33,6 @@ class AccessLogMiddleware(BaseHTTPMiddleware):
         # Process the request
         response: Response = await call_next(request)
 
-        # Calculate processing time
-        process_time = time.perf_counter() - start_time
-        process_time_ms = round(process_time * 1000, 2)
-
         # Get response info
         status_code = response.status_code
         content_length = response.headers.get("content-length", "-")
@@ -49,14 +41,10 @@ class AccessLogMiddleware(BaseHTTPMiddleware):
         log_message = (
             f'{client_ip} - "{method} {full_path}" '
             f"{status_code} {content_length} "
-            f"{process_time_ms}ms "
             f'"{referer}" "{user_agent}"'
         )
 
         access_logger.info(log_message)
-
-        # Add processing time header to response
-        response.headers["X-Process-Time"] = f"{process_time_ms}ms"
 
         return response
 
@@ -111,7 +99,6 @@ class MetricsMiddleware(BaseHTTPMiddleware):
             ACTIVE_CONNECTIONS,
             API_ERRORS_TOTAL,
         )
-        import time
 
         # Record start time
         start_time = time.perf_counter()
@@ -193,3 +180,61 @@ class MetricsMiddleware(BaseHTTPMiddleware):
         path = re.sub(r"/[a-f0-9-]{36}", "/{uuid}", path)  # UUID pattern
 
         return path
+
+class CORSMiddleware(BaseHTTPMiddleware):
+
+    """
+    Middleware to handle Cross-Origin Resource Sharing (CORS).
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+
+        # Set CORS headers
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type"
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+
+        return response
+    
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """
+    Middleware to add security-related HTTP headers.
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+
+        # Set security headers
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["X-XSS-Protection"] = "1; mode=block"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Permissions-Policy"] = "geolocation=()"
+
+        return response
+    
+
+class MetaDataMiddleware(BaseHTTPMiddleware):
+    """
+    Middleware to add standardized metadata to all responses.
+    """
+
+    async def dispatch(self, request: Request, call_next):
+
+        # Record start time
+        start_time = time.perf_counter()
+
+        # Process the request
+        response: Response = await call_next(request)
+
+        # Calculate processing time
+        process_time = time.perf_counter() - start_time
+        process_time_ms = round(process_time * 1000, 2)
+
+         # Add processing time header to response
+        response.headers["X-Process-Time"] = f"{process_time_ms}ms"
+
+        return response
