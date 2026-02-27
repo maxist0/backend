@@ -46,12 +46,15 @@ class Settings(BaseSettings):
 
     # Logging
     LOG_LEVEL: str = "INFO"
-    LOG_DIR: str = "logs"  # Can be absolute path like /var/log/api
-    LOG_MAX_BYTES: int = 10485760  # 10 MB
-    LOG_BACKUP_COUNT: int = 5
 
     # Access Logging
     ACCESS_LOG_ENABLED: bool = True
+
+    # OTLP log export (Grafana Alloy / OpenTelemetry Collector)
+    OTLP_LOGS_ENABLED: bool = True
+    OTLP_ENDPOINT: str = "http://localhost:4318"          # base URL (no path)
+    OTLP_SERVICE_NAME: str = "api"
+    OTLP_HEADERS: str = ""                                # comma-separated key=value pairs
 
     # Metrics
     METRICS_ENABLED: bool = True

@@ -36,10 +36,10 @@ async def init_cache_pool() -> redis.Redis:
     try:
         await client.ping()
     except redis.RedisError as e:
-        logger.error(f"Failed to connect to Redis: {e}")
+        logger.error("cache.connect_failed", error=str(e))
         raise
 
-    logger.info("Redis connection pool initialized.")
+    logger.info("cache.pool_init")
     return client
 
 
@@ -51,6 +51,6 @@ def init_fastapi_cache(client: redis.Redis) -> None:
         cache_status_header="X-Cache", 
     )
     logger.info(
-        f"FastAPI cache initialised with Redis backend "
-        f"(prefix='{settings.CACHE_KEY_PREFIX}')."
+        "cache.fastapi_cache_init",
+        prefix=settings.CACHE_KEY_PREFIX,
     )

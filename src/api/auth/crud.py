@@ -264,10 +264,10 @@ async def cache_refresh_token(
     """Cache a refresh token in Redis with TTL."""
     ttl = int((data.expires_at - datetime.now(timezone.utc)).total_seconds())
     if ttl <= 0:
-        logger.warning("Refresh token already expired, not caching")
+        logger.warning("cache.refresh_token_expired_on_store")
         return
     await redis_client.set(_rt_key(raw_token), data.model_dump_json(), ex=ttl)
-    logger.debug(f"Cached refresh token session={data.session_id} TTL={ttl}s")
+    logger.debug("cache.refresh_token_cached", session_id=data.session_id, ttl_seconds=ttl)
 
 
 async def get_cached_refresh_token(

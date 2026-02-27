@@ -1,7 +1,9 @@
 # src/common/middleware.py
 import time
+import uuid
 from typing import Callable
 
+import structlog
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
@@ -9,46 +11,7 @@ from starlette.responses import Response
 from src.common.logging import get_access_logger
 
 
-class AccessLogMiddleware(BaseHTTPMiddleware):
-    """
-    Middleware to log HTTP access information including:
-    - Client IP address
-    - HTTP method and path
-    - User agent
-    - Response status code
-    """
-
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        access_logger = get_access_logger()
-
-        # Get client information
-        client_ip = self._get_client_ip(request)
-        method = request.method
-        path = request.url.path
-        query_string = request.url.query
-        full_path = f"{path}?{query_string}" if query_string else path
-        user_agent = request.headers.get("user-agent", "-")
-        referer = request.headers.get("referer", "-")
-
-        # Process the request
-        response: Response = await call_next(request)
-
-        # Get response info
-        status_code = response.status_code
-        content_length = response.headers.get("content-length", "-")
-
-        # Log in a structured format similar to Apache/Nginx combined log format
-        log_message = (
-            f'{client_ip} - "{method} {full_path}" '
-            f"{status_code} {content_length} "
-            f'"{referer}" "{user_agent}"'
-        )
-
-        access_logger.info(log_message)
-
-        return response
-
-    def _get_client_ip(self, request: Request) -> str:
+def _get_client_ip(self, request: Request) -> str:
         """
         Get the client IP address, considering proxy headers.
 
@@ -73,6 +36,54 @@ class AccessLogMiddleware(BaseHTTPMiddleware):
             return request.client.host
 
         return "-"
+
+
+class AccessLogMiddleware(BaseHTTPMiddleware):
+    """
+    Middleware to log HTTP access information as structured JSON events:
+    - Client IP address
+    - HTTP method and path
+    - User agent
+    - Response status code and size
+    - Processing duration (ms)
+    """
+
+    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+        access_logger = get_access_logger()
+
+        # Capture request metadata before processing
+        client_ip = _get_client_ip(request)
+        method = request.method
+        path = request.url.path
+        query_string = request.url.query
+        full_path = f"{path}?{query_string}" if query_string else path
+        user_agent = request.headers.get("user-agent", "-")
+        referer = request.headers.get("referer", "-")
+
+        # Process the request and measure duration
+        start = __import__("time").perf_counter()
+        response: Response = await call_next(request)
+        duration_ms = round((__import__("time").perf_counter() - start) * 1000, 2)
+
+        # Get response info
+        status_code = response.status_code
+        content_length = response.headers.get("content-length", "-")
+
+        # Emit a single structured access event
+        access_logger.info(
+            "http.access",
+            client_ip=client_ip,
+            method=method,
+            path=full_path,
+            status_code=status_code,
+            content_length=content_length,
+            duration_ms=duration_ms,
+            user_agent=user_agent,
+            referer=referer,
+        )
+        return response
+
+    
 
 
 class MetricsMiddleware(BaseHTTPMiddleware):
@@ -224,6 +235,19 @@ class MetaDataMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next):
 
+        # ------------------------------------------------------------------
+        # Per-request structlog context
+        # Clear any leftover context from a previous request (hot-reload /
+        # task-reuse), then bind a fresh request_id for this request.
+        # ------------------------------------------------------------------
+        structlog.contextvars.clear_contextvars()
+
+        # Use caller-supplied request id when present, otherwise generate one.
+        request_id = (
+            request.headers.get("x-request-id") or str(uuid.uuid4())
+        )
+        structlog.contextvars.bind_contextvars(request_id=request_id)
+
         # Record start time
         start_time = time.perf_counter()
 
@@ -237,4 +261,14 @@ class MetaDataMiddleware(BaseHTTPMiddleware):
          # Add processing time header to response
         response.headers["X-Process-Time"] = f"{process_time_ms}ms"
 
+        # Forward the request id so clients / gateways can correlate logs.
+        response.headers["X-Request-ID"] = request_id
+
+         
+        # Clean up context so it doesn't bleed into the next request.
+        structlog.contextvars.clear_contextvars()
         return response
+
+
+
+

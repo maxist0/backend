@@ -49,17 +49,19 @@ async def lifespan(app: FastAPI):
         environment=settings.ENVIRONMENT.value,
     )
 
-    # Log Start, PID,Port,IP etc.
-    logger.info("Application starting up")
-    logger.info(f"Process ID: {os.getpid()}")
-    logger.info(f"Working Directory: {os.getcwd()}")
-    logger.info(f"App Name: {app.title}")
-    logger.info(f"App Version: {app.version}")
-    logger.info(f"App Description: {app.description}")
-    logger.info(f"Environment: {settings.ENVIRONMENT.value.upper()}")
-    logger.info(f"Address: {settings.HOST}")
-    logger.info(f"Port: {settings.PORT}")
-    logger.info(f"Reload Enabled: {settings.RELOAD}")
+    # Log Start, PID, Port, IP etc. – one consolidated structured event.
+    logger.info(
+        "app.startup",
+        pid=os.getpid(),
+        cwd=os.getcwd(),
+        app_name=app.title,
+        app_version=app.version,
+        app_description=app.description,
+        environment=settings.ENVIRONMENT.value.upper(),
+        host=settings.HOST,
+        port=settings.PORT,
+        reload=settings.RELOAD,
+    )
 
     ## Initialize DB connection pool
     await init_db()
@@ -73,15 +75,15 @@ async def lifespan(app: FastAPI):
     yield
 
     # Shutdown
-    logger.info("Application shutting down ...")
+    logger.info("app.shutdown")
 
     ## Close DB connection pool and cache
     await close_db()
     if app.state.cache:
         await app.state.cache.close()
-        logger.info("Cache connection pool closed.")
+        logger.info("app.cache_closed")
 
-    logger.info("Application shutdown complete.")
+    logger.info("app.shutdown_complete")
 
 
 ## FastAPI Application Instance

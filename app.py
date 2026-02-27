@@ -43,13 +43,10 @@ def main():
 
     # Initialize settings BEFORE importing the app
     from src.common.config import init_settings
+    from src.common.logging import setup_logging, get_logger
 
     settings = init_settings(args.env)
-
-    # Setup logging with file handlers using settings from config
-    from src.common.logging import setup_logging
-
-    _log_dir = setup_logging(settings)
+    setup_logging(settings)
 
     # Now import and run the app
     import uvicorn

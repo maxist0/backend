@@ -83,7 +83,11 @@ async def register(
                 start_time=start_time,
             )
 
-        logger.info(f"User registered: {register_request.username}")
+        logger.info(
+            "auth.user_registered",
+            user_id=str(user.id),
+            username=user.username,
+        )
         return created_response(
             data={
                 "message": "User registered successfully. Please check your email to verify your account.",
@@ -93,7 +97,7 @@ async def register(
             start_time=start_time,
         )
     except Exception as e:
-        logger.error(f"Registration error: {e}", exc_info=True)
+        logger.error("auth.register_failed", exc_info=True)
         return error_response(
             message="Registration failed",
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -135,10 +139,13 @@ async def login(
             },
             status_code=200,
         )
+        logger.info(
+            "auth.user_logged_in",
+        )
         return add_refresh_token_to_cookie(response, raw_refresh)
 
     except Exception as e:
-        logger.error(f"Login error: {e}", exc_info=True)
+        logger.error("auth.login_failed", exc_info=True)
         return error_response(
             message="Login failed",
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -177,10 +184,11 @@ async def logout(
             request=request,
             start_time=start_time,
         )
+        logger.info("auth.user_logged_out")
         return delete_refresh_token_cookie(response)
 
     except Exception as e:
-        logger.error(f"Logout error: {e}", exc_info=True)
+        logger.error("auth.logout_failed", exc_info=True)
         return error_response(
             message="Logout failed",
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -226,10 +234,11 @@ async def refresh_tokens(
             },
             status_code=200,
         )
+        logger.info("auth.token_refreshed")
         return add_refresh_token_to_cookie(response, new_raw_refresh)
 
     except Exception as e:
-        logger.error(f"Refresh error: {e}", exc_info=True)
+        logger.error("auth.refresh_failed", exc_info=True)
         return error_response(
             message="Token refresh failed",
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -260,7 +269,7 @@ async def password_forgot(
             start_time=start_time,
         )
     except Exception as e:
-        logger.error(f"Password forgot error: {e}", exc_info=True)
+        logger.error("auth.password_forgot_failed", exc_info=True)
         return error_response(
             message="Failed to process password reset request",
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -288,13 +297,14 @@ async def password_reset(
                 request=request,
                 start_time=start_time,
             )
+        logger.info("auth.password_reset_completed")
         return ok_response(
             data={"message": "Password has been reset successfully"},
             request=request,
             start_time=start_time,
         )
     except Exception as e:
-        logger.error(f"Password reset error: {e}", exc_info=True)
+        logger.error("auth.password_reset_failed", exc_info=True)
         return error_response(
             message="Password reset failed",
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -326,13 +336,14 @@ async def email_verify(
                 request=request,
                 start_time=start_time,
             )
+        logger.info("auth.email_verified")
         return ok_response(
             data={"message": "Email verified successfully"},
             request=request,
             start_time=start_time,
         )
     except Exception as e:
-        logger.error(f"Email verify error: {e}", exc_info=True)
+        logger.error("auth.email_verify_failed", exc_info=True)
         return error_response(
             message="Email verification failed",
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -360,13 +371,14 @@ async def email_verify_resend(
                 request=request,
                 start_time=start_time,
             )
+        logger.info("auth.verification_email_resent", user_id=str(current_user.id))
         return ok_response(
             data={"message": "Verification email has been resent"},
             request=request,
             start_time=start_time,
         )
     except Exception as e:
-        logger.error(f"Resend verification error: {e}", exc_info=True)
+        logger.error("auth.resend_verification_failed", exc_info=True)
         return error_response(
             message="Failed to resend verification email",
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

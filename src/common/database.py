@@ -10,7 +10,7 @@ Usage in routers / services:
 """
 
 from typing import AsyncGenerator
-
+from sqlalchemy.engine import make_url
 from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import (
     AsyncConnection,
@@ -33,12 +33,14 @@ logger = get_logger(__name__)
 def _build_engine() -> AsyncEngine:
     """Create the async SQLAlchemy engine from application settings."""
     url = settings.DATABASE_URL
-    logger.info(f"Creating database engine with URL: {url}")
+
+    url = make_url(url)  # validate and parse the URL
+    logger.info("db.engine_creating", url=url.render_as_string(hide_password=True))
 
     # asyncpg requires the postgresql+asyncpg:// scheme
-    if url.startswith("postgresql://") or url.startswith("postgres://"):
-        url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
-        url = url.replace("postgres://", "postgresql+asyncpg://", 1)
+    #if url.startswith("postgresql://") or url.startswith("postgres://"):
+    #    url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    #    url = url.replace("postgres://", "postgresql+asyncpg://", 1)
 
     return create_async_engine(
         url,
@@ -49,7 +51,7 @@ def _build_engine() -> AsyncEngine:
         pool_recycle=settings.DB_POOL_RECYCLE,
         pool_pre_ping=True,          # discard stale connections
         # --- misc ---
-        echo=settings.DEBUG,         # SQL echo only in debug mode
+        echo=False,      # SQL echo only in debug mode
         future=True,                 # SQLAlchemy 2.0 style
     )
 
@@ -84,13 +86,13 @@ async def init_db() -> None:
     """Verify the database is reachable on startup."""
     async with engine.connect() as conn:
         await conn.execute(text("SELECT 1"))
-    logger.info("Database connection pool initialised (%s)", settings.DATABASE_URL)
+    logger.info("db.pool_init", url=settings.DATABASE_URL)
 
 
 async def close_db() -> None:
     """Dispose the engine / connection pool on shutdown."""
     await engine.dispose()
-    logger.info("Database connection pool closed.")
+    logger.info("db.pool_closed")
 
 # ---------------------------------------------------------------------------
 # FastAPI dependency

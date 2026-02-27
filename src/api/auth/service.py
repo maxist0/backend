@@ -128,7 +128,7 @@ async def _audit(
 
 async def _send_email_stub(to: str, subject: str, token: str) -> None:
     """Placeholder – log instead of sending real email."""
-    logger.info(f"[EMAIL STUB] To={to} Subject='{subject}' Token={token}")
+    logger.info("auth.email_stub_sent", to=to, subject=subject, token=token)
 
 
 # ---------------------------------------------------------------------------
@@ -186,7 +186,7 @@ async def register_user(
     # Stub email
     await _send_email_stub(email, "Verify your email", raw_token)
 
-    logger.info(f"User registered: {username} (id={user.id})")
+    logger.info("auth.user_registered", username=username, user_id=str(user.id))
     return user, None
 
 
@@ -350,8 +350,9 @@ async def refresh_session(
     if sess and sess.is_revoked:
         # Token reuse detected! Revoke the entire family.
         logger.warning(
-            f"Refresh token reuse detected! family={sess.family_id} "
-            f"user={sess.user_id}"
+            "auth.token_reuse_detected",
+            family_id=str(sess.family_id),
+            user_id=str(sess.user_id),
         )
         revoked_sessions = await crud.revoke_family(
             db, sess.family_id, reason="reuse_detected"
@@ -451,7 +452,7 @@ async def reset_password(
     await _audit(
         db, AuditEventType.PASSWORD_RESET_COMPLETED, email_token.user_id, request
     )
-    logger.info(f"Password reset completed for user_id={email_token.user_id}")
+    logger.info("auth.password_reset_completed", user_id=str(email_token.user_id))
     return True, None
 
 
@@ -484,7 +485,7 @@ async def verify_email(
     user.is_email_verified = True
     await crud.update_user(db, user)
     await _audit(db, AuditEventType.EMAIL_VERIFIED, user.id, request)
-    logger.info(f"Email verified for user_id={user.id}")
+    logger.info("auth.email_verified", user_id=str(user.id))
     return True, None
 
 
@@ -540,7 +541,7 @@ async def change_password(
     await crud.update_password_hash(db, user_id, hash_password(new_password))
     await _audit(db, AuditEventType.PASSWORD_CHANGED, user_id, request)
 
-    logger.info(f"Password changed for user_id={user_id}")
+    logger.info("auth.password_changed", user_id=str(user_id))
     return True, None
 
 
