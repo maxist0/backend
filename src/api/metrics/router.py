@@ -5,21 +5,29 @@ Metrics API endpoints.
 
 from datetime import datetime
 from fastapi import APIRouter, Response, Request
-from src.common.metrics import get_metrics, get_metrics_content_type
+from src.common.metrics import get_metrics, get_metrics_content_type, ACTIVE_REFRESH_TOKENS
 from src.common.responses import ok_response, SuccessResponse
 from src.common.config import settings
+from src.common.constants import REDIS_REFRESH_TOKEN_PREFIX
 import os
 
 router = APIRouter()
 
 
 @router.get("/")
-async def metrics():
+async def metrics(request: Request):
     """
     Prometheus metrics endpoint.
 
     Returns metrics in Prometheus format for scraping by monitoring systems.
     """
+    redis_client = getattr(request.app.state, "cache", None)
+    if redis_client is not None:
+        try:
+            keys = await redis_client.keys(REDIS_REFRESH_TOKEN_PREFIX)
+            ACTIVE_REFRESH_TOKENS.set(len(keys))
+        except Exception:
+            pass
     metrics_data = get_metrics()
     return Response(content=metrics_data, media_type=get_metrics_content_type())
 

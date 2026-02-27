@@ -1,20 +1,18 @@
 # src/api/auth/jwt_utils.py
 
 """
-JWT utility functions: create, validate, revoke and decode tokens.
-All persistence is delegated to crud.py.
+JWT utility functions: create and decode access tokens.
+Refresh-token management is handled in service.py / crud.py.
 """
 
 import uuid
-import secrets
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
+
 import jwt
-import redis.asyncio as redis
+
+from src.api.auth.models import TokenData
 from src.common.config import settings
-from src.api.auth.models import TokenData, RefreshToken
-from fastapi import Request
-from src.api.auth import crud
 from src.common.logging import get_logger
 
 logger = get_logger(__name__)
@@ -27,7 +25,8 @@ def create_access_token(
     if expires_delta is None:
         expires_delta = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
 
-    expire = datetime.utcnow() + expires_delta
+    now = datetime.now(timezone.utc)
+    expire = now + expires_delta
     jti = str(uuid.uuid4())
 
     to_encode = {
@@ -36,63 +35,13 @@ def create_access_token(
         "jti": jti,
         "type": "access",
         "exp": expire,
-        "iat": datetime.utcnow(),
-        "nbf": datetime.utcnow(),
+        "iat": now,
+        "nbf": now,
     }
 
-    encoded_jwt = jwt.encode(
+    return jwt.encode(
         to_encode, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM
     )
-
-    return encoded_jwt
-
-
-async def create_refresh_token(
-    username: str,
-    user_id: str,
-    redis_client: redis.Redis,
-    request: Optional[Request] = None,
-    expires_delta: Optional[timedelta] = None,
-) -> str:
-    """Create an opaque refresh token and store it in Redis."""
-    if expires_delta is None:
-        expires_delta = timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
-
-    expire = datetime.utcnow() + expires_delta
-    opaque_token = secrets.token_urlsafe(32)
-
-    refresh_token_obj = RefreshToken(
-        user_id=user_id,
-        username=username,
-        token=opaque_token,
-        expires_at=expire,
-        device_id=request.headers.get("x-device-id") if request else None,
-        device_name=request.headers.get("x-device-name") if request else None,
-        ip_address=request.client.host if request and request.client else None,
-        user_agent=request.headers.get("user-agent") if request else None,
-    )
-    await crud.save_refresh_token(refresh_token_obj, redis_client)
-
-    logger.info(
-        f"Refresh token created for user {username} with ID {refresh_token_obj.id}"
-    )
-
-    return opaque_token
-
-
-async def validate_refresh_token(
-    token: str, redis_client: redis.Redis
-) -> Optional[RefreshToken]:
-    """Return the active RefreshToken for *token*, or None if invalid/expired."""
-    return await crud.get_active_refresh_token(token, redis_client)
-
-
-async def revoke_refresh_token(token: str, redis_client: redis.Redis) -> bool:
-    """Revoke a refresh token by deleting it from Redis. Returns True if found."""
-    revoked = await crud.revoke_refresh_token(token, redis_client)
-    if revoked:
-        logger.info(f"Refresh token revoked: {token[:8]}...")
-    return revoked
 
 
 def decode_token(token: str) -> Optional[TokenData]:
@@ -108,7 +57,6 @@ def decode_token(token: str) -> Optional[TokenData]:
         user_id: str = str(payload.get("sub"))
         username: str = str(payload.get("username"))
         jti: str = str(payload.get("jti"))
-        
 
         if user_id is None or username is None or jti is None:
             logger.warning("Invalid access token")

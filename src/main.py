@@ -9,17 +9,23 @@ Sets up the FastAPI app, middleware, routes, and lifecycle events.
 from contextlib import asynccontextmanager
 from datetime import datetime
 import os
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, status
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from src.common.logging import get_logger
 from src.common.config import settings, init_settings
 from src.common.database import init_db, close_db
 from src.common.cache import init_cache_pool, init_fastapi_cache
-from src.common.middleware import AccessLogMiddleware, MetricsMiddleware
+from src.common.middleware import AccessLogMiddleware, MetricsMiddleware,SecurityHeadersMiddleware, MetaDataMiddleware,CORSMiddleware
 from src.common.metrics import init_metrics
-from src.common.responses import ok_response, SuccessResponse
+from src.common.responses import ok_response, error_response, SuccessResponse
+from src.common.models import ErrorCode
 from src.api.metrics.router import router as metrics_router
 from src.api.auth.router import router as auth_router
+from src.api.user.router import router as user_router
 from fastapi_cache.decorator import cache
+
+from fastapi.middleware.gzip import GZipMiddleware
 
 # Logger for this module
 logger = get_logger(__name__)
@@ -100,11 +106,56 @@ app = FastAPI(
 )
 
 
+## Validation Error Handler
+"""
+Override FastAPI's default validation error response to use the unified error_response format.
+"""
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    """Return Pydantic / request-validation errors in the standard error envelope."""
+    start_time = datetime.now()
+    errors = exc.errors()
+
+    # Build a human-readable summary from the first error
+    first = errors[0] if errors else {}
+    loc = " -> ".join(str(l) for l in first.get("loc", []) if l != "body")
+    msg = first.get("msg", "Validation error")
+    message = f"{loc}: {msg}" if loc else msg
+
+    # Include all individual errors in details
+    detail_list = [
+        {
+            "field": " -> ".join(str(l) for l in e.get("loc", []) if l != "body"),
+            "message": e.get("msg", ""),
+            "type": e.get("type", ""),
+        }
+        for e in errors
+    ]
+
+    return error_response(
+        message=message,
+        error_code=ErrorCode.VALIDATION_ERROR,
+        field=loc or None,
+        details={"validation_errors": detail_list},
+        request=request,
+        start_time=start_time,
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+    )
+
+
 ## Middleware Configuration
 """
 Configure middleware for metrics and access logging.
 """
 
+app.add_middleware(MetaDataMiddleware)  # Add metadata middleware to all requests
+app.add_middleware(CORSMiddleware)  # Add Cors middleware with configured settings
+app.add_middleware(GZipMiddleware, minimum_size=1000)  # Add GZip compression for responses larger than 1KB
+app.add_middleware(SecurityHeadersMiddleware)   
 # Add metrics middleware (before other middleware for accurate timing)
 if settings.METRICS_ENABLED:
     app.add_middleware(MetricsMiddleware)
@@ -122,6 +173,9 @@ if settings.METRICS_ENABLED:
 
 # Include authentication routes
 app.include_router(auth_router, prefix="/auth", tags=["authentication"])
+
+# Include user profile routes
+app.include_router(user_router, prefix="/user", tags=["user"])
 
 
 # Root Endpoint
