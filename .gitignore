@@ -26,11 +26,12 @@ dist/
 build/
 
 .pytest_cache/
-
-k8n/
-scripts/
-
 .ruff_cache/
 .mypy_cache/
 
+
+
+deployment/
+documentation/
+scripts/
 implementation-plan/
