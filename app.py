@@ -7,6 +7,7 @@ Usage:
     python app.py test     # Test environment
     python app.py stage    # Staging environment
     python app.py prod     # Production environment
+    python app.py unittest  # Unit testing environment (not for running the server)
 """
 
 import argparse
@@ -18,7 +19,7 @@ def main():
         "env",
         nargs="?",
         default="dev",
-        choices=["dev", "test", "stage", "prod"],
+        choices=["dev", "test", "stage", "prod", "unittest"],
         help="Environment to run (default: dev)",
     )
     parser.add_argument(

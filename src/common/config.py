@@ -12,6 +12,7 @@ class Environment(str, Enum):
     TEST = "test"
     STAGE = "stage"
     PROD = "prod"
+    UNITTEST = "unittest"
 
 
 class Settings(BaseSettings):
