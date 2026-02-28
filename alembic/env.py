@@ -24,14 +24,6 @@ from sqlalchemy.ext.asyncio import create_async_engine
 # ── Import the project's declarative Base so Alembic can detect schema changes.
 # Add additional model modules here as the project grows.
 from src.common.database import Base  # noqa: F401 – registers metadata
-from src.common.config import init_settings, settings
-
-# ── Import concrete model modules so their tables appear in Base.metadata.
-from src.api.auth.models import (  # noqa: F401
-    User, PasswordCredential, AuthAuditLog, EmailToken, Session,
-)
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -62,6 +54,7 @@ target_metadata = Base.metadata
 # Offline migrations (no live DB connection)
 # ---------------------------------------------------------------------------
 
+
 def run_migrations_offline() -> None:
     """Generate SQL scripts without a live connection."""
     url = config.get_main_option("sqlalchemy.url")
@@ -80,6 +73,7 @@ def run_migrations_offline() -> None:
 # ---------------------------------------------------------------------------
 # Online migrations (async engine)
 # ---------------------------------------------------------------------------
+
 
 def do_run_migrations(connection: Connection) -> None:
     context.configure(

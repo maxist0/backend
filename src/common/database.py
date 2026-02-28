@@ -11,9 +11,8 @@ Usage in routers / services:
 
 from typing import AsyncGenerator
 from sqlalchemy.engine import make_url
-from sqlalchemy import event, text
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
-    AsyncConnection,
     AsyncEngine,
     AsyncSession,
     async_sessionmaker,
@@ -30,15 +29,18 @@ logger = get_logger(__name__)
 # Engine – created once, reused for the lifetime of the process
 # ---------------------------------------------------------------------------
 
+
 def _build_engine() -> AsyncEngine:
     """Create the async SQLAlchemy engine from application settings."""
-    url = settings.DATABASE_URL
+    url: str = settings.DATABASE_URL
 
-    url = make_url(url)  # validate and parse the URL
-    logger.info("db.engine_creating", url=url.render_as_string(hide_password=True))
+    maked_url = make_url(url)  # validate and parse the URL
+    logger.info(
+        "db.engine_creating", url=maked_url.render_as_string(hide_password=True)
+    )
 
     # asyncpg requires the postgresql+asyncpg:// scheme
-    #if url.startswith("postgresql://") or url.startswith("postgres://"):
+    # if url.startswith("postgresql://") or url.startswith("postgres://"):
     #    url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
     #    url = url.replace("postgres://", "postgresql+asyncpg://", 1)
 
@@ -49,10 +51,10 @@ def _build_engine() -> AsyncEngine:
         max_overflow=settings.DB_MAX_OVERFLOW,
         pool_timeout=settings.DB_POOL_TIMEOUT,
         pool_recycle=settings.DB_POOL_RECYCLE,
-        pool_pre_ping=True,          # discard stale connections
+        pool_pre_ping=True,  # discard stale connections
         # --- misc ---
-        echo=False,      # SQL echo only in debug mode
-        future=True,                 # SQLAlchemy 2.0 style
+        echo=False,  # SQL echo only in debug mode
+        future=True,  # SQLAlchemy 2.0 style
     )
 
 
@@ -74,13 +76,17 @@ AsyncSessionFactory: async_sessionmaker[AsyncSession] = async_sessionmaker(
 # Declarative Base – import this in your ORM models
 # ---------------------------------------------------------------------------
 
+
 class Base(DeclarativeBase):
     """Project-wide SQLAlchemy declarative base."""
+
     pass
+
 
 # ---------------------------------------------------------------------------
 # Lifecycle helpers – called from main.py lifespan
 # ---------------------------------------------------------------------------
+
 
 async def init_db() -> None:
     """Verify the database is reachable on startup."""
@@ -94,9 +100,11 @@ async def close_db() -> None:
     await engine.dispose()
     logger.info("db.pool_closed")
 
+
 # ---------------------------------------------------------------------------
 # FastAPI dependency
 # ---------------------------------------------------------------------------
+
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
     """Yield an AsyncSession; roll back on error, always close."""

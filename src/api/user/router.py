@@ -66,7 +66,7 @@ async def update_me(
             start_time=start_time,
         )
     except Exception as e:
-        logger.error("user.profile_update_failed", exc_info=True)
+        logger.error("user.profile_update_failed", error=str(e), exc_info=True)
         return error_response(
             message="Profile update failed",
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -107,7 +107,7 @@ async def change_my_password(
             start_time=start_time,
         )
     except Exception as e:
-        logger.error("user.password_change_failed", exc_info=True)
+        logger.error("user.password_change_failed", error=str(e), exc_info=True)
         return error_response(
             message="Password change failed",
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

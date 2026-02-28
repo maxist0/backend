@@ -24,8 +24,8 @@ class Settings(BaseSettings):
     # Connection pool
     DB_POOL_SIZE: int = 10
     DB_MAX_OVERFLOW: int = 20
-    DB_POOL_TIMEOUT: int = 30          # seconds to wait for a connection
-    DB_POOL_RECYCLE: int = 1800        # recycle connections after 30 min
+    DB_POOL_TIMEOUT: int = 30  # seconds to wait for a connection
+    DB_POOL_RECYCLE: int = 1800  # recycle connections after 30 min
 
     # Cache
     CACHE_HOST: str = "localhost"
@@ -51,10 +51,10 @@ class Settings(BaseSettings):
     ACCESS_LOG_ENABLED: bool = True
 
     # OTLP log export (Grafana Alloy / OpenTelemetry Collector)
-    OTLP_LOGS_ENABLED: bool = True
-    OTLP_ENDPOINT: str = "http://localhost:4318"          # base URL (no path)
+    OTLP_LOGS_ENABLED: bool = False
+    OTLP_ENDPOINT: str = "http://localhost:4318"  # base URL (no path)
     OTLP_SERVICE_NAME: str = "api"
-    OTLP_HEADERS: str = ""                                # comma-separated key=value pairs
+    OTLP_HEADERS: str = ""  # comma-separated key=value pairs
 
     # Metrics
     METRICS_ENABLED: bool = True
@@ -107,10 +107,10 @@ def get_settings(env: Optional[str] = None) -> Settings:
 
     env_files = get_env_file(env)
 
-    return Settings(
-        _env_file=env_files if env_files else None,
-        ENVIRONMENT=Environment(env),
-    )
+    class _Settings(Settings):
+        model_config = SettingsConfigDict(env_file=env_files or ())
+
+    return _Settings(ENVIRONMENT=Environment(env))
 
 
 def init_settings(env: str) -> Settings:
@@ -121,6 +121,6 @@ def init_settings(env: str) -> Settings:
 
 
 # Global settings instance - will be set by app.py
-settings: Optional[Settings] = init_settings(
+settings: Settings = init_settings(
     "dev"
 )  # Default to dev, will be overridden by app.py

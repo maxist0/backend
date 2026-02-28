@@ -9,7 +9,6 @@ Authentication routes:
 """
 
 from datetime import datetime
-from typing import Any, Dict
 
 from fastapi import APIRouter, Depends, Request, status
 from fastapi.responses import JSONResponse
@@ -57,6 +56,7 @@ router = APIRouter()
 # Registration
 # ---------------------------------------------------------------------------
 
+
 @router.post("/register")
 async def register(
     register_request: RegisterRequest,
@@ -97,7 +97,7 @@ async def register(
             start_time=start_time,
         )
     except Exception as e:
-        logger.error("auth.register_failed", exc_info=True)
+        logger.error("auth.register_failed", error=str(e), exc_info=True)
         return error_response(
             message="Registration failed",
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -110,6 +110,7 @@ async def register(
 # ---------------------------------------------------------------------------
 # Login
 # ---------------------------------------------------------------------------
+
 
 @router.post("/login")
 async def login(
@@ -145,7 +146,7 @@ async def login(
         return add_refresh_token_to_cookie(response, raw_refresh)
 
     except Exception as e:
-        logger.error("auth.login_failed", exc_info=True)
+        logger.error("auth.login_failed", error=str(e), exc_info=True)
         return error_response(
             message="Login failed",
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -158,6 +159,7 @@ async def login(
 # ---------------------------------------------------------------------------
 # Logout
 # ---------------------------------------------------------------------------
+
 
 @router.post("/logout")
 async def logout(
@@ -188,7 +190,7 @@ async def logout(
         return delete_refresh_token_cookie(response)
 
     except Exception as e:
-        logger.error("auth.logout_failed", exc_info=True)
+        logger.error("auth.logout_failed", error=str(e), exc_info=True)
         return error_response(
             message="Logout failed",
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -201,6 +203,7 @@ async def logout(
 # ---------------------------------------------------------------------------
 # Refresh
 # ---------------------------------------------------------------------------
+
 
 @router.post("/refresh")
 async def refresh_tokens(
@@ -218,7 +221,7 @@ async def refresh_tokens(
         access_token, new_raw_refresh, err = await refresh_session(
             db, raw_token, redis_client, request
         )
-        if access_token is None:
+        if access_token is None or new_raw_refresh is None:
             return error_response(
                 message=err or "Token refresh failed",
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -238,7 +241,7 @@ async def refresh_tokens(
         return add_refresh_token_to_cookie(response, new_raw_refresh)
 
     except Exception as e:
-        logger.error("auth.refresh_failed", exc_info=True)
+        logger.error("auth.refresh_failed", error=str(e), exc_info=True)
         return error_response(
             message="Token refresh failed",
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -252,6 +255,7 @@ async def refresh_tokens(
 # Password forgot / reset
 # ---------------------------------------------------------------------------
 
+
 @router.post("/password/forgot")
 async def password_forgot(
     body: PasswordForgotRequest,
@@ -264,12 +268,14 @@ async def password_forgot(
         await forgot_password(db, body.email, request)
         # Always return success to prevent email enumeration
         return ok_response(
-            data={"message": "If the email exists, a password reset link has been sent."},
+            data={
+                "message": "If the email exists, a password reset link has been sent."
+            },
             request=request,
             start_time=start_time,
         )
     except Exception as e:
-        logger.error("auth.password_forgot_failed", exc_info=True)
+        logger.error("auth.password_forgot_failed", error=str(e), exc_info=True)
         return error_response(
             message="Failed to process password reset request",
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -304,7 +310,7 @@ async def password_reset(
             start_time=start_time,
         )
     except Exception as e:
-        logger.error("auth.password_reset_failed", exc_info=True)
+        logger.error("auth.password_reset_failed", error=str(e), exc_info=True)
         return error_response(
             message="Password reset failed",
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -317,6 +323,7 @@ async def password_reset(
 # ---------------------------------------------------------------------------
 # Email verification
 # ---------------------------------------------------------------------------
+
 
 @router.post("/email/verify")
 async def email_verify(
@@ -343,7 +350,7 @@ async def email_verify(
             start_time=start_time,
         )
     except Exception as e:
-        logger.error("auth.email_verify_failed", exc_info=True)
+        logger.error("auth.email_verify_failed", error=str(e), exc_info=True)
         return error_response(
             message="Email verification failed",
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -378,7 +385,7 @@ async def email_verify_resend(
             start_time=start_time,
         )
     except Exception as e:
-        logger.error("auth.resend_verification_failed", exc_info=True)
+        logger.error("auth.resend_verification_failed", error=str(e), exc_info=True)
         return error_response(
             message="Failed to resend verification email",
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -391,6 +398,7 @@ async def email_verify_resend(
 # ---------------------------------------------------------------------------
 # 2FA stubs (not yet implemented)
 # ---------------------------------------------------------------------------
+
 
 @router.post("/2fa/enable")
 async def enable_2fa(request: Request) -> JSONResponse:

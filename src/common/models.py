@@ -1,6 +1,6 @@
 # src/common/models.py
 
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, cast, Union, Optional
 from pydantic import BaseModel, ConfigDict, Field
 from datetime import datetime
 from enum import Enum
@@ -62,7 +62,8 @@ class BaseResponse(BaseModel):
 
     success: bool = Field(..., description="Whether the request was successful")
     metadata: ResponseMetadata = Field(
-        default_factory=ResponseMetadata, description="Response metadata"
+        default_factory=cast(Callable[[], ResponseMetadata], ResponseMetadata),
+        description="Response metadata",
     )
 
 
@@ -73,7 +74,6 @@ class SuccessResponse(BaseResponse):
     data: Optional[Union[Dict[str, Any], List[Any], str, int, float, bool]] = Field(
         None, description="Response data"
     )
-    
 
 
 class ErrorResponse(BaseResponse):

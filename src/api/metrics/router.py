@@ -5,7 +5,11 @@ Metrics API endpoints.
 
 from datetime import datetime
 from fastapi import APIRouter, Response, Request
-from src.common.metrics import get_metrics, get_metrics_content_type, ACTIVE_REFRESH_TOKENS
+from src.common.metrics import (
+    get_metrics,
+    get_metrics_content_type,
+    ACTIVE_REFRESH_TOKENS,
+)
 from src.common.responses import ok_response, SuccessResponse
 from src.common.config import settings
 from src.common.constants import REDIS_REFRESH_TOKEN_PREFIX

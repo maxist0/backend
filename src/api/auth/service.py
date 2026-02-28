@@ -45,6 +45,7 @@ _ph = PasswordHasher()
 # Password helpers
 # ---------------------------------------------------------------------------
 
+
 def hash_password(password: str) -> str:
     """Return an argon2id hash of *password*."""
     return _ph.hash(password)
@@ -61,6 +62,7 @@ def verify_password(password: str, password_hash: str) -> bool:
 # ---------------------------------------------------------------------------
 # User → response helper
 # ---------------------------------------------------------------------------
+
 
 def user_to_response(user: User) -> UserResponse:
     """Convert a User ORM object to a UserResponse Pydantic model."""
@@ -79,6 +81,7 @@ def user_to_response(user: User) -> UserResponse:
 # ---------------------------------------------------------------------------
 # Cookie helpers
 # ---------------------------------------------------------------------------
+
 
 def add_refresh_token_to_cookie(
     response: JSONResponse, refresh_token: str
@@ -104,6 +107,7 @@ def delete_refresh_token_cookie(response: JSONResponse) -> JSONResponse:
 # Audit helper
 # ---------------------------------------------------------------------------
 
+
 async def _audit(
     db: AsyncSession,
     event: AuditEventType,
@@ -126,6 +130,7 @@ async def _audit(
 # Email stub
 # ---------------------------------------------------------------------------
 
+
 async def _send_email_stub(to: str, subject: str, token: str) -> None:
     """Placeholder – log instead of sending real email."""
     logger.info("auth.email_stub_sent", to=to, subject=subject, token=token)
@@ -134,6 +139,7 @@ async def _send_email_stub(to: str, subject: str, token: str) -> None:
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
+
 
 async def register_user(
     db: AsyncSession,
@@ -194,6 +200,7 @@ async def register_user(
 # Authentication (login)
 # ---------------------------------------------------------------------------
 
+
 async def authenticate_user(
     db: AsyncSession,
     username: str,
@@ -213,7 +220,10 @@ async def authenticate_user(
         if user.locked_until and user.locked_until > utcnow():
             remaining = int((user.locked_until - utcnow()).total_seconds())
             await _audit(
-                db, AuditEventType.LOGIN_FAILED, user.id, request,
+                db,
+                AuditEventType.LOGIN_FAILED,
+                user.id,
+                request,
                 f"Account locked, {remaining}s remaining",
             )
             return None, f"Account is locked. Try again in {remaining} seconds"
@@ -224,7 +234,10 @@ async def authenticate_user(
             user.locked_until = None
             await crud.update_user(db, user)
             await _audit(
-                db, AuditEventType.ACCOUNT_UNLOCKED, user.id, request,
+                db,
+                AuditEventType.ACCOUNT_UNLOCKED,
+                user.id,
+                request,
                 "Lock expired",
             )
 
@@ -243,7 +256,10 @@ async def authenticate_user(
             )
             await crud.update_user(db, user)
             await _audit(
-                db, AuditEventType.ACCOUNT_LOCKED, user.id, request,
+                db,
+                AuditEventType.ACCOUNT_LOCKED,
+                user.id,
+                request,
                 f"Locked after {user.failed_login_attempts} failed attempts",
             )
             return None, "Account has been locked due to too many failed login attempts"
@@ -263,6 +279,7 @@ async def authenticate_user(
 # ---------------------------------------------------------------------------
 # Session / Refresh-token management
 # ---------------------------------------------------------------------------
+
 
 async def create_session_tokens(
     db: AsyncSession,
@@ -358,7 +375,10 @@ async def refresh_session(
             db, sess.family_id, reason="reuse_detected"
         )
         await _audit(
-            db, AuditEventType.SESSION_REVOKED, sess.user_id, request,
+            db,
+            AuditEventType.SESSION_REVOKED,
+            sess.user_id,
+            request,
             f"Token reuse detected, revoked {len(revoked_sessions)} session(s) "
             f"in family {sess.family_id}",
         )
@@ -396,6 +416,7 @@ async def logout_session(
 # ---------------------------------------------------------------------------
 # Password reset
 # ---------------------------------------------------------------------------
+
 
 async def forgot_password(
     db: AsyncSession,
@@ -460,6 +481,7 @@ async def reset_password(
 # Email verification
 # ---------------------------------------------------------------------------
 
+
 async def verify_email(
     db: AsyncSession,
     raw_token: str,
@@ -523,6 +545,7 @@ async def resend_verification_email(
 # Change password (authenticated)
 # ---------------------------------------------------------------------------
 
+
 async def change_password(
     db: AsyncSession,
     user_id: uuid.UUID,
@@ -548,6 +571,7 @@ async def change_password(
 # ---------------------------------------------------------------------------
 # Profile update
 # ---------------------------------------------------------------------------
+
 
 async def update_profile(
     db: AsyncSession,

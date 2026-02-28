@@ -8,12 +8,13 @@ import uuid
 from typing import Optional
 
 import structlog
-from fastapi import Depends, HTTPException, Request, status
+from fastapi import Depends, Request
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 
 from src.api.auth import crud
 from src.api.auth.jwt_utils import decode_token
 from src.api.auth.models import TokenData, User
+from src.api.auth.exceptions import AuthenticationError
 from src.common.dependencies import DbSession
 from src.common.logging import get_logger
 
@@ -24,18 +25,10 @@ oauth2_scheme = OAuth2PasswordBearer(
 )
 
 
-class AuthenticationError(HTTPException):
-    def __init__(self, detail: str = "Authentication failed"):
-        super().__init__(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=detail,
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-
 # ---------------------------------------------------------------------------
 # Access-token dependencies
 # ---------------------------------------------------------------------------
+
 
 async def get_current_token_data(
     token: str = Depends(oauth2_scheme),
@@ -86,6 +79,7 @@ async def get_optional_user(
 # Form-based authentication (OAuth2 password flow for /auth/login)
 # ---------------------------------------------------------------------------
 
+
 async def authenticate_form_user(
     request: Request,
     db: DbSession,
@@ -99,16 +93,17 @@ async def authenticate_form_user(
     )
     if user is None:
         raise AuthenticationError(error or "Invalid username or password")
-    
+
     # Stamp every subsequent log in this request with the authenticated user.
     structlog.contextvars.bind_contextvars(user_id=str(user.id), username=user.username)
-    
+
     return user
 
 
 # ---------------------------------------------------------------------------
 # Refresh-token cookie extraction
 # ---------------------------------------------------------------------------
+
 
 async def get_refresh_token_from_cookie(request: Request) -> str:
     """Extract the raw refresh token from the httpOnly cookie."""

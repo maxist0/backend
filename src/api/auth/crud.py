@@ -35,6 +35,7 @@ logger = get_logger(__name__)
 # Redis key helpers
 # ---------------------------------------------------------------------------
 
+
 def _rt_key(raw_token: str) -> str:
     return f"{REDIS_REFRESH_TOKEN_PREFIX}{raw_token}"
 
@@ -42,6 +43,7 @@ def _rt_key(raw_token: str) -> str:
 # ---------------------------------------------------------------------------
 # User CRUD
 # ---------------------------------------------------------------------------
+
 
 async def get_user_by_id(db: AsyncSession, user_id: uuid.UUID) -> Optional[User]:
     with DatabaseTimer("select", "users"):
@@ -79,6 +81,7 @@ async def update_user(db: AsyncSession, user: User) -> User:
 # PasswordCredential CRUD
 # ---------------------------------------------------------------------------
 
+
 async def create_password_credential(
     db: AsyncSession, credential: PasswordCredential
 ) -> PasswordCredential:
@@ -113,6 +116,7 @@ async def update_password_hash(
 # ---------------------------------------------------------------------------
 # Session CRUD
 # ---------------------------------------------------------------------------
+
 
 async def create_session(db: AsyncSession, session: Session) -> Session:
     with DatabaseTimer("insert", "sessions"):
@@ -186,6 +190,7 @@ async def get_active_sessions_for_user(
 # EmailToken CRUD
 # ---------------------------------------------------------------------------
 
+
 async def create_email_token(db: AsyncSession, token: EmailToken) -> EmailToken:
     with DatabaseTimer("insert", "email_tokens"):
         db.add(token)
@@ -214,9 +219,7 @@ async def get_valid_email_token(
 async def mark_email_token_used(db: AsyncSession, token_id: uuid.UUID) -> None:
     with DatabaseTimer("update", "email_tokens"):
         await db.execute(
-            update(EmailToken)
-            .where(EmailToken.id == token_id)
-            .values(used_at=utcnow())
+            update(EmailToken).where(EmailToken.id == token_id).values(used_at=utcnow())
         )
         await db.flush()
 
@@ -245,6 +248,7 @@ async def invalidate_tokens_for_user_purpose(
 # AuthAuditLog CRUD
 # ---------------------------------------------------------------------------
 
+
 async def create_audit_log(db: AsyncSession, log: AuthAuditLog) -> AuthAuditLog:
     with DatabaseTimer("insert", "auth_audit_log"):
         db.add(log)
@@ -255,6 +259,7 @@ async def create_audit_log(db: AsyncSession, log: AuthAuditLog) -> AuthAuditLog:
 # ---------------------------------------------------------------------------
 # Redis – Refresh-token cache
 # ---------------------------------------------------------------------------
+
 
 async def cache_refresh_token(
     raw_token: str,
@@ -267,7 +272,9 @@ async def cache_refresh_token(
         logger.warning("cache.refresh_token_expired_on_store")
         return
     await redis_client.set(_rt_key(raw_token), data.model_dump_json(), ex=ttl)
-    logger.debug("cache.refresh_token_cached", session_id=data.session_id, ttl_seconds=ttl)
+    logger.debug(
+        "cache.refresh_token_cached", session_id=data.session_id, ttl_seconds=ttl
+    )
 
 
 async def get_cached_refresh_token(

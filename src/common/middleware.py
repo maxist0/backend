@@ -11,31 +11,31 @@ from starlette.responses import Response
 from src.common.logging import get_access_logger
 
 
-def _get_client_ip(self, request: Request) -> str:
-        """
-        Get the client IP address, considering proxy headers.
+def _get_client_ip(request: Request) -> str:
+    """
+    Get the client IP address, considering proxy headers.
 
-        Checks in order:
-        1. X-Forwarded-For (first IP in the chain)
-        2. X-Real-IP
-        3. Direct client host
-        """
-        # Check X-Forwarded-For header (may contain multiple IPs)
-        forwarded_for = request.headers.get("x-forwarded-for")
-        if forwarded_for:
-            # Take the first IP (original client)
-            return forwarded_for.split(",")[0].strip()
+    Checks in order:
+    1. X-Forwarded-For (first IP in the chain)
+    2. X-Real-IP
+    3. Direct client host
+    """
+    # Check X-Forwarded-For header (may contain multiple IPs)
+    forwarded_for = request.headers.get("x-forwarded-for")
+    if forwarded_for:
+        # Take the first IP (original client)
+        return forwarded_for.split(",")[0].strip()
 
-        # Check X-Real-IP header
-        real_ip = request.headers.get("x-real-ip")
-        if real_ip:
-            return real_ip
+    # Check X-Real-IP header
+    real_ip = request.headers.get("x-real-ip")
+    if real_ip:
+        return real_ip
 
-        # Fall back to direct client
-        if request.client:
-            return request.client.host
+    # Fall back to direct client
+    if request.client:
+        return request.client.host
 
-        return "-"
+    return "-"
 
 
 class AccessLogMiddleware(BaseHTTPMiddleware):
@@ -82,8 +82,6 @@ class AccessLogMiddleware(BaseHTTPMiddleware):
             referer=referer,
         )
         return response
-
-    
 
 
 class MetricsMiddleware(BaseHTTPMiddleware):
@@ -192,8 +190,8 @@ class MetricsMiddleware(BaseHTTPMiddleware):
 
         return path
 
-class CORSMiddleware(BaseHTTPMiddleware):
 
+class CORSMiddleware(BaseHTTPMiddleware):
     """
     Middleware to handle Cross-Origin Resource Sharing (CORS).
     """
@@ -203,12 +201,14 @@ class CORSMiddleware(BaseHTTPMiddleware):
 
         # Set CORS headers
         response.headers["Access-Control-Allow-Origin"] = "*"
-        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+        response.headers["Access-Control-Allow-Methods"] = (
+            "GET, POST, PUT, DELETE, OPTIONS"
+        )
         response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type"
         response.headers["Access-Control-Allow-Credentials"] = "true"
 
         return response
-    
+
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     """
@@ -226,7 +226,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["Permissions-Policy"] = "geolocation=()"
 
         return response
-    
+
 
 class MetaDataMiddleware(BaseHTTPMiddleware):
     """
@@ -243,9 +243,7 @@ class MetaDataMiddleware(BaseHTTPMiddleware):
         structlog.contextvars.clear_contextvars()
 
         # Use caller-supplied request id when present, otherwise generate one.
-        request_id = (
-            request.headers.get("x-request-id") or str(uuid.uuid4())
-        )
+        request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
         structlog.contextvars.bind_contextvars(request_id=request_id)
 
         # Record start time
@@ -258,17 +256,12 @@ class MetaDataMiddleware(BaseHTTPMiddleware):
         process_time = time.perf_counter() - start_time
         process_time_ms = round(process_time * 1000, 2)
 
-         # Add processing time header to response
+        # Add processing time header to response
         response.headers["X-Process-Time"] = f"{process_time_ms}ms"
 
         # Forward the request id so clients / gateways can correlate logs.
         response.headers["X-Request-ID"] = request_id
 
-         
         # Clean up context so it doesn't bleed into the next request.
         structlog.contextvars.clear_contextvars()
         return response
-
-
-
-

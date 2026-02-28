@@ -48,7 +48,7 @@ def init_fastapi_cache(client: redis.Redis) -> None:
     FastAPICache.init(
         RedisBackend(client),
         prefix=settings.CACHE_KEY_PREFIX,
-        cache_status_header="X-Cache", 
+        cache_status_header="X-Cache",
     )
     logger.info(
         "cache.fastapi_cache_init",

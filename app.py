@@ -43,7 +43,7 @@ def main():
 
     # Initialize settings BEFORE importing the app
     from src.common.config import init_settings
-    from src.common.logging import setup_logging, get_logger
+    from src.common.logging import setup_logging
 
     settings = init_settings(args.env)
     setup_logging(settings)

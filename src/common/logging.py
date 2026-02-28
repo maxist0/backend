@@ -41,6 +41,7 @@ logger: structlog.BoundLogger = structlog.get_logger("src")
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+
 def _parse_otlp_headers(raw: str) -> dict[str, str]:
     """Parse ``KEY=VALUE,KEY2=VALUE2`` header string into a dict."""
     headers: dict[str, str] = {}
@@ -77,7 +78,9 @@ def _build_otlp_handler(settings: "Settings") -> logging.Handler | None:
         )
         return None
 
-    headers = _parse_otlp_headers(settings.OTLP_HEADERS) if settings.OTLP_HEADERS else {}
+    headers = (
+        _parse_otlp_headers(settings.OTLP_HEADERS) if settings.OTLP_HEADERS else {}
+    )
 
     exporter = OTLPLogExporter(
         endpoint=f"{settings.OTLP_ENDPOINT.rstrip('/')}/v1/logs",
@@ -97,6 +100,7 @@ def _build_otlp_handler(settings: "Settings") -> logging.Handler | None:
 # ---------------------------------------------------------------------------
 # Shared structlog processor chain
 # ---------------------------------------------------------------------------
+
 
 def _make_static_fields_processor(environment: str) -> Any:
     """
@@ -129,6 +133,7 @@ _SHARED_PROCESSORS: list[Any] = [
 # ---------------------------------------------------------------------------
 # Public setup function
 # ---------------------------------------------------------------------------
+
 
 def setup_logging(settings: "Settings") -> None:
     """
@@ -183,7 +188,9 @@ def setup_logging(settings: "Settings") -> None:
 
     stdout_handler = logging.StreamHandler(sys.stdout)
     stdout_handler.setLevel(log_level_int)
-    stdout_handler.setFormatter(console_formatter if  not settings.is_production else json_formatter)
+    stdout_handler.setFormatter(
+        console_formatter if not settings.is_production else json_formatter
+    )
     handlers.append(stdout_handler)
 
     if settings.OTLP_LOGS_ENABLED:
@@ -201,7 +208,14 @@ def setup_logging(settings: "Settings") -> None:
         root_logger.addHandler(h)
 
     # Silence noisy third-party loggers
-    for name in ("uvicorn.access", "uvicorn.error", "sqlalchemy.engine", "urllib3","sqlalchemy","python_multipart.multipart"):
+    for name in (
+        "uvicorn.access",
+        "uvicorn.error",
+        "sqlalchemy.engine",
+        "urllib3",
+        "sqlalchemy",
+        "python_multipart.multipart",
+    ):
         logger = logging.getLogger(name)
         logger.setLevel(logging.WARNING)
         logger.handlers = []  # Clear any existing handlers
@@ -216,13 +230,16 @@ def setup_logging(settings: "Settings") -> None:
 
         access_stdout = logging.StreamHandler(sys.stdout)
         access_stdout.setLevel(logging.INFO)
-        access_stdout.setFormatter(console_formatter if not settings.is_production else json_formatter)
+        access_stdout.setFormatter(
+            console_formatter if not settings.is_production else json_formatter
+        )
         access_log.handlers = []
         access_log.addHandler(access_stdout)
 
         if settings.OTLP_LOGS_ENABLED:
             for h in handlers:
                 from opentelemetry.sdk._logs import LoggingHandler as _OtelH
+
                 if isinstance(h, _OtelH):
                     access_log.addHandler(h)
                     break
@@ -245,6 +262,7 @@ def setup_logging(settings: "Settings") -> None:
 # Public helpers
 # ---------------------------------------------------------------------------
 
+
 def get_logger(name: str) -> structlog.stdlib.BoundLogger:
     """
     Return a structlog logger bound to *name*.
@@ -261,4 +279,3 @@ def get_logger(name: str) -> structlog.stdlib.BoundLogger:
 def get_access_logger() -> structlog.stdlib.BoundLogger:
     """Return the dedicated HTTP access logger."""
     return structlog.get_logger("access")
-

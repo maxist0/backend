@@ -16,7 +16,13 @@ from src.common.logging import get_logger
 from src.common.config import settings, init_settings
 from src.common.database import init_db, close_db
 from src.common.cache import init_cache_pool, init_fastapi_cache
-from src.common.middleware import AccessLogMiddleware, MetricsMiddleware,SecurityHeadersMiddleware, MetaDataMiddleware,CORSMiddleware
+from src.common.middleware import (
+    AccessLogMiddleware,
+    MetricsMiddleware,
+    SecurityHeadersMiddleware,
+    MetaDataMiddleware,
+    CORSMiddleware,
+)
 from src.common.metrics import init_metrics
 from src.common.responses import ok_response, error_response, SuccessResponse
 from src.common.models import ErrorCode
@@ -124,14 +130,14 @@ async def validation_exception_handler(
 
     # Build a human-readable summary from the first error
     first = errors[0] if errors else {}
-    loc = " -> ".join(str(l) for l in first.get("loc", []) if l != "body")
+    loc = " -> ".join(str(loc) for loc in first.get("loc", []) if loc != "body")
     msg = first.get("msg", "Validation error")
     message = f"{loc}: {msg}" if loc else msg
 
     # Include all individual errors in details
     detail_list = [
         {
-            "field": " -> ".join(str(l) for l in e.get("loc", []) if l != "body"),
+            "field": " -> ".join(str(loc) for loc in e.get("loc", []) if loc != "body"),
             "message": e.get("msg", ""),
             "type": e.get("type", ""),
         }
@@ -156,8 +162,10 @@ Configure middleware for metrics and access logging.
 
 app.add_middleware(MetaDataMiddleware)  # Add metadata middleware to all requests
 app.add_middleware(CORSMiddleware)  # Add Cors middleware with configured settings
-app.add_middleware(GZipMiddleware, minimum_size=1000)  # Add GZip compression for responses larger than 1KB
-app.add_middleware(SecurityHeadersMiddleware)   
+app.add_middleware(
+    GZipMiddleware, minimum_size=1000
+)  # Add GZip compression for responses larger than 1KB
+app.add_middleware(SecurityHeadersMiddleware)
 # Add metrics middleware (before other middleware for accurate timing)
 if settings.METRICS_ENABLED:
     app.add_middleware(MetricsMiddleware)
@@ -187,7 +195,7 @@ Define the root endpoint with standardized response.
 
 
 @app.get("/", response_model=SuccessResponse)
-@cache(expire=60)  
+@cache(expire=60)
 async def root(request: Request):
     """Root endpoint with standardized response."""
     start_time = datetime.now()

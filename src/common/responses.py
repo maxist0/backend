@@ -21,7 +21,7 @@ def create_response_metadata(
     request: Optional[Request] = None, start_time: Optional[datetime] = None
 ) -> ResponseMetadata:
     """Create response metadata with optional request information."""
-    metadata_dict = {
+    metadata_dict: dict[str, Any] = {
         "request_id": str(uuid.uuid4()),
         "version": settings.APP_VERSION,
     }
@@ -46,7 +46,7 @@ def success_response(
 ) -> JSONResponse:
     """Create a standardized success response."""
     metadata = create_response_metadata(request=request, start_time=start_time)
-    response = SuccessResponse(data=data, metadata=metadata)
+    response = SuccessResponse(data=data, metadata=metadata, success=True)
     return JSONResponse(content=response.model_dump(), status_code=status_code)
 
 
@@ -64,7 +64,9 @@ def error_response(
     error_detail = ErrorDetail(
         code=error_code, message=message, field=field, details=details
     )
-    response = ErrorResponse(error=error_detail, metadata=metadata)
+    response = ErrorResponse(
+        error=error_detail, metadata=metadata, data=None, success=False
+    )
     return JSONResponse(content=response.model_dump(), status_code=status_code)
 
 
@@ -103,7 +105,11 @@ def paginated_response(
     )
 
     response = PaginatedResponse(
-        data=data, pagination=pagination_info, metadata=metadata
+        data=data,
+        pagination=pagination_info,
+        metadata=metadata,
+        success=True,
+        error=None,
     )
     return JSONResponse(content=response.model_dump(), status_code=200)
 

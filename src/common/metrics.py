@@ -103,11 +103,11 @@ def get_metrics() -> bytes:
     return generate_latest(REGISTRY)
 
 
-def get_metrics_content_type() -> bytes:
+def get_metrics_content_type() -> str:
     """
     Get the content type for metrics.
     """
-    return CONTENT_TYPE_LATEST
+    return str(CONTENT_TYPE_LATEST)
 
 
 # Helper functions for custom metrics

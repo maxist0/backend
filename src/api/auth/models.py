@@ -32,6 +32,7 @@ from src.common.database import Base
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def utcnow() -> datetime:
     """Return the current UTC datetime (timezone-aware)."""
     return datetime.now(timezone.utc)
@@ -45,6 +46,7 @@ def hash_token(raw_token: str) -> str:
 # ---------------------------------------------------------------------------
 # SQLAlchemy ORM Models
 # ---------------------------------------------------------------------------
+
 
 class User(Base):
     __tablename__ = "users"
@@ -88,9 +90,7 @@ class User(Base):
     sessions: Mapped[list["Session"]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
-    audit_logs: Mapped[list["AuthAuditLog"]] = relationship(
-        back_populates="user"
-    )
+    audit_logs: Mapped[list["AuthAuditLog"]] = relationship(back_populates="user")
 
 
 class PasswordCredential(Base):
@@ -121,6 +121,7 @@ class PasswordCredential(Base):
 # ---------------------------------------------------------------------------
 # Enums
 # ---------------------------------------------------------------------------
+
 
 class AuditEventType(PyEnum):
     REGISTER = "register"
@@ -228,9 +229,7 @@ class Session(Base):
         nullable=False,
     )
     token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
-    family_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), nullable=False
-    )
+    family_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     is_revoked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     revoke_reason: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
 
@@ -336,6 +335,7 @@ class UpdateProfileRequest(BaseModel):
 # ---------------------------------------------------------------------------
 # Response schemas
 # ---------------------------------------------------------------------------
+
 
 class UserResponse(BaseModel):
     """Public user representation returned by the API."""
