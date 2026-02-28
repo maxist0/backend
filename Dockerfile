@@ -40,9 +40,10 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/metrics/health')" || exit 1
 
+
 # Use ENTRYPOINT to define the executable
 # This allows you to pass the stage as an argument at runtime
 ENTRYPOINT ["python", "app.py"]
 
 # Default to production if no argument is provided
-CMD ["prod"]
+CMD ["test"]

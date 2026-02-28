@@ -49,6 +49,16 @@ docker-compose*.yml
 .dockerignore
 
 # Documentation
+documentation/
+implementation-plan/
+README.md
+
+# Other
+scripts/
+.mypy_cache/
+.ruff_cache/
+
+# Documentation
 README.md
 docs/
 
