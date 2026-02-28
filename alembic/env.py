@@ -14,6 +14,7 @@ Downgrade one step:
 
 import asyncio
 from logging.config import fileConfig
+import os
 
 from alembic import context
 from sqlalchemy import pool
@@ -32,14 +33,19 @@ from src.api.auth.models import (  # noqa: F401
 
 
 
-settings = init_settings("test")
+
 # ---------------------------------------------------------------------------
 # Alembic Config object – gives access to values in alembic.ini
 # ---------------------------------------------------------------------------
 config = context.config
 
 # Inject the live DATABASE_URL so we never hard-code it in alembic.ini
-_url = settings.DATABASE_URL
+
+## Get database from .env
+_url = os.getenv("DATABASE_URL")
+assert _url, "DATABASE_URL environment variable must be set for Alembic migrations"
+
+
 if _url.startswith("postgresql://") or _url.startswith("postgres://"):
     _url = _url.replace("postgresql://", "postgresql+asyncpg://", 1)
     _url = _url.replace("postgres://", "postgresql+asyncpg://", 1)
