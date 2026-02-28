@@ -15,7 +15,7 @@ from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatc
 from fastapi import Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-import redis.asyncio as aioredis
+import redis.asyncio as aioredis # type: ignore
 
 from src.api.auth import crud
 from src.api.auth.jwt_utils import create_access_token

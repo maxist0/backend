@@ -51,3 +51,6 @@ dev = [
     "mypy>=1.19.1",
     "ruff>=0.15.0",
 ]
+[[tool.mypy.overrides]]
+module = "redis.*"
+ignore_missing_imports = true

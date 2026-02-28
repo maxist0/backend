@@ -68,7 +68,6 @@ class Settings(BaseSettings):
     # Server
     HOST: str = "0.0.0.0"
     PORT: int = 8000
-    RELOAD: bool = False
 
     @property
     def is_production(self) -> bool:
@@ -97,15 +96,13 @@ def get_env_file(env: str) -> list[str]:
 
 
 @lru_cache
-def get_settings(env: Optional[str] = None) -> Settings:
+def get_settings(env: str) -> Settings:
     """
     Get settings for the specified environment.
     Environment-specific file (.env.{env}) overrides base .env
     """
-    if env is None:
-        env = "dev"
-
     env_files = get_env_file(env)
+    print(f"Loading settings for environment '{env}' from files: {env_files}")
 
     class _Settings(Settings):
         model_config = SettingsConfigDict(env_file=env_files or ())
@@ -121,6 +118,4 @@ def init_settings(env: str) -> Settings:
 
 
 # Global settings instance - will be set by app.py
-settings: Settings = init_settings(
-    "dev"
-)  # Default to dev, will be overridden by app.py
+settings: Settings = None # type: ignore

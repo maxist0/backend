@@ -54,17 +54,13 @@ def main():
     # Use command-line args if provided, otherwise use settings from config
     host = args.host if args.host is not None else settings.HOST
     port = args.port if args.port is not None else settings.PORT
-    reload_enabled = args.reload if args.reload is not None else settings.RELOAD
 
     uvicorn.run(
         "src.main:app",
         host=host,
         port=port,
-        reload=reload_enabled,
+        reload=False,
         log_config=None,  # Disable uvicorn's default logging configuration
-        reload_includes=["src/", "app.py"]
-        if reload_enabled
-        else None,  # Watch src/ and app.py for changes
     )
 
 

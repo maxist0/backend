@@ -13,7 +13,7 @@ from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from src.common.logging import get_logger
-from src.common.config import settings, init_settings
+from src.common.config import settings
 from src.common.database import init_db, close_db
 from src.common.cache import init_cache_pool, init_fastapi_cache
 from src.common.middleware import (
@@ -66,7 +66,6 @@ async def lifespan(app: FastAPI):
         environment=settings.ENVIRONMENT.value.upper(),
         host=settings.HOST,
         port=settings.PORT,
-        reload=settings.RELOAD,
     )
 
     ## Initialize DB connection pool
@@ -97,11 +96,7 @@ async def lifespan(app: FastAPI):
 Create FastAPI application instance with metadata and lifecycle management.
 """
 
-# Check if settings is initialized, if not initialize with default environment
-if settings is None:
-    print("Settings not initialized, initializing with default environment 'dev'")
-    settings = init_settings("dev")
-
+assert settings is not None, "Settings must be initialized before creating the app instance"
 
 app = FastAPI(
     title=settings.APP_NAME,
