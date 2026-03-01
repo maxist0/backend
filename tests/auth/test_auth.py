@@ -164,8 +164,8 @@ class TestLogin:
         # Even correct password must now be rejected
         r = login(client, username="alice")
         assert r.status_code == 401
-        # body = r.json()
-        # assert body["success"] is False TODO
+        body = r.json()
+        assert body["success"] is False
 
     def test_failed_attempt_counter_resets_on_successful_login(
         self, client, captured_emails

@@ -1,4 +1,4 @@
-# src/api/user/curd.py
+# src/api/user/crud.py
 
 """
 Data-access layer for user profile operations.
@@ -11,6 +11,8 @@ from src.api.auth.crud import (
     update_user,
     get_password_credential,
     update_password_hash,
+    invalidate_tokens_for_user_purpose,
+    create_email_token,
 )
 
 __all__ = [
@@ -19,4 +21,6 @@ __all__ = [
     "update_user",
     "get_password_credential",
     "update_password_hash",
+    "invalidate_tokens_for_user_purpose",
+    "create_email_token",
 ]

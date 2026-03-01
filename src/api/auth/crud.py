@@ -66,7 +66,6 @@ async def get_user_by_email(db: AsyncSession, email: str) -> Optional[User]:
 async def create_user(db: AsyncSession, user: User) -> User:
     with DatabaseTimer("insert", "users"):
         db.add(user)
-        await db.flush()
         await db.commit()
     return user
 
@@ -74,7 +73,7 @@ async def create_user(db: AsyncSession, user: User) -> User:
 async def update_user(db: AsyncSession, user: User) -> User:
     with DatabaseTimer("update", "users"):
         user.updated_at = utcnow()
-        await db.flush()
+        db.add(user)
         await db.commit()
     return user
 
@@ -89,7 +88,6 @@ async def create_password_credential(
 ) -> PasswordCredential:
     with DatabaseTimer("insert", "password_credentials"):
         db.add(credential)
-        await db.flush()
         await db.commit()
     return credential
 
@@ -124,7 +122,6 @@ async def update_password_hash(
 async def create_session(db: AsyncSession, session: Session) -> Session:
     with DatabaseTimer("insert", "sessions"):
         db.add(session)
-        await db.flush()
         await db.commit()
     return session
 

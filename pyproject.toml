@@ -109,7 +109,7 @@ exclude_lines = [
 ]
 skip_empty = true                 # ignore files with no executable lines
 skip_covered = false              # hide 100% covered files from report
-fail_under = 80                   # fail if total coverage below this %
+fail_under = 85                  # fail if total coverage below this %
 precision = 2                     # decimal places in percentages
 show_missing = true               # show missing line numbers
 sort = "cover"                    # sort by: "name", "stmts", "miss", "cover"

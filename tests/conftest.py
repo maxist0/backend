@@ -146,6 +146,7 @@ def captured_emails(monkeypatch) -> dict[str, str]:
         emails[to] = token
 
     monkeypatch.setattr("src.api.auth.service._send_email_stub", _capture)
+    monkeypatch.setattr("src.api.user.service._send_email_stub", _capture)
     return emails
 
 

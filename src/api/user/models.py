@@ -1,14 +1,9 @@
 # src/api/user/models.py
 
 """
-Pydantic request/response schemas for /user endpoints.
-ORM models live in src.api.auth.models (shared).
+ORM models live in src.api.auth.models .
 """
 
-from src.api.auth.schemas import (
-    ChangePasswordRequest,
-    UpdateProfileRequest,
-    UserResponse,
-)
+from src.api.auth.models import User, EmailToken, EmailTokenPurpose, hash_token, utcnow
 
-__all__ = ["ChangePasswordRequest", "UpdateProfileRequest", "UserResponse"]
+__all__ = ["User", "EmailToken", "EmailTokenPurpose", "hash_token", "utcnow"]

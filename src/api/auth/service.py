@@ -131,7 +131,7 @@ async def _audit(
 
 
 async def _send_email_stub(to: str, subject: str, token: str) -> None:
-    """Placeholder – log instead of sending real email."""
+    """Placeholder - log instead of sending real email."""
     logger.info("auth.email_stub_sent", to=to, subject=subject, token=token)
 
 
@@ -593,51 +593,3 @@ async def change_password(
 
     logger.info("auth.password_changed", user_id=str(user_id))
     return True, None
-
-
-# ---------------------------------------------------------------------------
-# Profile update
-# ---------------------------------------------------------------------------
-
-
-async def update_profile(
-    db: AsyncSession,
-    user_id: uuid.UUID,
-    display_name: Optional[str] = None,
-    new_email: Optional[str] = None,
-    request: Optional[Request] = None,
-) -> Tuple[Optional[User], Optional[str]]:
-    """
-    Update user profile fields.
-    If email is changed, a confirmation token is created (re-verification required).
-    """
-    user = await crud.get_user_by_id(db, user_id)
-    if user is None:
-        return None, "User not found"
-
-    if display_name is not None:
-        user.display_name = display_name
-
-    if new_email is not None and new_email != user.email:
-        # Check if new email is already taken
-        existing = await crud.get_user_by_email(db, new_email)
-        if existing and existing.id != user.id:
-            return None, "Email already in use"
-
-        # Create a change-email token
-        await crud.invalidate_tokens_for_user_purpose(
-            db, user.id, EmailTokenPurpose.CHANGE_EMAIL
-        )
-        raw_token = secrets.token_urlsafe(32)
-        email_token = EmailToken(
-            user_id=user.id,
-            purpose=EmailTokenPurpose.CHANGE_EMAIL,
-            token_hash=hash_token(raw_token),
-            new_email=new_email,
-            expires_at=utcnow() + timedelta(hours=24),
-        )
-        await crud.create_email_token(db, email_token)
-        await _send_email_stub(new_email, "Confirm your new email", raw_token)
-
-    await crud.update_user(db, user)
-    return user, None
