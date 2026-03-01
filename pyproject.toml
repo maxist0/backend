@@ -60,7 +60,7 @@ module = "redis.*"
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
-addopts = "-v -ra --tb=short --cov=src"
+addopts = "-v -ra --tb=short --cov=src --cov-report=term-missing --cov-fail-under=80"
 markers = [
     "auth: tests related to authentication and authorization",
     "users: tests for user management",
@@ -75,3 +75,54 @@ filterwarnings = [
 
 [tool.coverage.run]
 source = ["src"]
+branch = true
+parallel = false 
+concurrency = ["thread"]
+omit = [
+    "src/common/logging.py",
+    "src/main.py",
+    "*/__init__.py",
+]
+include = [
+    "src/*",
+]
+data_file = ".coverage"           # where to store coverage data
+
+
+
+[tool.coverage.report]
+exclude_lines = [
+    # default pragmas
+    "pragma: no cover",
+    # abstract/protocol methods
+    "raise NotImplementedError",
+    "@abstractmethod",
+    # type checking only blocks
+    "if TYPE_CHECKING:",
+    "if typing.TYPE_CHECKING:",
+    # defensive programming
+    "raise AssertionError",
+    # unreachable
+    "pass",
+    # main guard
+    'if __name__ == "__main__":',
+]
+skip_empty = true                 # ignore files with no executable lines
+skip_covered = false              # hide 100% covered files from report
+fail_under = 80                   # fail if total coverage below this %
+precision = 2                     # decimal places in percentages
+show_missing = true               # show missing line numbers
+sort = "cover"                    # sort by: "name", "stmts", "miss", "cover"
+
+[tool.coverage.html]
+directory = "htmlcov"
+title = "My Project Coverage"
+skip_covered = true
+skip_empty = true
+
+[tool.coverage.xml]
+output = "coverage.xml"
+
+[tool.coverage.json]
+output = "coverage.json"
+pretty_print = true

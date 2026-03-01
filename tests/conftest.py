@@ -1,54 +1,70 @@
 # conftest.py
+import asyncio
 import os
 import sys
-import asyncio
+
+import pytest
 from alembic import command
 from alembic.config import Config
-import pytest
 from fastapi.testclient import TestClient
-from testcontainers.postgres import PostgresContainer
+from sqlalchemy import text
+from testcontainers.postgres import PostgresContainer  # type: ignore
+from testcontainers.redis import RedisContainer  # type: ignore
 
-_container: PostgresContainer | None = None
+_pg_container: PostgresContainer | None = None
+_redis_container: RedisContainer | None = None
 
 if sys.platform == "win32":
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# Session-level: spin up containers and set env vars BEFORE anything imports
+# ---------------------------------------------------------------------------
+
 
 def pytest_configure(config):
-    global _container
-    _container = PostgresContainer("postgres:15-alpine")
-    _container.start()
+    global _pg_container, _redis_container
 
-    raw = _container.get_connection_url()
-
-    # testcontainers returns postgresql+psycopg2:// — swap to the async driver
+    _pg_container = PostgresContainer("postgres:15-alpine")
+    _pg_container.start()
+    raw = _pg_container.get_connection_url()
     async_url = (
-        raw
-        .replace("postgresql+psycopg2://", "postgresql+psycopg://")
+        raw.replace("postgresql+psycopg2://", "postgresql+psycopg://")
         .replace("postgresql://", "postgresql+psycopg://")
         .replace("postgres://", "postgresql+psycopg://")
     )
-
     os.environ["DATABASE_URL"] = async_url
+
+    _redis_container = RedisContainer("redis:7-alpine")
+    _redis_container.start()
+    redis_port = _redis_container.get_exposed_port(6379)
+    os.environ["REDIS_URL"] = f"redis://localhost:{redis_port}"
 
 
 def pytest_unconfigure(config):
-    """Tear down container after the session."""
-    global _container
-    if _container:
-        _container.stop()
+    global _pg_container, _redis_container
+    if _pg_container:
+        _pg_container.stop()
+    if _redis_container:
+        _redis_container.stop()
+
+
+# ---------------------------------------------------------------------------
+# Session-level: run Alembic migrations once
+# ---------------------------------------------------------------------------
 
 
 @pytest.fixture(scope="session", autouse=True)
 def init_db():
-    """Initialize settings + schema once DATABASE_URL is guaranteed to be set."""
     from src.common.config import init_settings
+
     init_settings("unittest")
 
     import src.common.database as database
 
     alembic_cfg = Config("alembic.ini")
     alembic_cfg.set_main_option("sqlalchemy.url", os.environ["DATABASE_URL"])
-
     command.upgrade(alembic_cfg, "head")
 
     async def _create():
@@ -56,7 +72,6 @@ def init_db():
             await conn.run_sync(database.Base.metadata.create_all)
 
     asyncio.run(_create())
-
     yield
 
     async def _drop():
@@ -66,8 +81,84 @@ def init_db():
     asyncio.run(_drop())
 
 
-@pytest.fixture(scope="session")
+# ---------------------------------------------------------------------------
+# Function-scoped: fresh TestClient per test
+#
+# Why function-scoped?
+#   - Each TestClient owns a requests.Session (its own cookie jar).
+#     A session-scoped client would leak refresh-token cookies between tests.
+#   - The DB container and migrations stay session-scoped (expensive);
+#     recreating the ASGI client is cheap.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
 def client(init_db):
     from src.main import app
+
     with TestClient(app) as c:
         yield c
+
+
+# ---------------------------------------------------------------------------
+# Function-scoped: truncate all auth tables after every test
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def clean_db(init_db):
+    yield
+
+    import src.common.database as database
+
+    async def _truncate():
+        async with database.engine.begin() as conn:
+            # CASCADE handles FK ordering automatically.
+            await conn.execute(
+                text(
+                    "TRUNCATE auth_audit_log, email_tokens, sessions, "
+                    "password_credentials, users CASCADE"
+                )
+            )
+
+    asyncio.run(_truncate())
+
+
+# ---------------------------------------------------------------------------
+# Function-scoped: capture tokens that would normally be emailed
+#
+# The service calls `_send_email_stub(to, subject, token)` instead of a real
+# mailer.  We replace it with a coroutine that stores the latest token per
+# address so tests can retrieve and use them without hitting an SMTP server.
+#
+# Usage:
+#   def test_something(client, captured_emails):
+#       _register(client, username="alice")
+#       token = captured_emails["alice@example.com"]
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def captured_emails(monkeypatch) -> dict[str, str]:
+    emails: dict[str, str] = {}
+
+    async def _capture(to: str, subject: str, token: str) -> None:
+        emails[to] = token
+
+    monkeypatch.setattr("src.api.auth.service._send_email_stub", _capture)
+    return emails
+
+
+@pytest.fixture
+def deactivate_user():
+    import src.common.database as database
+    from sqlalchemy import update
+    from src.api.auth.models import User
+
+    async def _run(username: str):
+        async with database.engine.begin() as conn:
+            await conn.execute(
+                update(User).where(User.username == username).values(is_active=False)
+            )
+
+    return _run
