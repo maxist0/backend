@@ -10,7 +10,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-import redis.asyncio as redis # type: ignore
+import redis.asyncio as redis  # type: ignore
 from sqlalchemy import and_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -19,11 +19,11 @@ from src.api.auth.models import (
     EmailToken,
     EmailTokenPurpose,
     PasswordCredential,
-    RefreshTokenCache,
     Session,
     User,
     utcnow,
 )
+from src.api.auth.schemas import RefreshTokenCache
 from src.common.constants import REDIS_REFRESH_TOKEN_PREFIX
 from src.common.logging import get_logger
 from src.common.metrics import DatabaseTimer
@@ -67,6 +67,7 @@ async def create_user(db: AsyncSession, user: User) -> User:
     with DatabaseTimer("insert", "users"):
         db.add(user)
         await db.flush()
+        await db.commit()
     return user
 
 
@@ -74,6 +75,7 @@ async def update_user(db: AsyncSession, user: User) -> User:
     with DatabaseTimer("update", "users"):
         user.updated_at = utcnow()
         await db.flush()
+        await db.commit()
     return user
 
 
@@ -88,6 +90,7 @@ async def create_password_credential(
     with DatabaseTimer("insert", "password_credentials"):
         db.add(credential)
         await db.flush()
+        await db.commit()
     return credential
 
 
@@ -110,7 +113,7 @@ async def update_password_hash(
             .where(PasswordCredential.user_id == user_id)
             .values(password_hash=new_hash, updated_at=utcnow())
         )
-        await db.flush()
+        await db.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +125,7 @@ async def create_session(db: AsyncSession, session: Session) -> Session:
     with DatabaseTimer("insert", "sessions"):
         db.add(session)
         await db.flush()
+        await db.commit()
     return session
 
 
@@ -144,7 +148,7 @@ async def revoke_session(
             .where(Session.id == session_id)
             .values(is_revoked=True, revoke_reason=reason, revoked_at=utcnow())
         )
-        await db.flush()
+        await db.commit()
 
 
 async def revoke_family(
@@ -166,7 +170,7 @@ async def revoke_family(
                 )
                 .values(is_revoked=True, revoke_reason=reason, revoked_at=utcnow())
             )
-            await db.flush()
+            await db.commit()
     return sessions
 
 
@@ -194,7 +198,7 @@ async def get_active_sessions_for_user(
 async def create_email_token(db: AsyncSession, token: EmailToken) -> EmailToken:
     with DatabaseTimer("insert", "email_tokens"):
         db.add(token)
-        await db.flush()
+        await db.commit()
     return token
 
 
@@ -221,7 +225,7 @@ async def mark_email_token_used(db: AsyncSession, token_id: uuid.UUID) -> None:
         await db.execute(
             update(EmailToken).where(EmailToken.id == token_id).values(used_at=utcnow())
         )
-        await db.flush()
+        await db.commit()
 
 
 async def invalidate_tokens_for_user_purpose(
@@ -241,7 +245,7 @@ async def invalidate_tokens_for_user_purpose(
             )
             .values(invalidated_at=utcnow())
         )
-        await db.flush()
+        await db.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -252,7 +256,7 @@ async def invalidate_tokens_for_user_purpose(
 async def create_audit_log(db: AsyncSession, log: AuthAuditLog) -> AuthAuditLog:
     with DatabaseTimer("insert", "auth_audit_log"):
         db.add(log)
-        await db.flush()
+        await db.commit()
     return log
 
 

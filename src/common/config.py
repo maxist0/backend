@@ -103,7 +103,6 @@ def get_settings(env: str) -> Settings:
     Environment-specific file (.env.{env}) overrides base .env
     """
     env_files = get_env_file(env)
-    print(f"Loading settings for environment '{env}' from files: {env_files}")
 
     class _Settings(Settings):
         model_config = SettingsConfigDict(env_file=env_files or ())
@@ -119,4 +118,4 @@ def init_settings(env: str) -> Settings:
 
 
 # Global settings instance - will be set by app.py
-settings: Settings = None # type: ignore
+settings: Settings = None  # type: ignore

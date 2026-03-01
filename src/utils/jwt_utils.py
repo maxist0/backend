@@ -1,4 +1,4 @@
-# src/api/auth/jwt_utils.py
+# src/utils/jwt_utils.py
 
 """
 JWT utility functions: create and decode access tokens.
@@ -11,7 +11,7 @@ from typing import Optional
 
 import jwt
 
-from src.api.auth.models import TokenData
+from src.api.auth.schemas import TokenData
 from src.common.config import settings
 from src.common.logging import get_logger
 

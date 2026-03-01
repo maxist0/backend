@@ -107,11 +107,11 @@ async def close_db() -> None:
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
-    """Yield an AsyncSession; roll back on error, always close."""
     async with AsyncSessionFactory() as session:
         try:
             yield session
-            await session.commit()
         except Exception:
             await session.rollback()
             raise
+        finally:
+            await session.close()

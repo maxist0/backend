@@ -12,8 +12,9 @@ from fastapi import Depends, Request
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 
 from src.api.auth import crud
-from src.api.auth.jwt_utils import decode_token
-from src.api.auth.models import TokenData, User
+from src.utils.jwt_utils import decode_token
+from src.api.auth.models import User
+from src.api.auth.schemas import TokenData
 from src.api.auth.exceptions import AuthenticationError
 from src.common.dependencies import DbSession
 from src.common.logging import get_logger

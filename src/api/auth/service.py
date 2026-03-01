@@ -15,23 +15,22 @@ from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatc
 from fastapi import Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-import redis.asyncio as aioredis # type: ignore
+import redis.asyncio as aioredis  # type: ignore
 
 from src.api.auth import crud
-from src.api.auth.jwt_utils import create_access_token
+from src.utils.jwt_utils import create_access_token
 from src.api.auth.models import (
     AuditEventType,
     AuthAuditLog,
     EmailToken,
     EmailTokenPurpose,
     PasswordCredential,
-    RefreshTokenCache,
     Session,
     User,
-    UserResponse,
     hash_token,
     utcnow,
 )
+from src.api.auth.schemas import UserResponse, RefreshTokenCache
 from src.common.config import settings
 from src.common.constants import MAXIMUM_LOGIN_ATTEMPTS, LOGIN_ATTEMPT_WINDOW_SECONDS
 from src.common.logging import get_logger
@@ -213,6 +212,7 @@ async def authenticate_user(
     """
     user = await crud.get_user_by_username(db, username)
     if user is None:
+        logger.warning("auth.login_attempt_invalid_username", username=username)
         return None, "Invalid username or password"
 
     # Check if account is locked
@@ -225,6 +225,12 @@ async def authenticate_user(
                 user.id,
                 request,
                 f"Account locked, {remaining}s remaining",
+            )
+            logger.warning(
+                "auth.login_attempt_locked_account",
+                user_id=str(user.id),
+                username=username,
+                remaining_seconds=remaining,
             )
             return None, f"Account is locked. Try again in {remaining} seconds"
         else:
@@ -240,8 +246,16 @@ async def authenticate_user(
                 request,
                 "Lock expired",
             )
+            logger.info(
+                "auth.account_unlocked", user_id=str(user.id), username=username
+            )
 
     if not user.is_active:
+        logger.warning(
+            "auth.login_attempt_inactive_account",
+            user_id=str(user.id),
+            username=username,
+        )
         return None, "Account is deactivated"
 
     # Verify password
@@ -249,6 +263,12 @@ async def authenticate_user(
     if credential is None or not verify_password(password, credential.password_hash):
         # Increment failed attempts
         user.failed_login_attempts += 1
+        logger.warning(
+            "auth.login_failed",
+            user_id=str(user.id),
+            username=username,
+            attempts=user.failed_login_attempts,
+        )
         if user.failed_login_attempts >= MAXIMUM_LOGIN_ATTEMPTS:
             user.is_locked = True
             user.locked_until = utcnow() + timedelta(
@@ -262,6 +282,13 @@ async def authenticate_user(
                 request,
                 f"Locked after {user.failed_login_attempts} failed attempts",
             )
+            logger.warning(
+                "auth.account_locked",
+                user_id=str(user.id),
+                username=username,
+                attempts=user.failed_login_attempts,
+                locked_until=str(user.locked_until),
+            )
             return None, "Account has been locked due to too many failed login attempts"
         await crud.update_user(db, user)
         await _audit(db, AuditEventType.LOGIN_FAILED, user.id, request)
@@ -272,7 +299,7 @@ async def authenticate_user(
     user.last_login_at = utcnow()
     await crud.update_user(db, user)
     await _audit(db, AuditEventType.LOGIN_SUCCESS, user.id, request)
-
+    logger.info("auth.login_success", user_id=str(user.id), username=username)
     return user, None
 
 

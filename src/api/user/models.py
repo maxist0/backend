@@ -5,7 +5,7 @@ Pydantic request/response schemas for /user endpoints.
 ORM models live in src.api.auth.models (shared).
 """
 
-from src.api.auth.models import (
+from src.api.auth.schemas import (
     ChangePasswordRequest,
     UpdateProfileRequest,
     UserResponse,

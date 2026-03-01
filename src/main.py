@@ -9,9 +9,9 @@ Sets up the FastAPI app, middleware, routes, and lifecycle events.
 from contextlib import asynccontextmanager
 from datetime import datetime
 import os
-from fastapi import FastAPI, Request, status
+from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from src.api.auth.exceptions import AuthenticationError
 from src.common.logging import get_logger
 from src.common.config import settings
 from src.common.database import init_db, close_db
@@ -24,12 +24,17 @@ from src.common.middleware import (
     CORSMiddleware,
 )
 from src.common.metrics import init_metrics
-from src.common.responses import ok_response, error_response, SuccessResponse
-from src.common.models import ErrorCode
+from src.common.responses import ok_response, SuccessResponse
 from src.api.metrics.router import router as metrics_router
 from src.api.auth.router import router as auth_router
 from src.api.user.router import router as user_router
 from fastapi_cache.decorator import cache
+
+from src.common.exceptions import (
+    generic_exception_handler,
+    validation_exception_handler,
+    authentication_exception_handler,
+)
 
 from fastapi.middleware.gzip import GZipMiddleware
 
@@ -96,7 +101,9 @@ async def lifespan(app: FastAPI):
 Create FastAPI application instance with metadata and lifecycle management.
 """
 
-assert settings is not None, "Settings must be initialized before creating the app instance"
+assert settings is not None, (
+    "Settings must be initialized before creating the app instance"
+)
 
 app = FastAPI(
     title=settings.APP_NAME,
@@ -108,47 +115,10 @@ app = FastAPI(
     openapi_url=None if settings.is_production else "/openapi.json",
 )
 
-
-## Validation Error Handler
-"""
-Override FastAPI's default validation error response to use the unified error_response format.
-"""
-
-
-@app.exception_handler(RequestValidationError)
-async def validation_exception_handler(
-    request: Request, exc: RequestValidationError
-) -> JSONResponse:
-    """Return Pydantic / request-validation errors in the standard error envelope."""
-    start_time = datetime.now()
-    errors = exc.errors()
-
-    # Build a human-readable summary from the first error
-    first = errors[0] if errors else {}
-    loc = " -> ".join(str(loc) for loc in first.get("loc", []) if loc != "body")
-    msg = first.get("msg", "Validation error")
-    message = f"{loc}: {msg}" if loc else msg
-
-    # Include all individual errors in details
-    detail_list = [
-        {
-            "field": " -> ".join(str(loc) for loc in e.get("loc", []) if loc != "body"),
-            "message": e.get("msg", ""),
-            "type": e.get("type", ""),
-        }
-        for e in errors
-    ]
-
-    return error_response(
-        message=message,
-        error_code=ErrorCode.VALIDATION_ERROR,
-        field=loc or None,
-        details={"validation_errors": detail_list},
-        request=request,
-        start_time=start_time,
-        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-    )
-
+## Exception Handlers
+app.add_exception_handler(Exception, generic_exception_handler)
+app.add_exception_handler(RequestValidationError, validation_exception_handler)
+app.add_exception_handler(AuthenticationError, authentication_exception_handler)
 
 ## Middleware Configuration
 """

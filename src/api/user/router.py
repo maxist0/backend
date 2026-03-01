@@ -10,11 +10,12 @@ from fastapi import APIRouter, Depends, Request, status
 from fastapi.responses import JSONResponse
 
 from src.api.auth.dependencies import get_current_user
-from src.api.auth.models import ChangePasswordRequest, UpdateProfileRequest, User
+from src.api.auth.schemas import ChangePasswordRequest, UpdateProfileRequest
+from src.api.auth.models import User
 from src.api.auth.service import change_password, update_profile, user_to_response
 from src.common.dependencies import DbSession
 from src.common.logging import get_logger
-from src.common.models import ErrorCode
+from src.common.schemas import ErrorCode
 from src.common.responses import error_response, ok_response
 
 logger = get_logger(__name__)

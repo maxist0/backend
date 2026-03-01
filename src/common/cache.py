@@ -8,7 +8,7 @@ as needed.
 """
 
 from typing import Optional
-import redis.asyncio as redis # type: ignore
+import redis.asyncio as redis  # type: ignore
 from fastapi import Request
 from fastapi_cache import FastAPICache
 from fastapi_cache.backends.redis import RedisBackend

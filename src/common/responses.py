@@ -5,7 +5,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse
 from datetime import datetime
 import uuid
-from .models import (
+from .schemas import (
     SuccessResponse,
     ErrorResponse,
     PaginatedResponse,

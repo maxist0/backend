@@ -18,13 +18,13 @@ from src.api.auth.dependencies import (
     get_current_user,
     get_refresh_token_from_cookie,
 )
-from src.api.auth.models import (
+from src.api.auth.schemas import (
     EmailVerifyRequest,
     PasswordForgotRequest,
     PasswordResetRequest,
     RegisterRequest,
-    User,
 )
+from src.api.auth.models import User
 from src.api.auth.service import (
     add_refresh_token_to_cookie,
     create_session_tokens,
@@ -40,7 +40,7 @@ from src.api.auth.service import (
 )
 from src.common.dependencies import DbSession
 from src.common.logging import get_logger
-from src.common.models import ErrorCode
+from src.common.schemas import ErrorCode
 from src.common.responses import (
     created_response,
     error_response,
