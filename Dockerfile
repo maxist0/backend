@@ -1,5 +1,5 @@
 # Use a lightweight Python image
-FROM python:3.14-slim
+FROM python:3.13-slim
 
 # Set build arguments for environment
 ARG ENVIRONMENT=prod
