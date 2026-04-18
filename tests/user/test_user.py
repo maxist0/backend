@@ -65,7 +65,7 @@ def register_and_login(
     )
     r = login(client, username=username, password=password)
     assert r.status_code == 200, f"Login failed: {r.text}"
-    return r.json()["access_token"]
+    return r.json()["data"]["access_token"]
 
 
 # ---------------------------------------------------------------------------

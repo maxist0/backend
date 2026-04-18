@@ -6,13 +6,13 @@ Infrastructure:
   - Real PostgreSQL via testcontainers (Alembic migrations applied once per session)
   - Real Redis via testcontainers
   - No service-layer mocking — every test exercises the full stack
-  - `captured_emails` fixture intercepts _send_email_stub to retrieve tokens
+    - `captured_emails` fixture intercepts email task `.delay(...)` calls to retrieve tokens
     without an SMTP server
 
 Fixtures (all defined in conftest.py):
   client          - function-scoped TestClient (fresh cookie jar per test)
   clean_db        - autouse; truncates all auth tables after each test
-  captured_emails - patches _send_email_stub; returns {email: last_token} dict
+    captured_emails - patches email task dispatch; returns {email: last_token} dict
 """
 
 from src.common.constants import MAXIMUM_LOGIN_ATTEMPTS
@@ -132,9 +132,11 @@ class TestLogin:
 
         assert r.status_code == 200
         body = r.json()
-        assert "access_token" in body
-        assert body["token_type"] == "bearer"
-        assert body["user"]["username"] == "alice"
+        assert body["success"] is True
+        assert body["metadata"]["request_id"]
+        assert "access_token" in body["data"]
+        assert body["data"]["token_type"] == "bearer"
+        assert body["data"]["user"]["username"] == "alice"
         assert "refresh_token" in client.cookies
 
     def test_wrong_password_returns_401(self, client, captured_emails):
@@ -237,7 +239,7 @@ class TestRefresh:
         r = client.post("/auth/refresh")
 
         assert r.status_code == 200
-        assert "access_token" in r.json()
+        assert "access_token" in r.json()["data"]
 
         new_refresh = client.cookies.get("refresh_token")
         assert new_refresh is not None
@@ -249,7 +251,7 @@ class TestRefresh:
         register(client, username="alice")
         login(client, username="alice")
 
-        new_access = client.post("/auth/refresh").json()["access_token"]
+        new_access = client.post("/auth/refresh").json()["data"]["access_token"]
 
         # Any authenticated endpoint will do; resend verification is convenient
         r = client.post("/auth/email/verify/resend", headers=bearer(new_access))
@@ -433,7 +435,7 @@ class TestEmailVerification:
         client.post("/auth/email/verify", json={"token": token})
 
         r = login(client, username="alice")
-        assert r.json()["user"]["is_email_verified"] is True
+        assert r.json()["data"]["user"]["is_email_verified"] is True
 
     def test_verify_with_invalid_token_returns_400(self, client):
         r = client.post("/auth/email/verify", json={"token": "notavalidtoken"})
@@ -457,7 +459,7 @@ class TestEmailVerification:
         original_token = captured_emails["alice@example.com"]
 
         r = login(client, username="alice")
-        access_token = r.json()["access_token"]
+        access_token = r.json()["data"]["access_token"]
 
         captured_emails.clear()
         client.post("/auth/email/verify/resend", headers=bearer(access_token))
@@ -470,7 +472,7 @@ class TestEmailVerification:
         register(client, username="alice")
         old_token = captured_emails["alice@example.com"]
 
-        access_token = login(client, username="alice").json()["access_token"]
+        access_token = login(client, username="alice").json()["data"]["access_token"]
         client.post("/auth/email/verify/resend", headers=bearer(access_token))
 
         r = client.post("/auth/email/verify", json={"token": old_token})
@@ -478,7 +480,7 @@ class TestEmailVerification:
 
     def test_resend_returns_200(self, client, captured_emails):
         register(client, username="alice")
-        access_token = login(client, username="alice").json()["access_token"]
+        access_token = login(client, username="alice").json()["data"]["access_token"]
 
         r = client.post("/auth/email/verify/resend", headers=bearer(access_token))
         assert r.status_code == 200
@@ -489,7 +491,7 @@ class TestEmailVerification:
         token = captured_emails["alice@example.com"]
         client.post("/auth/email/verify", json={"token": token})
 
-        access_token = login(client, username="alice").json()["access_token"]
+        access_token = login(client, username="alice").json()["data"]["access_token"]
         r = client.post("/auth/email/verify/resend", headers=bearer(access_token))
         assert r.status_code == 400
         assert r.json()["success"] is False
@@ -514,13 +516,13 @@ class TestFullFlow:
         # 3. Login — user should show as verified
         r = login(client, username="alice")
         assert r.status_code == 200
-        access_token = r.json()["access_token"]
-        assert r.json()["user"]["is_email_verified"] is True
+        access_token = r.json()["data"]["access_token"]
+        assert r.json()["data"]["user"]["is_email_verified"] is True
 
         # 4. Refresh — should issue a new token pair
         r = client.post("/auth/refresh")
         assert r.status_code == 200
-        new_access_token = r.json()["access_token"]
+        new_access_token = r.json()["data"]["access_token"]
         assert new_access_token != access_token
 
         # 5. Old token should still work (access tokens are JWTs and remain
@@ -554,4 +556,4 @@ class TestFullFlow:
         # New password must succeed
         r = login(client, username="alice", password="BrandNewPass99!")
         assert r.status_code == 200
-        assert "access_token" in r.json()
+        assert "access_token" in r.json()["data"]
