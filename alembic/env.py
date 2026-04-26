@@ -7,6 +7,7 @@ Run autogenerate:
 
 Apply migrations:
     alembic upgrade head
+    alembic -x env=test upgrade head
 
 Downgrade one step:
     alembic downgrade -1
@@ -23,7 +24,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 # ── Import the project's declarative Base so Alembic can detect schema changes.
 # Add additional model modules here as the project grows.
-from src.common.database import Base  # noqa: F401 – registers metadata
+from src.common.models import Base  # noqa: F401 – registers metadata
 
 
 # ---------------------------------------------------------------------------
@@ -31,8 +32,25 @@ from src.common.database import Base  # noqa: F401 – registers metadata
 # ---------------------------------------------------------------------------
 config = context.config
 
-# Inject the live DATABASE_URL so we never hard-code it in alembic.ini
 
+from dotenv import load_dotenv
+
+_env = (
+    context.get_x_argument(as_dictionary=True).get("env")  # -x env=test
+    or os.getenv("APP_ENV")                                 # shell export
+    or "dev"                                                # default
+)
+
+_env_file = f".env.{_env}"
+
+if os.path.exists(_env_file):
+    load_dotenv(_env_file, override=True)
+    print(f"[alembic] Loaded {_env_file}")
+else:
+    load_dotenv(".env", override=True)
+    print(f"[alembic] {_env_file} not found – falling back to .env")
+
+# Inject the live DATABASE_URL so we never hard-code it in alembic.ini
 ## Get database from .env
 _url = os.getenv("DATABASE_URL")
 assert _url, "DATABASE_URL environment variable must be set for Alembic migrations"
