@@ -18,10 +18,12 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
-from sqlalchemy.orm import DeclarativeBase
+from src.common.models import Base  # noqa: F401 – registers metadata
 
 from src.common.config import settings
 from src.common.logging import get_logger
+
+__all__ = ["get_db", "init_db", "close_db","Base"]
 
 logger = get_logger(__name__)
 
@@ -72,16 +74,6 @@ AsyncSessionFactory: async_sessionmaker[AsyncSession] = async_sessionmaker(
     autocommit=False,
 )
 
-# ---------------------------------------------------------------------------
-# Declarative Base – import this in your ORM models
-# ---------------------------------------------------------------------------
-
-
-class Base(DeclarativeBase):
-    """Project-wide SQLAlchemy declarative base."""
-
-    pass
-
 
 # ---------------------------------------------------------------------------
 # Lifecycle helpers – called from main.py lifespan
@@ -90,9 +82,13 @@ class Base(DeclarativeBase):
 
 async def init_db() -> None:
     """Verify the database is reachable on startup."""
-    async with engine.connect() as conn:
-        await conn.execute(text("SELECT 1"))
-    logger.info("db.pool_init", url=settings.DATABASE_URL)
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(text("SELECT 1"))
+        logger.info("db.pool_init", url=settings.DATABASE_URL)
+    except Exception as e:
+        logger.error("db.pool_init_failed", error=str(e), exc_info=True)
+        raise RuntimeError(f"Database connection failed: {e}") from e
 
 
 async def close_db() -> None:
