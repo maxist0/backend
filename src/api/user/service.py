@@ -14,14 +14,14 @@ from fastapi import Request
 from src.api.user.models import hash_token, utcnow
 from src.api.user.models import User, EmailToken, EmailTokenPurpose
 from src.api.user import crud
+from src.utils.email_tasks import send_verification_email_task
 
 from src.api.auth.service import (
     change_password,
     user_to_response,
-    _send_email_stub,
 )
 
-__all__ = ["change_password", "user_to_response", "_send_email_stub"]
+__all__ = ["change_password", "user_to_response"]
 
 
 # ---------------------------------------------------------------------------
@@ -69,7 +69,7 @@ async def update_profile(
             expires_at=utcnow() + timedelta(hours=24),
         )
         await crud.create_email_token(db, email_token)
-        await _send_email_stub(new_email, "Confirm your new email", raw_token)
+        send_verification_email_task.delay(new_email, user.username, raw_token)
 
     await crud.update_user(db, user)
     return user, None

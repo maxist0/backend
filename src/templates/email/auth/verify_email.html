@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+
+{% block title %}Verify your email{% endblock %}
+
+{% block header %}Confirm your email address{% endblock %}
+
+{% block content %}
+<p>Hi <strong>{{ username }}</strong>,</p>
+<p>Thanks for signing up. Please verify your email address by clicking the button below. This link is valid for <strong>24 hours</strong>.</p>
+<a class="btn" href="{{ verify_url }}">Verify Email</a>
+<p style="margin-top: 24px;">Or copy this token manually:</p>
+<div class="token-box">{{ token }}</div>
+<p style="margin-top: 24px; font-size: 13px; color: #888;">If you did not create an account, you can safely ignore this email.</p>
+{% endblock %}

@@ -91,11 +91,15 @@ class UserResponse(BaseModel):
     id: str
     username: str
     email: str
+    roles: list[str] # TODO Type Safety of roles rather than just strings
+    permissions: list[str] # TODO Type Safety of permissions rather than just strings
     display_name: Optional[str] = None
+    profile_picture_url: Optional[str] = None
     is_active: bool
     is_email_verified: bool
     created_at: datetime
     last_login_at: Optional[datetime] = None
+    preferences: Optional[dict] = None  # Placeholder for user preferences
 
 
 class TokenResponse(BaseModel):

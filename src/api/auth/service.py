@@ -34,6 +34,7 @@ from src.api.auth.schemas import UserResponse, RefreshTokenCache
 from src.common.config import settings
 from src.common.constants import MAXIMUM_LOGIN_ATTEMPTS, LOGIN_ATTEMPT_WINDOW_SECONDS
 from src.common.logging import get_logger
+from src.utils.email_tasks import send_verification_email_task, send_password_reset_email_task
 
 logger = get_logger(__name__)
 
@@ -70,10 +71,19 @@ def user_to_response(user: User) -> UserResponse:
         username=user.username,
         email=user.email,
         display_name=user.display_name,
+        profile_picture_url="",# Placeholder for profile picture URL
         is_active=user.is_active,
         is_email_verified=user.is_email_verified,
         created_at=user.created_at,
         last_login_at=user.last_login_at,
+        roles=["test"],  # Placeholder for role-based access control
+        permissions=["posts:create","posts:read"],  # Placeholder for permissions
+        preferences={
+            "locale": "en-US",
+            "theme": "dark",
+            "timezone": "UTC",
+        }
+
     )
 
 
@@ -124,15 +134,6 @@ async def _audit(
     )
     await crud.create_audit_log(db, log)
 
-
-# ---------------------------------------------------------------------------
-# Email stub
-# ---------------------------------------------------------------------------
-
-
-async def _send_email_stub(to: str, subject: str, token: str) -> None:
-    """Placeholder - log instead of sending real email."""
-    logger.info("auth.email_stub_sent", to=to, subject=subject, token=token)
 
 
 # ---------------------------------------------------------------------------
@@ -188,8 +189,8 @@ async def register_user(
     await _audit(db, AuditEventType.REGISTER, user.id, request)
     await _audit(db, AuditEventType.EMAIL_VERIFICATION_SENT, user.id, request)
 
-    # Stub email
-    await _send_email_stub(email, "Verify your email", raw_token)
+    # Enqueue verification email (fire-and-forget via Celery)
+    send_verification_email_task.delay(email, username, raw_token)
 
     logger.info("auth.user_registered", username=username, user_id=str(user.id))
     return user, None
@@ -473,7 +474,7 @@ async def forgot_password(
     )
     await crud.create_email_token(db, email_token)
     await _audit(db, AuditEventType.PASSWORD_RESET_REQUESTED, user.id, request)
-    await _send_email_stub(email, "Reset your password", raw_token)
+    send_password_reset_email_task.delay(email, user.username, raw_token)
 
 
 async def reset_password(
@@ -564,7 +565,7 @@ async def resend_verification_email(
     )
     await crud.create_email_token(db, email_token)
     await _audit(db, AuditEventType.EMAIL_VERIFICATION_SENT, user.id, request)
-    await _send_email_stub(user.email, "Verify your email", raw_token)
+    send_verification_email_task.delay(user.email, user.username, raw_token)
     return True, None
 
 

@@ -36,6 +36,11 @@ class Settings(BaseSettings):
     CACHE_MAX_CONNECTIONS: int = 10
     CACHE_KEY_PREFIX: str = "fastapi-cache"
 
+    # Celery  (DB 1 = broker queue, DB 2 = result backend, keeps app cache on DB 0)
+    CELERY_BROKER_URL: str = "redis://:redis@localhost:6379/1"
+    CELERY_RESULT_BACKEND: str = "redis://:redis@localhost:6379/2"
+    CELERY_CONCURRENCY: int = 2
+
     # JWT Authentication
     JWT_SECRET_KEY: str = "your-super-secret-jwt-key-change-in-production"
     JWT_ALGORITHM: str = "HS256"
@@ -57,6 +62,15 @@ class Settings(BaseSettings):
     OTLP_SERVICE_NAME: str = "api"
     OTLP_HEADERS: str = ""  # comma-separated key=value pairs
 
+
+    # Mail Server
+    MAIL_USERNAME: Optional[str] = None
+    MAIL_PASSWORD: Optional[str] = None
+    MAIL_FROM: Optional[str] = None
+    MAIL_PORT: int = 587
+    MAIL_SERVER: Optional[str] = None
+    MAIL_STARTTLS: bool = True
+
     # Metrics
     METRICS_ENABLED: bool = True
 
@@ -65,6 +79,7 @@ class Settings(BaseSettings):
     APP_NAME: str = "api"
     APP_DESCRIPTION: str = "API Description"
     APP_VERSION: str = "0.1.0"
+    FRONTEND_URL: str = "http://localhost:3000"  # used for email links; override in production
 
     # Server
     HOST: str = "0.0.0.0"
