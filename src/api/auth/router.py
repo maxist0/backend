@@ -120,8 +120,7 @@ async def login(
 ) -> JSONResponse:
     """
     Authenticate a user via OAuth2 password form.
-    Returns an OAuth2-compatible response with the access token at the top level
-    (required for Swagger / OpenAPI 'Authorize' to capture it automatically).
+    Returns the standard API success envelope with token information in `data`.
     The refresh token is set as an httpOnly secure cookie.
     """
     start_time = datetime.now()
@@ -132,12 +131,14 @@ async def login(
         )
         user_resp = user_to_response(user)
 
-        response = JSONResponse(
-            content={
+        response = success_response(
+            data={
                 "access_token": access_token,
                 "token_type": "bearer",
                 "user": user_resp.model_dump(mode="json"),
             },
+            request=request,
+            start_time=start_time,
             status_code=200,
         )
         logger.info(
@@ -230,11 +231,13 @@ async def refresh_tokens(
                 start_time=start_time,
             )
 
-        response = JSONResponse(
-            content={
+        response = success_response(
+            data={
                 "access_token": access_token,
                 "token_type": "bearer",
             },
+            request=request,
+            start_time=start_time,
             status_code=200,
         )
         logger.info("auth.token_refreshed")
