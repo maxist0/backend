@@ -21,8 +21,8 @@ from src.common.middleware import (
     MetricsMiddleware,
     SecurityHeadersMiddleware,
     MetaDataMiddleware,
-    CORSMiddleware,
 )
+from fastapi.middleware.cors import CORSMiddleware
 from src.common.metrics import init_metrics
 from src.common.responses import ok_response, SuccessResponse
 from src.api.metrics.router import router as metrics_router
@@ -126,7 +126,15 @@ Configure middleware for metrics and access logging.
 """
 
 app.add_middleware(MetaDataMiddleware)  # Add metadata middleware to all requests
-app.add_middleware(CORSMiddleware)  # Add Cors middleware with configured settings
+#app.add_middleware(CORSMiddleware)  # Add Cors middleware with configured settings
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"], # List your specific frontend URLs
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 app.add_middleware(
     GZipMiddleware, minimum_size=1000
 )  # Add GZip compression for responses larger than 1KB
