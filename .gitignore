@@ -6,7 +6,7 @@ __pycache__/
 *.egg-info/
 dist/
 build/
-
+.idea/
 # Environment files with secrets - don't commit!
 .env.dev
 .env.test
