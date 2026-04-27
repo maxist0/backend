@@ -125,10 +125,10 @@ Configure middleware for metrics and access logging.
 """
 
 app.add_middleware(MetaDataMiddleware)  # Add metadata middleware to all requests
-#app.add_middleware(CORSMiddleware)  # Add Cors middleware with configured settings
+# app.add_middleware(CORSMiddleware)  # Add Cors middleware with configured settings
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"], # List your specific frontend URLs
+    allow_origins=["http://localhost:5173"],  # List your specific frontend URLs
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

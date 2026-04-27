@@ -10,8 +10,9 @@ as needed.
 from typing import Optional
 import redis.asyncio as redis  # type: ignore
 from fastapi import Request
-#from fastapi_cache import FastAPICache
-#from fastapi_cache.backends.redis import RedisBackend
+
+# from fastapi_cache import FastAPICache
+# from fastapi_cache.backends.redis import RedisBackend
 from src.common.config import settings
 from src.common.logging import get_logger
 
@@ -45,11 +46,11 @@ async def init_cache_pool() -> redis.Redis:
 
 def init_fastapi_cache(client: redis.Redis) -> None:
     """Initialise fastapi-cache2 using the provided async Redis client."""
-    #FastAPICache.init(
+    # FastAPICache.init(
     #    RedisBackend(client),
     #    prefix=settings.CACHE_KEY_PREFIX,
     #    cache_status_header="X-Cache",
-    #)
+    # )
     logger.info(
         "cache.fastapi_cache_init",
         prefix=settings.CACHE_KEY_PREFIX,

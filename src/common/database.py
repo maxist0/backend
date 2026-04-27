@@ -23,7 +23,7 @@ from src.common.models import Base  # noqa: F401 – registers metadata
 from src.common.config import settings
 from src.common.logging import get_logger
 
-__all__ = ["get_db", "init_db", "close_db","Base"]
+__all__ = ["get_db", "init_db", "close_db", "Base"]
 
 logger = get_logger(__name__)
 

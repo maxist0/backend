@@ -145,9 +145,15 @@ def captured_emails(monkeypatch) -> dict[str, str]:
     async def _capture(to: str, username: str, token: str) -> None:
         emails[to.lower()] = token
 
-    monkeypatch.setattr("src.api.auth.service.send_verification_email_task.kiq", _capture)
-    monkeypatch.setattr("src.api.auth.service.send_password_reset_email_task.kiq", _capture)
-    monkeypatch.setattr("src.api.user.service.send_verification_email_task.kiq", _capture)
+    monkeypatch.setattr(
+        "src.api.auth.service.send_verification_email_task.kiq", _capture
+    )
+    monkeypatch.setattr(
+        "src.api.auth.service.send_password_reset_email_task.kiq", _capture
+    )
+    monkeypatch.setattr(
+        "src.api.user.service.send_verification_email_task.kiq", _capture
+    )
     return emails
 
 

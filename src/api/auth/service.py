@@ -34,7 +34,10 @@ from src.api.auth.schemas import UserResponse, RefreshTokenCache
 from src.common.config import settings
 from src.common.constants import MAXIMUM_LOGIN_ATTEMPTS, LOGIN_ATTEMPT_WINDOW_SECONDS
 from src.common.logging import get_logger
-from src.utils.email_tasks import send_verification_email_task, send_password_reset_email_task
+from src.utils.email_tasks import (
+    send_verification_email_task,
+    send_password_reset_email_task,
+)
 
 logger = get_logger(__name__)
 
@@ -71,19 +74,18 @@ def user_to_response(user: User) -> UserResponse:
         username=user.username,
         email=user.email,
         display_name=user.display_name,
-        profile_picture_url="",# Placeholder for profile picture URL
+        profile_picture_url="",  # Placeholder for profile picture URL
         is_active=user.is_active,
         is_email_verified=user.is_email_verified,
         created_at=user.created_at,
         last_login_at=user.last_login_at,
         roles=["test"],  # Placeholder for role-based access control
-        permissions=["posts:create","posts:read"],  # Placeholder for permissions
+        permissions=["posts:create", "posts:read"],  # Placeholder for permissions
         preferences={
             "locale": "en-US",
             "theme": "dark",
             "timezone": "UTC",
-        }
-
+        },
     )
 
 
@@ -133,7 +135,6 @@ async def _audit(
         detail=detail,
     )
     await crud.create_audit_log(db, log)
-
 
 
 # ---------------------------------------------------------------------------

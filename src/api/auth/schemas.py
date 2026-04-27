@@ -91,8 +91,8 @@ class UserResponse(BaseModel):
     id: str
     username: str
     email: str
-    roles: list[str] # TODO Type Safety of roles rather than just strings
-    permissions: list[str] # TODO Type Safety of permissions rather than just strings
+    roles: list[str]  # TODO Type Safety of roles rather than just strings
+    permissions: list[str]  # TODO Type Safety of permissions rather than just strings
     display_name: Optional[str] = None
     profile_picture_url: Optional[str] = None
     is_active: bool

@@ -1,6 +1,5 @@
 # src/common/middleware.py
 import time
-from urllib import response
 import uuid
 from typing import Callable
 

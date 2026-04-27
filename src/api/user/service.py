@@ -46,9 +46,9 @@ async def update_profile(
 
     if display_name is not None:
         user.display_name = display_name
-        
+
     if new_email is not None:
-        new_email = new_email.lower() 
+        new_email = new_email.lower()
 
     if new_email is not None and new_email != user.email:
         # Check if new email is already taken
