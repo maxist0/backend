@@ -57,7 +57,11 @@ dev = [
     "ruff>=0.15.0",
 ]
 [[tool.mypy.overrides]]
-module = "redis.*"
+module = [
+    "alembic.*",
+    "sqlalchemy.*",
+    "redis.*"
+]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

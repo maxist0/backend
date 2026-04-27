@@ -1,4 +1,4 @@
-from fastapi_mail import ConnectionConfig, FastMail, MessageSchema, MessageType
+from fastapi_mail import ConnectionConfig, FastMail, MessageSchema, MessageType,NameEmail
 from src.common.config import settings
 from src.common.logging import get_logger
 from typing import Optional
@@ -20,14 +20,13 @@ def setup_mail() -> Optional[FastMail]:
     ):
         logger.warning("Mail settings not fully configured; skipping mail setup.")
         return None
-
     template_folder = Path(__file__).parent.parent / "templates" / "email"
     mail_config = ConnectionConfig(
-        MAIL_USERNAME=os.getenv("MAIL_USERNAME"),
-        MAIL_PASSWORD=os.getenv("MAIL_PASSWORD"),
-        MAIL_FROM=os.getenv("MAIL_FROM"),
+        MAIL_USERNAME=os.getenv("MAIL_USERNAME"),# type: ignore[arg-type]
+        MAIL_PASSWORD=os.getenv("MAIL_PASSWORD"),# type: ignore[arg-type]
+        MAIL_FROM=os.getenv("MAIL_FROM"),# type: ignore[arg-type]
         MAIL_PORT=int(os.getenv("MAIL_PORT", 587)),
-        MAIL_SERVER=os.getenv("MAIL_SERVER"),
+        MAIL_SERVER=os.getenv("MAIL_SERVER"),# type: ignore[arg-type]
         MAIL_STARTTLS=True,
         MAIL_SSL_TLS=False,
         USE_CREDENTIALS=True,
@@ -62,9 +61,10 @@ async def send_templated_email(
         )
         return
     context.setdefault("app_name", settings.APP_NAME)
+    _to = NameEmail(name=context.get("username", ""), email=to)
     message = MessageSchema(
         subject=subject,
-        recipients=[to],
+        recipients=[_to],
         template_body=context,
         subtype=MessageType.html,
     )
