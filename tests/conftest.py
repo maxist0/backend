@@ -127,8 +127,8 @@ def clean_db(init_db):
 # ---------------------------------------------------------------------------
 # Function-scoped: capture tokens that would normally be emailed
 #
-# Services dispatch Celery tasks via `.delay(to, username, token)`.
-# We patch those delay calls to store the latest token per address so tests
+# Services dispatch Taskiq tasks via `.kiq(to, username, token)`.
+# We patch those `.kiq` calls to store the latest token per address so tests
 # can retrieve and use them without touching a real broker/SMTP server.
 #
 # Usage:
@@ -142,12 +142,12 @@ def clean_db(init_db):
 def captured_emails(monkeypatch) -> dict[str, str]:
     emails: dict[str, str] = {}
 
-    def _capture(to: str, username: str, token: str) -> None:
+    async def _capture(to: str, username: str, token: str) -> None:
         emails[to.lower()] = token
 
-    monkeypatch.setattr("src.api.auth.service.send_verification_email_task.delay", _capture)
-    monkeypatch.setattr("src.api.auth.service.send_password_reset_email_task.delay", _capture)
-    monkeypatch.setattr("src.api.user.service.send_verification_email_task.delay", _capture)
+    monkeypatch.setattr("src.api.auth.service.send_verification_email_task.kiq", _capture)
+    monkeypatch.setattr("src.api.auth.service.send_password_reset_email_task.kiq", _capture)
+    monkeypatch.setattr("src.api.user.service.send_verification_email_task.kiq", _capture)
     return emails
 
 

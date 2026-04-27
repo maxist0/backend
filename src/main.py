@@ -28,7 +28,6 @@ from src.common.responses import ok_response, SuccessResponse
 from src.api.metrics.router import router as metrics_router
 from src.api.auth.router import router as auth_router
 from src.api.user.router import router as user_router
-from fastapi_cache.decorator import cache
 
 from src.common.exceptions import (
     generic_exception_handler,
@@ -168,7 +167,6 @@ Define the root endpoint with standardized response.
 
 
 @app.get("/", response_model=SuccessResponse)
-@cache(expire=60)
 async def root(request: Request):
     """Root endpoint with standardized response."""
     start_time = datetime.now()

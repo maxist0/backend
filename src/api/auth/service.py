@@ -189,8 +189,8 @@ async def register_user(
     await _audit(db, AuditEventType.REGISTER, user.id, request)
     await _audit(db, AuditEventType.EMAIL_VERIFICATION_SENT, user.id, request)
 
-    # Enqueue verification email (fire-and-forget via Celery)
-    send_verification_email_task.delay(email, username, raw_token)
+    # Enqueue verification email (fire-and-forget via Taskiq)
+    await send_verification_email_task.kiq(email, username, raw_token)
 
     logger.info("auth.user_registered", username=username, user_id=str(user.id))
     return user, None
@@ -474,7 +474,7 @@ async def forgot_password(
     )
     await crud.create_email_token(db, email_token)
     await _audit(db, AuditEventType.PASSWORD_RESET_REQUESTED, user.id, request)
-    send_password_reset_email_task.delay(email, user.username, raw_token)
+    await send_password_reset_email_task.kiq(email, user.username, raw_token)
 
 
 async def reset_password(
@@ -565,7 +565,7 @@ async def resend_verification_email(
     )
     await crud.create_email_token(db, email_token)
     await _audit(db, AuditEventType.EMAIL_VERIFICATION_SENT, user.id, request)
-    send_verification_email_task.delay(user.email, user.username, raw_token)
+    await send_verification_email_task.kiq(user.email, user.username, raw_token)
     return True, None
 
 

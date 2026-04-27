@@ -36,10 +36,13 @@ class Settings(BaseSettings):
     CACHE_MAX_CONNECTIONS: int = 10
     CACHE_KEY_PREFIX: str = "fastapi-cache"
 
-    # Celery  (DB 1 = broker queue, DB 2 = result backend, keeps app cache on DB 0)
-    CELERY_BROKER_URL: str = "redis://:redis@localhost:6379/1"
-    CELERY_RESULT_BACKEND: str = "redis://:redis@localhost:6379/2"
-    CELERY_CONCURRENCY: int = 2
+    # Taskiq (DB 1 = broker queue, DB 2 = result backend, keeps app cache on DB 0)
+    TASKIQ_BROKER_URL: str = "redis://:redis@localhost:6379/1"
+    TASKIQ_RESULT_BACKEND_URL: str = "redis://:redis@localhost:6379/2"
+    TASKIQ_WORKERS: int = 2
+    TASKIQ_METRICS_PORT: int = 9000
+    TASKIQ_RETRY_COUNT: int = 3
+    TASKIQ_RETRY_DELAY_SECONDS: int = 60
 
     # JWT Authentication
     JWT_SECRET_KEY: str = "your-super-secret-jwt-key-change-in-production"

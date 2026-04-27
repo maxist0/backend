@@ -22,6 +22,7 @@ RUN uv sync --frozen --no-dev
 # Use the project virtual environment for runtime
 ENV VIRTUAL_ENV=/app/.venv
 ENV PATH="/app/.venv/bin:$PATH"
+ENV PYTHONPATH=/app
 
 # Copy the rest of the application code
 COPY . .

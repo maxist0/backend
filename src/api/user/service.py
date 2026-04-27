@@ -69,7 +69,7 @@ async def update_profile(
             expires_at=utcnow() + timedelta(hours=24),
         )
         await crud.create_email_token(db, email_token)
-        send_verification_email_task.delay(new_email, user.username, raw_token)
+        await send_verification_email_task.kiq(new_email, user.username, raw_token)
 
     await crud.update_user(db, user)
     return user, None
