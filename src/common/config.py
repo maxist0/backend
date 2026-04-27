@@ -34,7 +34,9 @@ class Settings(BaseSettings):
     CACHE_DB: int = 0
     CACHE_PASSWORD: Optional[str] = None
     CACHE_MAX_CONNECTIONS: int = 10
-    CACHE_KEY_PREFIX: str = "fastapi-cache"
+    ROUTE_CACHE_ENABLED: bool = True
+    ROUTE_CACHE_TTL: str = "2m"
+    ROUTE_CACHE_TIME_CONDITION: str = "50ms"
 
     # Taskiq (DB 1 = broker queue, DB 2 = result backend, keeps app cache on DB 0)
     TASKIQ_BROKER_URL: str = "redis://localhost:6379/1"

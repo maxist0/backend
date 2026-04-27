@@ -1,4 +1,10 @@
-from fastapi_mail import ConnectionConfig, FastMail, MessageSchema, MessageType,NameEmail
+from fastapi_mail import (
+    ConnectionConfig,
+    FastMail,
+    MessageSchema,
+    MessageType,
+    NameEmail,
+)
 from src.common.config import settings
 from src.common.logging import get_logger
 from typing import Optional
@@ -22,11 +28,11 @@ def setup_mail() -> Optional[FastMail]:
         return None
     template_folder = Path(__file__).parent.parent / "templates" / "email"
     mail_config = ConnectionConfig(
-        MAIL_USERNAME=os.getenv("MAIL_USERNAME"),# type: ignore[arg-type]
-        MAIL_PASSWORD=os.getenv("MAIL_PASSWORD"),# type: ignore[arg-type]
-        MAIL_FROM=os.getenv("MAIL_FROM"),# type: ignore[arg-type]
+        MAIL_USERNAME=os.getenv("MAIL_USERNAME"),  # type: ignore[arg-type]
+        MAIL_PASSWORD=os.getenv("MAIL_PASSWORD"),  # type: ignore[arg-type]
+        MAIL_FROM=os.getenv("MAIL_FROM"),  # type: ignore[arg-type]
         MAIL_PORT=int(os.getenv("MAIL_PORT", 587)),
-        MAIL_SERVER=os.getenv("MAIL_SERVER"),# type: ignore[arg-type]
+        MAIL_SERVER=os.getenv("MAIL_SERVER"),  # type: ignore[arg-type]
         MAIL_STARTTLS=True,
         MAIL_SSL_TLS=False,
         USE_CREDENTIALS=True,

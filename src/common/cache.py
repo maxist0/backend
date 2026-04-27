@@ -9,10 +9,10 @@ as needed.
 
 from typing import Optional
 import redis.asyncio as redis  # type: ignore
+from cashews import cache as route_cache
 from fastapi import Request
+from urllib.parse import quote_plus
 
-# from fastapi_cache import FastAPICache
-# from fastapi_cache.backends.redis import RedisBackend
 from src.common.config import settings
 from src.common.logging import get_logger
 
@@ -35,7 +35,7 @@ async def init_cache_pool() -> redis.Redis:
     )
     client = redis.Redis(connection_pool=pool)
     try:
-        await client.ping()
+        await client.ping()  # type: ignore[misc]
     except redis.RedisError as e:
         logger.error("cache.connect_failed", error=str(e))
         raise
@@ -44,14 +44,28 @@ async def init_cache_pool() -> redis.Redis:
     return client
 
 
-def init_fastapi_cache(client: redis.Redis) -> None:
-    """Initialise fastapi-cache2 using the provided async Redis client."""
-    # FastAPICache.init(
-    #    RedisBackend(client),
-    #    prefix=settings.CACHE_KEY_PREFIX,
-    #    cache_status_header="X-Cache",
-    # )
-    logger.info(
-        "cache.fastapi_cache_init",
-        prefix=settings.CACHE_KEY_PREFIX,
+def init_fastapi_cache() -> None:
+    """Initialise cashews cache used by route decorators and cache middlewares."""
+    if not settings.ROUTE_CACHE_ENABLED:
+        logger.info("cache.route_cache_disabled")
+        return
+
+    auth = ""
+    if settings.CACHE_PASSWORD:
+        auth = f":{quote_plus(settings.CACHE_PASSWORD)}@"
+    cache_uri = (
+        f"redis://{auth}{settings.CACHE_HOST}:{settings.CACHE_PORT}/{settings.CACHE_DB}"
     )
+    route_cache.setup(cache_uri)
+    logger.info(
+        "cache.route_cache_init",
+        route_cache_ttl=settings.ROUTE_CACHE_TTL,
+    )
+
+
+async def close_fastapi_cache() -> None:
+    """Close cashews cache backend on shutdown."""
+    if not settings.ROUTE_CACHE_ENABLED:
+        return
+    await route_cache.close()
+    logger.info("cache.route_cache_closed")

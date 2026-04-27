@@ -9,13 +9,19 @@ Sets up the FastAPI app, middleware, routes, and lifecycle events.
 from contextlib import asynccontextmanager
 from datetime import datetime
 import os
+from cashews import cache
+from cashews.contrib.fastapi import (
+    CacheEtagMiddleware,
+    CacheRequestControlMiddleware,
+    cache_control_ttl,
+)
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from src.api.auth.exceptions import AuthenticationError
 from src.common.logging import get_logger
 from src.common.config import settings
 from src.common.database import init_db, close_db
-from src.common.cache import init_cache_pool, init_fastapi_cache
+from src.common.cache import init_cache_pool, init_fastapi_cache, close_fastapi_cache
 from src.common.middleware import (
     AccessLogMiddleware,
     MetricsMiddleware,
@@ -77,7 +83,7 @@ async def lifespan(app: FastAPI):
 
     ## Initialize Redis and fastapi-cache2
     app.state.cache = await init_cache_pool()
-    init_fastapi_cache(app.state.cache)
+    init_fastapi_cache()
 
     app.state.start_time = datetime.now()
 
@@ -88,6 +94,7 @@ async def lifespan(app: FastAPI):
 
     ## Close DB connection pool and cache
     await close_db()
+    await close_fastapi_cache()
     if app.state.cache:
         await app.state.cache.close()
         logger.info("app.cache_closed")
@@ -134,6 +141,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+if settings.ROUTE_CACHE_ENABLED:
+    app.add_middleware(CacheEtagMiddleware)
+    app.add_middleware(CacheRequestControlMiddleware)
+
 app.add_middleware(
     GZipMiddleware, minimum_size=1000
 )  # Add GZip compression for responses larger than 1KB
@@ -167,6 +178,10 @@ Define the root endpoint with standardized response.
 
 
 @app.get("/", response_model=SuccessResponse)
+@cache(
+    ttl=cache_control_ttl(default=settings.ROUTE_CACHE_TTL),
+    key="route:root",
+)
 async def root(request: Request):
     """Root endpoint with standardized response."""
     start_time = datetime.now()
