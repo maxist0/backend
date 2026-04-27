@@ -35,7 +35,7 @@ async def init_cache_pool() -> redis.Redis:
     )
     client = redis.Redis(connection_pool=pool)
     try:
-        client.ping()
+        await client.ping()
     except redis.RedisError as e:
         logger.error("cache.connect_failed", error=str(e))
         raise
