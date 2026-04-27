@@ -32,6 +32,7 @@ dependencies = [
     "fastapi-mail>=1.6.2",
     "taskiq>=0.12.2",
     "taskiq-redis>=1.2.2",
+    "mypy>=1.19.1",
 ]
 
 [project.optional-dependencies]
