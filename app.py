@@ -10,6 +10,8 @@ Usage:
 
 import argparse
 import os
+import subprocess
+import sys
 
 
 def main():
@@ -61,13 +63,33 @@ def main():
     host = args.host if args.host is not None else settings.HOST
     port = args.port if args.port is not None else settings.PORT
 
-    uvicorn.run(
-        "src.main:app",
-        host=host,
-        port=port,
-        reload=False,
-        log_config=None,  # Disable uvicorn's default logging configuration
-    )
+    worker_process = None
+
+    # Start Taskiq worker process automatically in development mode.
+    if settings.is_development:
+        worker_process = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "taskiq",
+                "worker",
+                "src.common.taskiq:broker",
+                f"--workers={settings.TASKIQ_WORKERS}",
+                f"--log-level={settings.LOG_LEVEL.upper()}",
+            ]
+        )
+
+    try:
+        uvicorn.run(
+            "src.main:app",
+            host=host,
+            port=port,
+            reload=False,
+            log_config=None,  # Disable uvicorn's default logging configuration
+        )
+    finally:
+        if worker_process is not None and worker_process.poll() is None:
+            worker_process.kill()
 
 
 if __name__ == "__main__":

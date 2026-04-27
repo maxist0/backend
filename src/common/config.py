@@ -37,8 +37,8 @@ class Settings(BaseSettings):
     CACHE_KEY_PREFIX: str = "fastapi-cache"
 
     # Taskiq (DB 1 = broker queue, DB 2 = result backend, keeps app cache on DB 0)
-    TASKIQ_BROKER_URL: str = "redis://:redis@localhost:6379/1"
-    TASKIQ_RESULT_BACKEND_URL: str = "redis://:redis@localhost:6379/2"
+    TASKIQ_BROKER_URL: str = "redis://localhost:6379/1"
+    TASKIQ_RESULT_BACKEND_URL: str = "redis://localhost:6379/2"
     TASKIQ_WORKERS: int = 2
     TASKIQ_METRICS_PORT: int = 9000
     TASKIQ_RETRY_COUNT: int = 3
@@ -88,6 +88,11 @@ class Settings(BaseSettings):
     # Server
     HOST: str = "0.0.0.0"
     PORT: int = 8000
+
+    @property
+    def is_development(self) -> bool:
+        """Check if the application is running in development mode."""
+        return self.ENVIRONMENT == Environment.DEV
 
     @property
     def is_production(self) -> bool:
