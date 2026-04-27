@@ -65,7 +65,6 @@ class Settings(BaseSettings):
     OTLP_SERVICE_NAME: str = "api"
     OTLP_HEADERS: str = ""  # comma-separated key=value pairs
 
-
     # Mail Server
     MAIL_USERNAME: Optional[str] = None
     MAIL_PASSWORD: Optional[str] = None
@@ -82,7 +81,9 @@ class Settings(BaseSettings):
     APP_NAME: str = "api"
     APP_DESCRIPTION: str = "API Description"
     APP_VERSION: str = "0.1.0"
-    FRONTEND_URL: str = "http://localhost:3000"  # used for email links; override in production
+    FRONTEND_URL: str = (
+        "http://localhost:3000"  # used for email links; override in production
+    )
 
     # Server
     HOST: str = "0.0.0.0"
@@ -100,35 +101,43 @@ class Settings(BaseSettings):
     )
 
 
-def get_env_file(env: str) -> list[str]:
-    """Get the env files to load based on environment."""
-    base_env = Path(".env")
-    env_specific = Path(f".env.{env}")
+def get_env_file(env: str | None) -> list[str]:
+    """Get env files to load based on startup mode.
 
-    files = []
-    if base_env.exists():
-        files.append(str(base_env))
-    if env_specific.exists():
-        files.append(str(env_specific))
+    Only local development reads from .env.local. All other modes rely on
+    environment variables already injected by the runtime.
+    """
+    if env != Environment.DEV.value:
+        return []
 
-    return files
+    local_env = Path(".env.local")
+    return [str(local_env)] if local_env.exists() else []
 
 
 @lru_cache
-def get_settings(env: str) -> Settings:
+def get_settings(env: str | None = None) -> Settings:
     """
     Get settings for the specified environment.
-    Environment-specific file (.env.{env}) overrides base .env
+
+    - env="dev": reads .env.local
+    - env=None or any other mode: expects injected environment variables
     """
     env_files = get_env_file(env)
 
     class _Settings(Settings):
-        model_config = SettingsConfigDict(env_file=env_files or ())
+        model_config = SettingsConfigDict(
+            env_file=tuple(env_files),
+            env_file_encoding="utf-8",
+            extra="ignore",
+        )
+
+    if env is None:
+        return _Settings()
 
     return _Settings(ENVIRONMENT=Environment(env))
 
 
-def init_settings(env: str) -> Settings:
+def init_settings(env: str | None = None) -> Settings:
     """Initialize settings with the given environment."""
     global settings
     settings = get_settings(env)

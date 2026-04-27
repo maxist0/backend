@@ -3,14 +3,13 @@
 Entry point for the API application.
 
 Usage:
-    python app.py dev      # Development environment
-    python app.py test     # Test environment
-    python app.py stage    # Staging environment
-    python app.py prod     # Production environment
+    python app.py           # Environment injected by Docker/Kubernetes
+    python app.py dev       # Development environment from .env.local
     python app.py unittest  # Unit testing environment (not for running the server)
 """
 
 import argparse
+import os
 
 
 def main():
@@ -18,9 +17,9 @@ def main():
     parser.add_argument(
         "env",
         nargs="?",
-        default="dev",
-        choices=["dev", "test", "stage", "prod", "unittest"],
-        help="Environment to run (default: dev)",
+        default=None,
+        choices=["dev", "unittest"],
+        help="Environment mode to run (optional)",
     )
     parser.add_argument(
         "--host",
@@ -41,6 +40,12 @@ def main():
     )
 
     args = parser.parse_args()
+
+    if args.env is None and not os.getenv("ENVIRONMENT"):
+        parser.error(
+            "No mode provided. Set ENVIRONMENT via Docker/Kubernetes, "
+            "or run 'python app.py dev' for local development."
+        )
 
     # Initialize settings BEFORE importing the app
     from src.common.config import init_settings

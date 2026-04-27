@@ -25,7 +25,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 # ── Import the project's declarative Base so Alembic can detect schema changes.
 # Add additional model modules here as the project grows.
 from src.common.models import Base  # noqa: F401 – registers metadata
-
+from dotenv import load_dotenv
 
 # ---------------------------------------------------------------------------
 # Alembic Config object – gives access to values in alembic.ini
@@ -33,12 +33,10 @@ from src.common.models import Base  # noqa: F401 – registers metadata
 config = context.config
 
 
-from dotenv import load_dotenv
-
 _env = (
     context.get_x_argument(as_dictionary=True).get("env")  # -x env=test
-    or os.getenv("APP_ENV")                                 # shell export
-    or "dev"                                                # default
+    or os.getenv("APP_ENV")  # shell export
+    or "dev"  # default
 )
 
 _env_file = f".env.{_env}"
