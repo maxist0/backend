@@ -52,6 +52,7 @@ def send_verification_email_task(self, to: str, username: str, token: str) -> No
         "token": token,
         "verify_url": verify_url,
     }
+    return ## TODO real task with queing
     try:
         _run(
             send_templated_email(

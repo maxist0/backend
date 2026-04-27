@@ -135,7 +135,9 @@ class TestLogin:
         assert body["success"] is True
         assert body["metadata"]["request_id"]
         assert "access_token" in body["data"]
+        assert body["access_token"] == body["data"]["access_token"]
         assert body["data"]["token_type"] == "bearer"
+        assert body["token_type"] == body["data"]["token_type"]
         assert body["data"]["user"]["username"] == "alice"
         assert "refresh_token" in client.cookies
 
@@ -239,7 +241,10 @@ class TestRefresh:
         r = client.post("/auth/refresh")
 
         assert r.status_code == 200
-        assert "access_token" in r.json()["data"]
+        body = r.json()
+        assert "access_token" in body["data"]
+        assert body["access_token"] == body["data"]["access_token"]
+        assert body["token_type"] == body["data"]["token_type"]
 
         new_refresh = client.cookies.get("refresh_token")
         assert new_refresh is not None

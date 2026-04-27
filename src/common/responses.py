@@ -43,11 +43,15 @@ def success_response(
     request: Optional[Request] = None,
     start_time: Optional[datetime] = None,
     status_code: int = 200,
+    top_level_fields: Optional[Dict[str, Any]] = None,
 ) -> JSONResponse:
     """Create a standardized success response."""
     metadata = create_response_metadata(request=request, start_time=start_time)
     response = SuccessResponse(data=data, metadata=metadata, success=True)
-    return JSONResponse(content=response.model_dump(), status_code=status_code)
+    response_content = response.model_dump()
+    if top_level_fields:
+        response_content.update(top_level_fields)
+    return JSONResponse(content=response_content, status_code=status_code)
 
 
 def error_response(

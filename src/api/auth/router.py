@@ -140,7 +140,12 @@ async def login(
             request=request,
             start_time=start_time,
             status_code=200,
+            top_level_fields={
+                "access_token": access_token,
+                "token_type": "bearer",
+            },
         )
+
         logger.info(
             "auth.user_logged_in",
         )
@@ -239,6 +244,10 @@ async def refresh_tokens(
             request=request,
             start_time=start_time,
             status_code=200,
+            top_level_fields={
+                "access_token": access_token,
+                "token_type": "bearer",
+            },
         )
         logger.info("auth.token_refreshed")
         return add_refresh_token_to_cookie(response, new_raw_refresh)
