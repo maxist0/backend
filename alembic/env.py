@@ -33,26 +33,20 @@ from dotenv import load_dotenv
 config = context.config
 
 
-_env = (
-    context.get_x_argument(as_dictionary=True).get("env")  # -x env=test
-    or os.getenv("APP_ENV")  # shell export
-    or "dev"  # default
-)
-
-_env_file = f".env.{_env}"
+_env_file = ".env.local"
 
 if os.path.exists(_env_file):
     load_dotenv(_env_file, override=True)
     print(f"[alembic] Loaded {_env_file}")
 else:
-    load_dotenv(".env", override=True)
-    print(f"[alembic] {_env_file} not found – falling back to .env")
+    print(f"[alembic] {_env_file} not found – falling back to injecting DATABASE_URL from environment")
 
 # Inject the live DATABASE_URL so we never hard-code it in alembic.ini
 ## Get database from .env
 _url = os.getenv("DATABASE_URL")
 assert _url, "DATABASE_URL environment variable must be set for Alembic migrations"
 
+print(f"[alembic] Using DATABASE_URL: {_url}")
 
 if _url.startswith("postgresql://") or _url.startswith("postgres://"):
     _url = _url.replace("postgresql://", "postgresql+asyncpg://", 1)
@@ -126,3 +120,5 @@ if context.is_offline_mode():
     run_migrations_offline()
 else:
     run_migrations_online()
+
+print("[alembic] Migration complete")

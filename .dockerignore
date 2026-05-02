@@ -6,12 +6,11 @@ __pycache__/
 .Python
 
 # Virtual environments
+.venv/
 venv/
 env/
-.env.local
-.env
 ENV/
-.venv
+
 
 # IDEs
 .vscode/
@@ -54,15 +53,14 @@ docker-compose*.yml
 documentation/
 implementation-plan/
 README.md
+Readme.md
+docs/
 
 # Other
 scripts/
 .mypy_cache/
 .ruff_cache/
-
-# Documentation
-README.md
-docs/
+deployment/
 
 # OS
 .DS_Store

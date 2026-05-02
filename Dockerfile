@@ -1,9 +1,18 @@
-# Use a lightweight Python image
-FROM python:3.13-slim
+# Build dependencies in a separate stage to keep the runtime small
+FROM python:3.13-slim AS builder
 
-# Set build arguments for environment
-ARG ENVIRONMENT=prod
-ENV ENVIRONMENT=${ENVIRONMENT}
+# Set the working directory
+WORKDIR /app
+
+# Install uv and sync dependencies into a local venv
+RUN pip install --no-cache-dir uv
+
+# Copy dependency files and install via uv
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev
+
+# Runtime stage
+FROM python:3.13-slim
 
 # Set the working directory
 WORKDIR /app
@@ -14,10 +23,8 @@ RUN groupadd -r appuser && useradd -r -g appuser appuser
 # Create logs directory with proper permissions
 RUN mkdir -p /app/logs && chown -R appuser:appuser /app/logs
 
-# Copy dependency files and install via uv
-COPY pyproject.toml uv.lock ./
-RUN pip install --no-cache-dir uv
-RUN uv sync --frozen --no-dev
+# Copy the virtual environment from the builder
+COPY --from=builder /app/.venv /app/.venv
 
 # Use the project virtual environment for runtime
 ENV VIRTUAL_ENV=/app/.venv
@@ -45,6 +52,3 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
 # Use ENTRYPOINT to define the executable
 # This allows you to pass the stage as an argument at runtime
 ENTRYPOINT ["python", "app.py"]
-
-# Default to production if no argument is provided
-CMD ["test"]
