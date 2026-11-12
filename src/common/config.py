@@ -75,6 +75,11 @@ class Settings(BaseSettings):
     MAIL_SERVER: Optional[str] = None
     MAIL_STARTTLS: bool = True
 
+    # Admin panel
+    ADMIN_USERNAME: str = "admin"
+    ADMIN_PASSWORD: str = "admin"
+    ADMIN_SECRET_KEY: str = "admin-secret-key-change-in-production"
+
     # Metrics
     METRICS_ENABLED: bool = True
 

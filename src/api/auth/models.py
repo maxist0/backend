@@ -79,6 +79,9 @@ class User(Base):
         DateTime(timezone=True), nullable=True
     )
 
+    def __str__(self) -> str:
+        return f"{self.username} ({self.email})"
+
     # relationships
     password_credential: Mapped[Optional["PasswordCredential"]] = relationship(
         back_populates="user", uselist=False, cascade="all, delete-orphan"
@@ -113,6 +116,9 @@ class PasswordCredential(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
     )
+
+    def __str__(self) -> str:
+        return f"PasswordCredential(user_id={self.user_id})"
 
     user: Mapped["User"] = relationship(back_populates="password_credential")
 
@@ -158,6 +164,9 @@ class AuthAuditLog(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow
     )
+
+    def __str__(self) -> str:
+        return f"{self.event_type.value} @ {self.created_at}"
 
     user: Mapped[Optional["User"]] = relationship(back_populates="audit_logs")
 
@@ -205,6 +214,9 @@ class EmailToken(Base):
         DateTime(timezone=True), default=utcnow
     )
 
+    def __str__(self) -> str:
+        return f"{self.purpose.value} (user_id={self.user_id})"
+
     user: Mapped["User"] = relationship(back_populates="email_tokens")
 
     __table_args__ = (
@@ -247,6 +259,10 @@ class Session(Base):
     revoked_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+
+    def __str__(self) -> str:
+        status = "revoked" if self.is_revoked else "active"
+        return f"Session({status}, device={self.device_name or 'unknown'}, ip={self.ip_address})"
 
     user: Mapped["User"] = relationship(back_populates="sessions")
 

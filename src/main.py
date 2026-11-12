@@ -42,6 +42,7 @@ from src.common.exceptions import (
 )
 
 from fastapi.middleware.gzip import GZipMiddleware
+from src.admin import create_admin
 
 # Logger for this module
 logger = get_logger(__name__)
@@ -120,6 +121,9 @@ app = FastAPI(
     redoc_url=None if settings.is_production else "/redoc",
     openapi_url=None if settings.is_production else "/openapi.json",
 )
+
+## Admin panel
+create_admin(app)
 
 ## Exception Handlers
 app.add_exception_handler(Exception, generic_exception_handler)
