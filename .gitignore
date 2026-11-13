@@ -29,9 +29,8 @@ build/
 
 
 deployment/
-documentation/
 scripts/
-implementation-plan/
+
 
 .coverage
 .env.local
