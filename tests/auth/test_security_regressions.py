@@ -44,6 +44,7 @@ from tests.helpers import (
     login_tokens,
     refresh_with,
     register,
+    run_async,
     run_parallel,
     secret_value,
     user_id_of,
@@ -803,7 +804,6 @@ class TestLoggingHygiene:
 
     def test_database_url_password_is_not_logged(self, caplog):
         """GUARD (fixed in step A, K3): engine creation and init_db logs."""
-        import asyncio
         import os
 
         import app.common.database as database
@@ -830,7 +830,7 @@ class TestLoggingHygiene:
                 await engine.dispose()
 
         with pytest.raises(RuntimeError) as raised:
-            asyncio.run(_init_and_dispose())
+            run_async(_init_and_dispose())
 
         assert password not in str(raised.value)
         text = _log_text(caplog)

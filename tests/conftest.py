@@ -1,8 +1,26 @@
 # conftest.py
-import asyncio
+"""Shared fixtures: containers, schema, per-test reset, clients.
+
+Harness design (review 2026-11, step 1.3):
+
+* Postgres and Redis run as SESSION-scoped fixtures, never in
+  ``pytest_configure``: ``pytest --collect-only`` and ``--help`` start nothing.
+* The schema comes from Alembic only (no ``create_all``): the migrations are
+  what production runs.
+* Every test starts from an empty database and an empty Redis (``TRUNCATE`` and
+  ``FLUSHALL`` BEFORE the test, so a crashed run cannot leak state forward).
+* HTTP tests use the sync ``TestClient`` (also for thread races). Fixture and
+  assertion SQL goes through one sync psycopg 3 engine (``db``), never through
+  ``asyncio.run`` with the app's engine.
+* psycopg async cannot run on Windows' ProactorEventLoop. Instead of the
+  deprecated ``WindowsSelectorEventLoopPolicy``, every place that creates an
+  event loop passes a loop factory (``helpers.LOOP_FACTORY``; the TestClient
+  gets it via ``backend_options``). No ``set_event_loop_policy`` anywhere.
+"""
+
 import os
-import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 # MUST run before anything calls ``get_settings()``: ENVIRONMENT is required
 # (no fallback to dev), and "unittest" never reads .env.local.
@@ -10,119 +28,147 @@ os.environ["ENVIRONMENT"] = "unittest"
 # Admin panel is opt-in outside "dev" (Phase 0 fix 6). The admin tests drive the
 # real sqladmin app, so enable it explicitly for the test process.
 os.environ["ADMIN_ENABLED"] = "true"
+# Collection imports app modules (``app.main`` builds an app, ``app.common.taskiq``
+# builds the broker) BEFORE the containers exist and their ports are known.
+# Until ``test_environment`` wires the real addresses, every service address
+# points at a closed port, so nothing collected or imported early can reach a
+# developer's own Postgres/Redis on the default ports. Tests never use those
+# early objects: ``client`` builds its app from the wired settings. (The broker
+# is the exception; its enqueue stays unreachable on purpose, tests that
+# register users use ``captured_emails``. Step 1.5 moves the broker into the
+# lifespan.)
+_UNREACHABLE = "127.0.0.1:1"
+os.environ["DATABASE_URL"] = f"postgresql+psycopg://x:x@{_UNREACHABLE}/unconfigured"
+os.environ["CACHE_HOST"] = "127.0.0.1"
+os.environ["CACHE_PORT"] = "1"
+os.environ["TASKIQ_BROKER_URL"] = f"redis://{_UNREACHABLE}/1"
+os.environ["TASKIQ_RESULT_BACKEND_URL"] = f"redis://{_UNREACHABLE}/2"
 
-import pytest
-import redis as redis_sync
-from alembic import command
-from alembic.config import Config
-from fastapi.testclient import TestClient
-from sqlalchemy import text
-from testcontainers.postgres import PostgresContainer  # type: ignore
-from testcontainers.redis import RedisContainer  # type: ignore
+import pytest  # noqa: E402
+import redis as redis_sync  # noqa: E402
+from alembic import command  # noqa: E402
+from alembic.config import Config  # noqa: E402
+from sqlalchemy import create_engine, text  # noqa: E402
+from testcontainers.postgres import PostgresContainer  # type: ignore  # noqa: E402
+from testcontainers.redis import RedisContainer  # type: ignore  # noqa: E402
 
-_pg_container: PostgresContainer | None = None
-_redis_container: RedisContainer | None = None
+from tests.helpers import new_test_client  # noqa: E402
 
-if sys.platform == "win32":
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())  # type: ignore[attr-defined]
+BACKEND_DIR = Path(__file__).resolve().parents[1]
 
-
-# ---------------------------------------------------------------------------
-# Session-level: spin up containers and set env vars BEFORE anything imports
-# ---------------------------------------------------------------------------
-
-
-def pytest_configure(config):
-    global _pg_container, _redis_container
-
-    _pg_container = PostgresContainer("postgres:15-alpine")
-    _pg_container.start()
-    raw = _pg_container.get_connection_url()
-    async_url = (
-        raw.replace("postgresql+psycopg2://", "postgresql+psycopg://")
-        .replace("postgresql://", "postgresql+psycopg://")
-        .replace("postgres://", "postgresql+psycopg://")
-    )
-    os.environ["DATABASE_URL"] = async_url
-
-    _redis_container = RedisContainer("redis:7-alpine")
-    _redis_container.start()
-    redis_port = _redis_container.get_exposed_port(6379)
-    os.environ["REDIS_URL"] = f"redis://localhost:{redis_port}"
-    # The app reads CACHE_HOST/CACHE_PORT and TASKIQ_*_URL, not REDIS_URL
-    # (Known issue 1). Point every Redis consumer at the container.
-    os.environ["CACHE_HOST"] = "localhost"
-    os.environ["CACHE_PORT"] = str(redis_port)
-    os.environ["CACHE_DB"] = "0"
-    os.environ["TASKIQ_BROKER_URL"] = f"redis://localhost:{redis_port}/1"
-    os.environ["TASKIQ_RESULT_BACKEND_URL"] = f"redis://localhost:{redis_port}/2"
-
-    # Settings are cached per process: drop anything read before the
-    # containers' addresses were known.
-    from app.common.config import get_settings
-
-    get_settings.cache_clear()
-
-
-def pytest_unconfigure(config):
-    global _pg_container, _redis_container
-    if _pg_container:
-        _pg_container.stop()
-    if _redis_container:
-        _redis_container.stop()
+# Same pins as compose.dev.yaml (tests/common/test_dev_compose_parity.py fails
+# when they drift): same major as production (review 2026-11, N3).
+POSTGRES_IMAGE = "postgres:18.7-alpine3.24@sha256:b6972e1115a4ff8eba5d7f7d19184926d1e16d7d1136ae1e1a7ebf286da0f015"
+REDIS_IMAGE = "redis:7.4.12-alpine3.22@sha256:7f7d30b7fdd09467bac58198a1f166dd69789d348d4fe859cccb20e0cf287fbe"
 
 
 # ---------------------------------------------------------------------------
-# Session-level: run Alembic migrations once
+# Session-level: containers, environment wiring, schema
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="session")
+def postgres_container():
+    # driver="psycopg": URL is postgresql+psycopg://, the app's only driver
+    # (Settings refuse the testcontainers default +psycopg2).
+    with PostgresContainer(POSTGRES_IMAGE, driver="psycopg") as container:
+        yield container
+
+
+@pytest.fixture(scope="session")
+def redis_container():
+    with RedisContainer(REDIS_IMAGE) as container:
+        yield container
 
 
 @pytest.fixture(scope="session", autouse=True)
-def init_db():
-    from sqlalchemy import create_engine
+def test_environment(postgres_container, redis_container):
+    """Point every consumer (DB, cache, taskiq) at the containers.
 
+    The app reads CACHE_HOST/CACHE_PORT and TASKIQ_*_URL (not REDIS_URL).
+    Settings are cached per process, so the cache is cleared after wiring and
+    again when the environment is restored.
+    """
+    from app.common.config import get_settings
+
+    redis_port = redis_container.get_exposed_port(6379)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("DATABASE_URL", postgres_container.get_connection_url())
+        mp.setenv("CACHE_HOST", "localhost")
+        mp.setenv("CACHE_PORT", str(redis_port))
+        mp.setenv("CACHE_DB", "0")
+        mp.setenv("TASKIQ_BROKER_URL", f"redis://localhost:{redis_port}/1")
+        mp.setenv("TASKIQ_RESULT_BACKEND_URL", f"redis://localhost:{redis_port}/2")
+        get_settings.cache_clear()
+        try:
+            yield
+        finally:
+            get_settings.cache_clear()
+
+
+@pytest.fixture(scope="session")
+def sync_engine(test_environment):
+    """One sync psycopg 3 engine for fixtures and assertions.
+
+    It never shares connections with the app's async engine, which lives on
+    the TestClient's event loop.
+    """
+    engine = create_engine(os.environ["DATABASE_URL"], pool_pre_ping=True)
+    try:
+        yield engine
+    finally:
+        engine.dispose()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def migrated_db(sync_engine):
+    """Create the schema with Alembic, exactly like a deployment (once).
+
+    Returns the comma-separated, quoted table list that ``clean_db`` truncates.
+    """
     from app.common.config import get_settings
     from app.common.logging import setup_logging
-    from app.models import Base
 
-    alembic_cfg = Config("alembic.ini")
-    alembic_cfg.set_main_option("sqlalchemy.url", os.environ["DATABASE_URL"])
-    command.upgrade(alembic_cfg, "head")
-
-    # Known issue 2 (create_all after alembic) is removed by the harness rework
-    # (review 2026-11, step 1.3). A short-lived sync engine (psycopg 3) keeps
-    # this off the app's event loops.
-    engine = create_engine(os.environ["DATABASE_URL"])
-    Base.metadata.create_all(engine)
+    cfg = Config(str(BACKEND_DIR / "alembic.ini"))
+    cfg.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
+    # alembic/env.py reads DATABASE_URL from the environment.
+    command.upgrade(cfg, "head")
 
     # Like a process start: code tested outside a lifespan logs through the
     # configured structlog/stdlib chain. After alembic, whose fileConfig
     # replaces the root handlers.
     setup_logging(get_settings())
-    try:
-        yield
-    finally:
-        Base.metadata.drop_all(engine)
-        engine.dispose()
+
+    # Every table except alembic's own bookkeeping, so new models are reset
+    # without touching this file.
+    with sync_engine.connect() as conn:
+        tables = (
+            conn.execute(
+                text(
+                    "SELECT format('%I.%I', schemaname, tablename) FROM pg_tables "
+                    "WHERE schemaname = 'public' AND tablename <> 'alembic_version' "
+                    "ORDER BY tablename"
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert tables, "alembic upgrade head created no tables"
+    return ", ".join(tables)
 
 
 # ---------------------------------------------------------------------------
-# Function-scoped: fresh TestClient per test
-#
-# Why function-scoped?
-#   - Each TestClient owns a requests.Session (its own cookie jar).
-#     A session-scoped client would leak refresh-token cookies between tests.
-#   - The DB container and migrations stay session-scoped (expensive);
-#     recreating the ASGI client is cheap.
+# Function-scoped: reset state BEFORE every test
 # ---------------------------------------------------------------------------
 
 
 @pytest.fixture(autouse=True)
-def flush_redis(init_db):
+def flush_redis(test_environment):
     """FLUSHALL on the Redis container BEFORE every test (not after).
 
     Starting from an empty Redis makes tests independent of whatever the
-    previous test (or a crashed run) left behind.
+    previous test (or a crashed run) left behind. Yields the callable so a test
+    can simulate a Redis outage/flush mid-test.
     """
 
     def _flush() -> None:
@@ -135,41 +181,42 @@ def flush_redis(init_db):
             r.close()
 
     _flush()
-    # Yield the callable so a test can simulate a Redis outage/flush mid-test.
     yield _flush
 
 
-@pytest.fixture
-def client(init_db, flush_redis):
-    from app.main import app
-
-    with TestClient(app) as c:
-        yield c
-
-
-# ---------------------------------------------------------------------------
-# Function-scoped: truncate all auth tables after every test
-# ---------------------------------------------------------------------------
-
-
 @pytest.fixture(autouse=True)
-def clean_db(init_db):
+def clean_db(sync_engine, migrated_db):
+    """TRUNCATE every application table BEFORE every test (CASCADE: FK order)."""
+    with sync_engine.begin() as conn:
+        conn.execute(text(f"TRUNCATE {migrated_db} RESTART IDENTITY CASCADE"))
     yield
 
-    from sqlalchemy import create_engine
 
-    engine = create_engine(os.environ["DATABASE_URL"])
-    try:
-        with engine.begin() as conn:
-            # CASCADE handles FK ordering automatically.
-            conn.execute(
-                text(
-                    "TRUNCATE auth_audit_log, email_tokens, sessions, "
-                    "password_credentials, users CASCADE"
-                )
-            )
-    finally:
-        engine.dispose()
+# ---------------------------------------------------------------------------
+# Function-scoped: fresh app and TestClient per test
+#
+# Why function-scoped?
+#   - Each TestClient owns its own cookie jar. A session-scoped client would
+#     leak refresh-token cookies between tests.
+#   - The app is built from the WIRED settings (the collection-time
+#     ``app.main.app`` was created before the containers existed).
+#     create_app() does no I/O.
+#   - Containers and migrations stay session-scoped (expensive).
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def app(test_environment):
+    from app.common.config import get_settings
+    from app.main import create_app
+
+    return create_app(get_settings())
+
+
+@pytest.fixture
+def client(app, clean_db, flush_redis):
+    with new_test_client(app) as c:
+        yield c
 
 
 # ---------------------------------------------------------------------------
@@ -248,15 +295,13 @@ def captured_emails(monkeypatch) -> CapturedEmails:
 
 
 @pytest.fixture
-def db():
+def db(sync_engine):
     """Synchronous SQL helper for assertions and direct state manipulation.
 
-    Uses its own short-lived sync engine (psycopg 3 supports sync and async) so
-    it never shares pooled connections with the app's event loop.
+    Shares the session's sync psycopg 3 engine; it never touches the app's
+    event loop or its async engine.
     """
-    from sqlalchemy import create_engine
-
-    engine = create_engine(os.environ["DATABASE_URL"])
+    engine = sync_engine
 
     class _Db:
         def rows(self, sql: str, **params):
@@ -276,31 +321,4 @@ def db():
             with engine.begin() as conn:
                 conn.execute(text(sql), params)
 
-    try:
-        yield _Db()
-    finally:
-        engine.dispose()
-
-
-@pytest.fixture
-def deactivate_user():
-    from sqlalchemy import update
-    from sqlalchemy.ext.asyncio import create_async_engine
-    from sqlalchemy.pool import NullPool
-
-    from app.api.auth.models import User
-
-    async def _run(username: str):
-        # Own engine: the app's engine lives on the TestClient's event loop.
-        engine = create_async_engine(os.environ["DATABASE_URL"], poolclass=NullPool)
-        try:
-            async with engine.begin() as conn:
-                await conn.execute(
-                    update(User)
-                    .where(User.username == username)
-                    .values(is_active=False)
-                )
-        finally:
-            await engine.dispose()
-
-    return _run
+    return _Db()

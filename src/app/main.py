@@ -45,6 +45,7 @@ from app.common.database import (
     build_engine,
     close_db,
     create_session_factory,
+    ensure_supported_event_loop,
     init_db,
 )
 from app.common.exceptions import (
@@ -103,7 +104,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
 
     async with AsyncExitStack() as stack:
-        # Database: engine, connectivity check, bind the session factory.
+        # Database: loop check (Windows), engine, connectivity check, bind
+        # the session factory.
+        ensure_supported_event_loop()
         engine = build_engine(settings)
         stack.push_async_callback(close_db, engine)
         await init_db(engine, settings)

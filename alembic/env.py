@@ -13,7 +13,10 @@ Run autogenerate:
 
 Apply migrations:
     ENVIRONMENT=dev alembic upgrade head
-    DATABASE_URL=postgresql+asyncpg://... alembic upgrade head
+    DATABASE_URL=postgresql+psycopg://... alembic upgrade head
+
+The URL is normalised like the application's (``postgresql://`` and
+``postgres://`` become ``postgresql+psycopg://``; other drivers are refused).
 
 Downgrade one step:
     ENVIRONMENT=dev alembic downgrade -1
@@ -22,6 +25,7 @@ Downgrade one step:
 import asyncio
 import logging
 import os
+import sys
 from logging.config import fileConfig
 
 from alembic import context
@@ -30,7 +34,7 @@ from sqlalchemy import pool
 from sqlalchemy.engine import Connection, make_url
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from app.common.config import LOCAL_ENV_FILE, Environment
+from app.common.config import LOCAL_ENV_FILE, Environment, normalize_database_url
 
 # The model registry imports every feature's models, so the metadata holds
 # all tables (autogenerate must never see an empty metadata).
@@ -65,10 +69,11 @@ def _database_url() -> str:
             "DATABASE_URL is not set. Export it, or set ENVIRONMENT=dev to "
             "read it from .env.local."
         )
-    if url.startswith("postgresql://") or url.startswith("postgres://"):
-        url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
-        url = url.replace("postgres://", "postgresql+asyncpg://", 1)
-    return url
+    try:
+        return normalize_database_url(url)
+    except ValueError as exc:
+        # The message names the scheme only, never the URL.
+        raise MigrationConfigError(str(exc)) from None
 
 
 _url = _database_url()
@@ -128,7 +133,9 @@ async def run_async_migrations() -> None:
 
 
 def run_migrations_online() -> None:
-    asyncio.run(run_async_migrations())
+    # psycopg (async) cannot use Windows' default ProactorEventLoop.
+    loop_factory = asyncio.SelectorEventLoop if sys.platform == "win32" else None
+    asyncio.run(run_async_migrations(), loop_factory=loop_factory)
 
 
 # ---------------------------------------------------------------------------

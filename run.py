@@ -18,6 +18,12 @@ import os
 import subprocess
 import sys
 
+# psycopg (async) cannot run on Windows' default ProactorEventLoop, which
+# uvicorn picks for a single process there. An import string is used as the
+# loop factory directly (uvicorn >= 0.36, "--loop <module>:<attr>"). Other
+# platforms keep "auto" (uvloop when installed).
+UVICORN_LOOP = "asyncio:SelectorEventLoop" if sys.platform == "win32" else "auto"
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the API server")
@@ -71,7 +77,10 @@ def main() -> None:
 
     worker_process = None
 
-    # Start a taskiq worker process automatically in development mode.
+    # Start a taskiq worker process automatically in development mode. On
+    # Windows the taskiq CLI runs on a ProactorEventLoop; that is fine while
+    # tasks use no database (mail, heartbeat). A worker that uses psycopg
+    # needs its own entrypoint there (review 2026-11, step 1.5).
     if settings.is_development:
         worker_process = subprocess.Popen(
             [
@@ -91,6 +100,7 @@ def main() -> None:
             host=host,
             port=port,
             reload=args.reload,
+            loop=UVICORN_LOOP,
             log_config=None,  # logging is configured by the app's lifespan
         )
     finally:

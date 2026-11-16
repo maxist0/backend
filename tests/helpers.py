@@ -3,16 +3,51 @@
 
 from __future__ import annotations
 
+import asyncio
+import sys
 import threading
 import uuid
+from collections.abc import Awaitable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 import jwt
+from fastapi.testclient import TestClient
 
 PASSWORD = "Password123!"
+
+# psycopg's async mode cannot run on Windows' default ProactorEventLoop (the app
+# refuses to start on it, see app.common.database.ensure_supported_event_loop).
+# Event loops are therefore created through this factory instead of the
+# deprecated ``WindowsSelectorEventLoopPolicy``; ``None`` means the platform
+# default (uvloop-compatible asyncio default on POSIX).
+LOOP_FACTORY: Callable[[], asyncio.AbstractEventLoop] | None = (
+    asyncio.SelectorEventLoop if sys.platform == "win32" else None
+)
+
+
+def new_test_client(app: Any, **kwargs: Any) -> TestClient:
+    """``TestClient`` whose anyio portal runs on ``LOOP_FACTORY``.
+
+    Starlette passes ``backend_options`` to ``anyio.from_thread.start_blocking_portal``,
+    and anyio's asyncio backend forwards ``loop_factory`` to ``asyncio.Runner``.
+    """
+    return TestClient(app, backend_options={"loop_factory": LOOP_FACTORY}, **kwargs)
+
+
+def run_async[T](coro: Awaitable[T]) -> T:
+    """Run *coro* to completion on a fresh loop made by ``LOOP_FACTORY``.
+
+    For tests that call async code outside the TestClient (own engines only,
+    never the app engine, which lives on the TestClient's loop).
+    """
+
+    async def _wrapper() -> T:
+        return await coro
+
+    return asyncio.run(_wrapper(), loop_factory=LOOP_FACTORY)
 
 
 def secret_value(value: Any) -> str:

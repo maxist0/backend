@@ -15,7 +15,7 @@ from importlib.metadata import version as distribution_version
 from pathlib import Path
 from typing import Optional, Self
 
-from pydantic import Field, SecretStr, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Public code defaults. They are fine for local development and the test suite,
@@ -41,6 +41,39 @@ def _installed_version() -> str:
         return _UNKNOWN_VERSION
 
 
+# The only supported database driver: psycopg 3 (async), review 2026-11, N1.
+DATABASE_URL_SCHEME = "postgresql+psycopg"
+# Generic PostgreSQL URL schemes (libpq, Heroku-style) that mean the same server.
+_GENERIC_POSTGRES_SCHEMES = frozenset({"postgresql", "postgres"})
+
+
+def normalize_database_url(url: str) -> str:
+    """Return *url* with the ``postgresql+psycopg`` scheme.
+
+    ``postgresql://`` and ``postgres://`` are rewritten (they name no driver,
+    so the meaning does not change). Any other driver is refused instead of
+    silently replaced: an explicit ``+asyncpg`` or ``+psycopg2`` in a deployment
+    is a stale configuration someone should see. Messages contain only the
+    scheme, never the URL (it holds the password).
+    """
+    url = url.strip()
+    scheme, separator, rest = url.partition("://")
+    if not separator:
+        raise ValueError(f"DATABASE_URL must start with {DATABASE_URL_SCHEME}://")
+    scheme = scheme.lower()
+    if scheme == DATABASE_URL_SCHEME or scheme in _GENERIC_POSTGRES_SCHEMES:
+        return f"{DATABASE_URL_SCHEME}://{rest}"
+    if scheme == "postgresql+asyncpg":
+        raise ValueError(
+            "DATABASE_URL uses the asyncpg driver, which is no longer installed. "
+            f"Change the scheme to {DATABASE_URL_SCHEME}:// (psycopg 3)."
+        )
+    raise ValueError(
+        f"DATABASE_URL scheme {scheme!r} is not supported; "
+        f"use {DATABASE_URL_SCHEME}:// (psycopg 3)."
+    )
+
+
 class ConfigurationError(RuntimeError):
     """The process environment does not allow building the settings.
 
@@ -60,8 +93,11 @@ class Settings(BaseSettings):
     # Environment: required, never defaulted (no silent fallback to dev).
     ENVIRONMENT: Environment
 
-    # Database
-    DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/api"
+    # Database (psycopg 3; postgresql:// and postgres:// are normalised)
+    DATABASE_URL: str = "postgresql+psycopg://postgres:postgres@localhost:5432/api"
+    # Seconds to establish one connection (psycopg's own default is 130).
+    # libpq treats values below 2 as 2.
+    DB_CONNECT_TIMEOUT: int = Field(default=10, ge=2)
 
     # Connection pool
     DB_POOL_SIZE: int = 10
@@ -161,6 +197,11 @@ class Settings(BaseSettings):
         if self.ADMIN_ENABLED is None:
             return self.is_development
         return self.ADMIN_ENABLED
+
+    @field_validator("DATABASE_URL")
+    @classmethod
+    def _normalize_database_url(cls, value: str) -> str:
+        return normalize_database_url(value)
 
     @model_validator(mode="after")
     def _refuse_insecure_defaults(self) -> Self:

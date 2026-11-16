@@ -7,11 +7,11 @@ import sys
 from pathlib import Path
 
 import pytest
-from fastapi.testclient import TestClient
 from sqlalchemy.engine import make_url
 
 import app.main as main
 from app.common.config import Settings
+from tests.helpers import new_test_client
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
 
@@ -109,7 +109,7 @@ class TestLifespan:
             _spy(monkeypatch, name, calls)
         app = main.create_app(_settings())
 
-        with TestClient(app) as c:
+        with new_test_client(app) as c:
             factory = app.state.session_factory
             assert factory.kw["bind"] is app.state.engine
             assert c.get("/").status_code == 200
@@ -134,7 +134,7 @@ class TestLifespan:
         app = main.create_app(_settings())
 
         with pytest.raises(ConnectionError, match="redis down"):
-            with TestClient(app):
+            with new_test_client(app):
                 pass
 
         assert [name for name, _ in calls] == ["close_db"]
@@ -153,7 +153,7 @@ class TestLifespan:
         app = main.create_app(_settings())
 
         with pytest.raises(RuntimeError, match="route cache setup failed"):
-            with TestClient(app):
+            with new_test_client(app):
                 pass
 
         assert [name for name, _ in calls] == ["close_cache_pool", "close_db"]
@@ -169,7 +169,7 @@ class TestLifespan:
         )
 
         with pytest.raises(RuntimeError, match="Database connection failed"):
-            with TestClient(app):
+            with new_test_client(app):
                 pass
 
         assert [name for name, _ in calls] == ["close_db"]

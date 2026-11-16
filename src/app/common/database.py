@@ -15,6 +15,8 @@ Usage in routers / services:
     async def my_endpoint(db: DbSession) -> ...
 """
 
+import asyncio
+import sys
 from collections.abc import AsyncIterator
 
 from fastapi import Request
@@ -33,9 +35,11 @@ from app.common.models import Base
 
 __all__ = [
     "Base",
+    "UnsupportedEventLoopError",
     "build_engine",
     "close_db",
     "create_session_factory",
+    "ensure_supported_event_loop",
     "get_db",
     "init_db",
 ]
@@ -44,17 +48,58 @@ logger = get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Event loop check (psycopg async on Windows)
+# ---------------------------------------------------------------------------
+
+
+class UnsupportedEventLoopError(RuntimeError):
+    """The running event loop cannot drive the async database driver."""
+
+
+def ensure_supported_event_loop() -> None:
+    """Fail fast when psycopg cannot run on the current event loop.
+
+    psycopg 3 does not support Windows' default ``ProactorEventLoop``
+    (https://www.psycopg.org/psycopg3/docs/advanced/async.html). uvicorn uses
+    that loop on Windows for a single process; ``run.py`` selects a
+    ``SelectorEventLoop`` instead, ``fastapi dev`` (reload) and multi-worker
+    runs get one from uvicorn. Must be called inside the running loop.
+    """
+    if sys.platform == "win32":
+        loop = asyncio.get_running_loop()
+        if isinstance(loop, asyncio.ProactorEventLoop):
+            raise UnsupportedEventLoopError(
+                "The database driver (psycopg) cannot run on Windows' "
+                "ProactorEventLoop. Start the API with 'python run.py dev' or "
+                "'fastapi dev' (or 'fastapi run --workers 2'), which use a "
+                "SelectorEventLoop."
+            )
+
+
+# ---------------------------------------------------------------------------
 # Engine and session factory (created by the app factory / lifespan)
 # ---------------------------------------------------------------------------
 
 
 def build_engine(settings: Settings) -> AsyncEngine:
-    """Create the async SQLAlchemy engine from *settings* (no I/O yet)."""
+    """Create the async SQLAlchemy engine from *settings* (no I/O yet).
+
+    Driver: psycopg 3 (``postgresql+psycopg``; SQLAlchemy picks the async
+    variant for ``create_async_engine``). psycopg prepares a statement on the
+    server after it ran ``prepare_threshold`` (default 5) times on one
+    connection; that is fine against PostgreSQL directly. Behind a PgBouncer
+    in transaction mode it needs PgBouncer >= 1.21 with
+    ``max_prepared_statements``, or ``prepare_threshold=None``.
+    """
     url = make_url(settings.DATABASE_URL)  # validate and parse the URL
     logger.info("db.engine_creating", url=url.render_as_string(hide_password=True))
 
     return create_async_engine(
         url,
+        # --- driver ---
+        # Bounded connection setup (psycopg defaults to 130 s); applies to the
+        # startup check and to every new pool connection.
+        connect_args={"connect_timeout": settings.DB_CONNECT_TIMEOUT},
         # --- connection pool ---
         pool_size=settings.DB_POOL_SIZE,
         max_overflow=settings.DB_MAX_OVERFLOW,
@@ -87,7 +132,7 @@ def create_session_factory(
 def _redact_db_secrets(message: str, database_url: str) -> str:
     """Remove the database URL and password from an error message.
 
-    Driver errors (asyncpg, psycopg, socket errors) can echo DSN fragments;
+    Driver errors (psycopg, socket errors) can echo DSN fragments;
     the password must never reach logs or tracebacks.
     """
     url = make_url(database_url)

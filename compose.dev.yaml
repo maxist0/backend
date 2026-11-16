@@ -1,0 +1,77 @@
+# compose.dev.yaml - local development dependencies only (Postgres + Redis).
+#
+#   docker compose -f compose.dev.yaml up -d      # start
+#   docker compose -f compose.dev.yaml down       # stop, keep data
+#   docker compose -f compose.dev.yaml down -v    # stop and delete data
+#
+# The credentials are the public, non-secret dev defaults that the `.env`
+# template documents:
+#   DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5432/api
+#   CACHE_HOST=localhost, CACHE_PORT=6379 (no password)
+#   TASKIQ_BROKER_URL=redis://localhost:6379/1
+#   TASKIQ_RESULT_BACKEND_URL=redis://localhost:6379/2
+# Never use this file, or these credentials, outside a developer machine.
+#
+# Ports bind to 127.0.0.1 only, so the services are not reachable from the
+# network. If 5432/6379 are taken, override the host side, e.g.
+#   DEV_POSTGRES_PORT=55432 docker compose -f compose.dev.yaml up -d
+# and adjust DATABASE_URL / CACHE_PORT / TASKIQ_*_URL in .env.local.
+#
+# Images are pinned to an exact version plus the multi-arch index digest
+# (works on amd64 and arm64). To update: pick the new tag on Docker Hub and
+# replace the digest with `docker buildx imagetools inspect <tag>` (the
+# "Digest:" line of the index).
+
+name: api-dev
+
+services:
+  postgres:
+    # Same major as tests and production (review 2026-11, decision N3).
+    image: postgres:18.7-alpine3.24@sha256:b6972e1115a4ff8eba5d7f7d19184926d1e16d7d1136ae1e1a7ebf286da0f015
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: api
+    ports:
+      - "127.0.0.1:${DEV_POSTGRES_PORT:-5432}:5432"
+    volumes:
+      # Postgres 18+ images: PGDATA is /var/lib/postgresql/18/docker and the
+      # image VOLUME is /var/lib/postgresql. Mount the parent directory (not
+      # .../data as for <= 17) so a later major upgrade (pg_upgrade --link)
+      # sees old and new data directories on one volume.
+      - postgres_data:/var/lib/postgresql
+    healthcheck:
+      # Over TCP: during first-run initialisation the entrypoint starts a
+      # temporary server on the Unix socket only (listen_addresses=''), so a
+      # socket check would report "healthy" before the real server is up.
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "postgres", "-d", "api"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+      start_interval: 1s
+    restart: unless-stopped
+
+  redis:
+    # Redis 7 like the current deployment stack; the redis-py 8 client
+    # upgrade is a separate step (review 2026-11, step 1.4).
+    image: redis:7.4.12-alpine3.22@sha256:7f7d30b7fdd09467bac58198a1f166dd69789d348d4fe859cccb20e0cf287fbe
+    # Persistence is not needed for dev (cache, task queue); the volume keeps
+    # the RDB snapshot only so a restart does not drop queued tasks.
+    command: ["redis-server", "--save", "60", "1", "--appendonly", "no"]
+    ports:
+      - "127.0.0.1:${DEV_REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+      start_interval: 1s
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:

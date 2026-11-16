@@ -14,7 +14,6 @@ dependencies = [
     "argon2-cffi>=23.1.0",
     "redis>=5.0.0",
     "sqlalchemy[asyncio]>=2.0.49",
-    "asyncpg>=0.31.0",
     "alembic>=1.18.4",
     "greenlet>=3.1.0",
     "structlog>=25.0.0",
@@ -109,10 +108,26 @@ markers = [
     "unit: isolated logic tests",
     "root: test root endpoint and basic app functionality",
 ]
+# Later entries take precedence over earlier ones, so the targeted ignores sit
+# below the errors. There is no blanket ignore: a new deprecation (ours, a
+# dependency's, or Python's) fails the run and has to be fixed or listed here
+# with a reason and an exit condition.
 filterwarnings = [
-    "ignore::DeprecationWarning",
-    "ignore:Unverified HTTPS request",
+    "error::DeprecationWarning",
+    "error::PendingDeprecationWarning",
     "error::RuntimeWarning",
+    # testcontainers 4.14.1: RedisContainer still uses its own deprecated
+    # @wait_container_is_ready decorator (emitted at import). Upstream issue, no
+    # first-party code involved. Remove when testcontainers drops the decorator.
+    "ignore:The @wait_container_is_ready decorator is deprecated:DeprecationWarning:testcontainers",
+    # cashews 7.x calls the deprecated redis-py Redis.close() when the route cache
+    # shuts down. Upstream; the app's own redis client already uses aclose().
+    # Step 1.4 (dependency upgrades) re-checks this and removes the line.
+    "ignore:Call to deprecated close:DeprecationWarning:cashews",
+    # starlette's TestClient prefers httpx2 over httpx (StarletteDeprecationWarning,
+    # a UserWarning). Switching the test client dependency is part of step 1.4
+    # (major upgrades), not of the harness rework. Remove it there.
+    "ignore:Using `httpx` with `starlette.testclient` is deprecated:starlette.exceptions.StarletteDeprecationWarning",
 ]
 
 [tool.coverage.run]

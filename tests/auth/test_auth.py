@@ -189,14 +189,10 @@ class TestLogin:
         r = login(client, username="alice")
         assert r.status_code == 200
 
-    def test_inactive_account_returns_401(
-        self, client, deactivate_user, captured_emails
-    ):
-        import asyncio
-
+    def test_inactive_account_returns_401(self, client, db, captured_emails):
         r = register(client, username="alice")
         assert r.status_code == 201
-        asyncio.run(deactivate_user("alice"))
+        db.execute("UPDATE users SET is_active = false WHERE username = :u", u="alice")
         r = login(client, username="alice")
         assert r.status_code == 401
 
