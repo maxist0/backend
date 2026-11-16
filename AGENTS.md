@@ -1,15 +1,24 @@
 # AGENTS.md — backend
 
-Guidance for coding agents (Claude Code, Codex, Cursor, Copilot) and humans working in this repository. Human-facing docs, architecture and the roadmap are in [README.md](README.md); do not duplicate them here, link to them.
+Guidance for coding agents (Claude Code, Codex, Cursor, Copilot) and humans working in this repository. This file is the single source for backend conventions. Human-facing docs, architecture and the roadmap are in [README.md](README.md); link to them, do not duplicate them here. Decisions are recorded as ADRs in [documentation/adr/](documentation/adr/README.md).
+
+> **Target state.** Sections marked *(target)* describe the layout and rules decided on 2026-11-16 and implemented in steps S1–S3 of the 2026-11 cleanup (S1 structure, S2 taskiq reliability, S3 style pass, strict ruff/mypy, docs). Until they land, the code still uses `src/app/common/`, `src/app/api/` and the response envelope. New code follows the target.
 
 ## Project in one paragraph
 
-Production-grade FastAPI boilerplate: async SQLAlchemy 2 on PostgreSQL, Redis for the route cache, taskiq broker and results (refresh tokens live only in Postgres), taskiq for background jobs, structlog + Prometheus for observability, Docker Swarm for deployment. Python **3.14** is the target. The repository intentionally contains **no business features**; keep it generic. Current gaps and the plan are in [README.md → Roadmap](README.md#roadmap) and [Known issues](README.md#known-issues). Decisions not yet taken are in [Open decisions](README.md#open-decisions); do not pre-empt them in code.
+A **module boilerplate** on FastAPI: async SQLAlchemy 2 on PostgreSQL 18, Redis (taskiq broker and results, cache; refresh tokens live only in Postgres), taskiq for background jobs, structlog and Prometheus for observability, Docker Swarm for deployment. Python **3.14** is the target. A stable **core** carries user management, scaling and the other production features. Someone building a web app **adds modules and never edits the core**. The repository contains **no business features**. Gaps and the plan are in [README.md → Roadmap](README.md#roadmap) and [Known issues](README.md#known-issues). Decisions not yet taken are in [Open decisions](README.md#open-decisions); do not pre-empt them in code.
+
+## Simplicity first
+
+- Build no machinery for cases that do not exist yet (for example a router mounted under several prefixes).
+- Every abstraction needs a user today.
+- Prefer the standard or library mechanism over custom code. Prefer custom code over a new dependency only when it is a few lines.
+- Before structural changes, ask clarifying questions first. Agents return a "Clarifying questions" block ([agent standard §2](../.claude/agent-standards.md)).
 
 ## Golden rules
 
 1. Async only. Never call sync DB, Redis, SMTP or HTTP from request handlers or tasks.
-2. Read before you write: `src/common/config.py`, `src/common/exceptions.py`, `src/common/responses.py`, and the feature folder you touch.
+2. Read before you write: `src/app/core/config.py`, `src/app/core/errors.py`, `src/app/core/__init__.py`, and the module you touch.
 3. Every value that could differ per environment comes from `Settings`. No hard-coded URLs, TTLs, limits, origins or secrets.
 4. Never commit secrets, `.env.local`, or real credentials. `.env` is a template with empty values.
 5. Generate migrations, never apply them outside your local database. Never edit an applied migration.
@@ -21,118 +30,181 @@ Production-grade FastAPI boilerplate: async SQLAlchemy 2 on PostgreSQL, Redis fo
 ```bash
 uv python install 3.14 && uv sync          # install (creates .venv with dev group)
 uv run alembic upgrade head                 # migrate local DB (reads .env.local)
-uv run python app.py dev                    # API on :8000 + taskiq worker, reads .env.local
-uvx ruff@0.15.0 check src tests             # lint   (strict config is Roadmap Phase 0)
+uv run python run.py dev                    # API on :8000 + taskiq worker, reads .env.local
+uvx ruff@0.15.0 check src tests             # lint (S3 switches to `uv run ruff`, lint group)
 uvx ruff@0.15.0 format src tests            # format
-uv run mypy src                             # types  (strict mode is Roadmap Phase 0)
-uv run pytest                               # all tests; needs a running Docker daemon (Postgres and Redis Testcontainers)
-uv run pytest tests/auth/test_auth.py::TestLogin -x
-uv run pytest -k "refresh" -x -p no:cacheprovider
+uv run mypy src                             # types (strict mode arrives in S3)
+uv run pytest tests/unit                    # fast, no Docker (target); the coverage gate applies only to the full run
+uv run pytest                               # full suite; needs a running Docker daemon
+uv run pytest tests/integration -k "refresh" -x
 uv run alembic revision --autogenerate -m "describe_change"   # after model changes, then review the file
 docker build -t api:latest .                # image
 ```
 
-Use `uv run ...`; never `pip install` or activate a virtualenv by hand. If `.venv` is broken, `uv sync --reinstall`.
+`pytest` adds `--cov` through `addopts` (`pyproject.toml`). For a quick unit run without the coverage gate, pass `--no-cov`. Use `uv run ...`; never `pip install` or activate a virtualenv by hand. If `.venv` is broken, `uv sync --reinstall`.
 
-## Where things are
+## Where things are *(target)*
 
 | Need | Location |
 |---|---|
-| App assembly, middleware order, routers | `src/main.py` |
-| Settings and environments | `src/common/config.py` (`Settings`, `Environment`) |
-| DB engine, session, `get_db` | `src/common/database.py`; typed alias `DbSession` in `src/common/dependencies.py` |
-| Auth dependencies (`get_current_user`, `get_optional_user`) | `src/api/auth/dependencies.py` |
-| JWT encode/decode | `src/utils/jwt_utils.py` |
-| Response envelope helpers | `src/common/responses.py`, models in `src/common/schemas.py` |
-| Global exception handlers | `src/common/exceptions.py` |
-| Logging | `src/common/logging.py` (`get_logger(__name__)`, `log_unexpected_error`) |
-| DB error details (constraint, SQLSTATE) | `src/common/db_errors.py` (`constraint_name`, `sqlstate`, `find_db_error`) |
-| Metrics | `src/common/metrics.py` (`DatabaseTimer`, counters) |
-| Cache (Redis + cashews) | `src/common/cache.py` |
-| Background tasks | `src/common/taskiq.py` (broker), tasks in `src/utils/*.py` |
-| Email | `src/common/mail.py`, templates in `src/templates/email/` |
+| App assembly (`create_app()`), module mounting | `src/app/main.py`, `src/app/modules/__init__.py` (`MODULES`) |
+| Launcher (uvicorn, dev worker) | `run.py` |
+| Public core facade | `src/app/core/__init__.py` |
+| Settings and environments | `src/app/core/config.py` (`Settings`, `get_settings`, `SettingsDep`) |
+| DB engine, session, `DbSession`, `Base`; DB error details | `src/app/core/database.py`, `src/app/core/db_errors.py` |
+| `AppError` family and RFC 9457 handlers | `src/app/core/errors.py` |
+| Request middleware (request id, access log, metrics, security headers) | `src/app/core/middleware.py` |
+| Health, metrics | `src/app/core/health.py`, `src/app/core/metrics.py` |
+| Cache (`cached`, `invalidate`, `RedisDep`) | `src/app/core/cache.py` |
+| Logging (`get_logger`, `log_unexpected_error`) | `src/app/core/logging.py` |
+| Taskiq broker, email (templates in `src/app/templates/email/`) | `src/app/core/tasks.py`, `src/app/core/mail.py` |
+| Module contract (`Module`), admin (sqladmin), helpers (`utcnow`) | `src/app/core/module.py`, `admin.py`, `utils.py` |
+| Auth and users (`module`, `CurrentUser`, `OptionalUser`, `User`) | `src/app/modules/auth/` |
 | Migrations | `alembic/versions/`, async `alembic/env.py` |
-| Tests and fixtures | `tests/conftest.py` (`client`, `clean_db`, `captured_emails`) |
+| Tests | `tests/unit/`, `tests/integration/` (see Testing) |
 | Deployment | `deployment/docker/api/` (Swarm), `deployment/docker/monitoring/` |
+
+## Core vs modules *(target)*
+
+- `src/app/core/` is the infrastructure. `src/app/modules/` holds the modules. The built-in module `modules/auth` merges the former auth and user packages.
+- **The core never imports from `app.modules`.** Modules import infrastructure from `app.core` and user/auth from `app.modules.auth`.
+- `app.core` is a facade. It exports `DbSession`, `SettingsDep`, `get_settings`, `Base`, `get_logger`, `log_unexpected_error`, the `AppError` family, `cached`, `invalidate`, `RedisDep`, `broker`, `Module` and `utcnow`. Import from `app.core`, not from its submodules.
+- An app built on this boilerplate adds modules. If a task seems to need a core edit, stop and ask: either the core has a gap (a core change with an ADR) or the code belongs in a module.
+
+## Adding a module *(target)*
+
+1. Create the package `src/app/modules/<name>/` with the files the module needs (`router.py`, `service.py`, `models.py`, `schemas.py`, `errors.py`, `tasks.py`). Skip empty files.
+2. In `__init__.py`, define `module = Module(name=..., router=..., models=..., tasks=..., admin_views=...)`. `Module` is a frozen dataclass; `models`, `tasks` and `admin_views` are optional. The router carries its own `prefix` and `tags`. Module resources use `APIRouter(lifespan=...)`.
+3. Add one line to `MODULES = (auth.module, ...)` in `src/app/modules/__init__.py`. There is no auto-discovery.
+4. Autogenerate a migration (`uv run alembic revision --autogenerate -m "add_<name>"`), review it, apply it locally only.
+5. Add tests under `tests/unit/modules/<name>/` and `tests/integration/modules/<name>/`, with the module's own `conftest.py`. Never edit the root `conftest.py`.
+
+`create_app()` mounts every module router under `settings.API_PREFIX` (default `/api/v1`). The worker imports `module.tasks`, Alembic imports `module.models`, and the admin registers `module.admin_views`.
 
 ## Architecture rules
 
-- One feature = one folder `src/api/<feature>/` with `router.py`, `service.py`, `crud.py`, `models.py`, `schemas.py`, `dependencies.py`, `exceptions.py`, `__init__.py`. Create only the files the feature needs; an empty file is worse than a missing one. Mirror the folder in `tests/<feature>/`.
-- Layering is strict: `router → service → crud → models`. Routers never query the DB; services never build HTTP responses; crud contains no business rules.
+- Layering inside a module: `router → service → crud → models`. Routers never query the DB; services never build HTTP responses; crud contains no business rules. Create only the files the module needs.
 - Routers are thin: validate via Pydantic, call one service function, return a typed response. Every route declares `response_model` (or a return annotation), `status_code`, `summary` and the error `responses` it can produce.
-- Dependencies use `Annotated`: `db: DbSession`, `current_user: Annotated[User, Depends(get_current_user)]`. Never instantiate `AsyncSession` yourself. Use `Depends(..., scope="function")` only when cleanup must happen before the response is sent.
-- Register routers in `src/main.py` with `prefix` and `tags`. API versioning (`/api/v1`) is the next roadmap step; new routers should be written so the prefix can move without code changes.
-- Lifespan (`src/main.py`) is the only startup/shutdown mechanism. No `on_event`, no work at import time.
-- Shared base classes for crud/service are not used; keep modules explicit and standalone.
+- Dependencies use `Annotated`: `db: DbSession`, `user: CurrentUser`. Never instantiate `AsyncSession` yourself. Use `Depends(..., scope="function")` only when cleanup must happen before the response is sent.
+- Lifespan is the only startup/shutdown mechanism. No `on_event`, no work at import time.
+- No shared base classes for crud/service; keep modules explicit and standalone.
+- Auth hooks for modules are the `CurrentUser`/`OptionalUser` aliases only. Roles and permissions (D3), user events and per-module settings are deferred; do not build them. The 2FA stubs stay.
+
+## Errors and responses *(target)*
+
+- Routes return typed Pydantic models directly. There is no envelope.
+- Errors are RFC 9457 `application/problem+json`: `type` (`about:blank` or a docs URL), `title`, `status`, `detail`, a stable machine-readable `code` and `request_id`. A 422 adds `errors[]` with `field`, `code` and `message`. See [ADR 0002](documentation/adr/0002-rfc9457-errors-plain-responses-api-v1.md).
+- Services raise `AppError` subclasses: `BadRequest`, `Unauthorized` (sets `WWW-Authenticate`), `Forbidden`, `NotFound`, `Conflict`. A module's errors subclass them and set their own `code`.
+- No `(value, err)` tuple returns. No `try/except Exception` in routes. No `start_time` or `request` plumbing through services.
+- The API is versioned under `/api/v1`. `/health`, `/health/ready` and `/metrics` stay unprefixed.
+- REST nouns, plural, kebab-case paths; actions as sub-resources (`/auth/password/reset`).
+- Status codes: 200 read/update, 201 create, 204 delete, 400 bad input, 401 missing or invalid credentials, 403 authenticated but not allowed, 404, 409 conflict, 422 validation, 429 rate limited, 500 never with internals.
+- Timestamps RFC 3339 in UTC; IDs are UUID strings.
+- Never expose stack traces, SQL or internal identifiers in responses.
 
 ## Code style
 
-- Ruff for lint and format, mypy for types. All code must pass both. The strict Ruff rule set from the roadmap is the target even before it is enabled: no `Optional[X]` (use `X | None`), no `List`/`Dict` from typing, no naive `datetime.now()` (use `datetime.now(timezone.utc)`), no `print`, no commented-out code, no `assert` outside tests.
+- Ruff for lint and format, mypy for types. All code must pass both. Target rules: no `Optional[X]` (use `X | None`), no `List`/`Dict`/`Tuple` from typing, no naive `datetime.now()` (use `utcnow()` from `app.core`), no `print`, no commented-out code, no `assert` outside tests.
 - Type every parameter and return value. `Any` needs a comment explaining why.
-- Pydantic v2 only: `model_config = ConfigDict(...)`, `field_validator`, `model_validator`, `model_dump(mode="json")`. Request models should set `extra="forbid"`. Separate `XCreate`, `XUpdate`, `XResponse`; never return ORM objects.
+- Pydantic v2 only: `model_config = ConfigDict(...)`, `field_validator`, `model_validator`, `model_dump(mode="json")`. Request models set `extra="forbid"`. Separate `XCreate`, `XUpdate`, `XResponse`; never return ORM objects.
 - Naming: `snake_case` functions and modules, `PascalCase` classes, `UPPER_SNAKE` constants, schemas suffixed `Request`/`Response`, exceptions suffixed `Error`.
-- Docstrings on every route, service and crud function; route docstrings are user-facing (they render in Swagger).
 - Structured log events, not messages: `logger.info("auth.login_success", user_id=str(user.id))`. Event names are `area.action`.
-- Imports: absolute (`from src.api.auth import crud`). No circular imports between features; shared code goes to `src/common/`.
+- Imports are absolute: `from app.core import DbSession`, `from app.modules.auth import CurrentUser`. No circular imports.
 
-## API conventions
+## Comments and docstrings
 
-- REST nouns, plural, kebab-case paths; actions as sub-resources (`/auth/password/reset`), not verbs in the resource name.
-- Status codes: 200 read/update, 201 create, 204 delete, 400 bad input, 401 missing or invalid credentials, 403 authenticated but not allowed, 404, 409 conflict, 422 validation, 429 rate limited, 500 never with internals.
-- Error bodies use the envelope in `src/common/responses.py` until decision D1 (RFC 9457) is taken. Raise named exceptions from services; do not return `(None, "message")` tuples in new code and do not wrap handlers in `except Exception`.
-- Reads must be idempotent and cacheable; mutations must invalidate the relevant cashews keys in the service.
-- Timestamps RFC 3339 in UTC; IDs are UUID strings.
-- Never expose stack traces, SQL, or internal identifiers in responses.
+House style, enforced by strict ruff in S3 (rule set `D` with the google convention, plus `ERA`).
+
+- English throughout. Google-style docstrings with single backticks.
+- Docstrings are required on public functions and classes in `core/` and on service functions. Route docstrings are user-facing: they render in Swagger.
+- An inline comment explains only a WHY the code cannot express: a security invariant, a lock order, a library quirk with a source link, or a non-obvious bound.
+- Forbidden:
+  - file-path header comments (`# src/app/...`);
+  - banner and section separators (`# -----`);
+  - comments that restate the code;
+  - review, phase or finding IDs in code (`Phase 0 fix 6`, `review 2026-11`, `NEW-3`, `BE-10`). They belong in commit messages and ADRs;
+  - TODOs without an issue reference;
+  - commented-out code;
+  - legacy typing (`Optional`, `Dict`, `List`, `Tuple`).
+
+```python
+"""Refresh-token sessions: rotation, revocation and reuse detection.
+
+PostgreSQL is the only source of truth. Writes to `sessions` take the
+user row lock first (lock order: email_tokens -> users -> sessions).
+"""
+
+
+async def revoke_user_sessions(
+    db: AsyncSession, user_id: UUID, *, keep_family: UUID | None = None
+) -> int:
+    """Revoke every active session of a user.
+
+    Args:
+        db: Caller's unit of work; this function does not commit.
+        user_id: Owner of the sessions.
+        keep_family: Session family to keep (the caller's `sid`).
+
+    Returns:
+        Number of revoked sessions.
+    """
+```
 
 ## Security rules
 
-- Passwords: `argon2-cffi` via `hash_password`/`verify_password` in `src/api/auth/service.py`. Never store or log a plaintext password or token; tokens at rest are SHA-256 (`hash_token`).
-- JWT via `PyJWT` with an explicit `algorithms=[...]` list (HS256, pinned in `src/utils/jwt_utils.py`). Never read the algorithm from the token.
+- Passwords: `argon2-cffi` via `hash_password`/`verify_password` in the auth service (`src/app/modules/auth/`). Never store or log a plaintext password or token; tokens at rest are SHA-256 (`hash_token`).
+- JWT via `PyJWT` with an explicit `algorithms=[...]` list (HS256, pinned in the auth module). Never read the algorithm from the token.
 - Refresh tokens live only in Postgres; the refresh gate is one atomic `UPDATE ... RETURNING`. Do not add a Redis mirror.
 - Secrets are `SecretStr` in `Settings`; a startup guard rejects defaults outside `dev`/`unittest`. New secrets need a guard entry and a README configuration row.
-- Auth-protected routes use `get_current_user`; do not re-implement token parsing. Do not change `src/api/auth/` internals unless the task is about auth.
+- Auth-protected routes use `CurrentUser` (or `OptionalUser`); do not re-implement token parsing. Do not change `src/app/modules/auth/` internals unless the task is about auth.
 - Error messages must not reveal whether an account exists (see Roadmap Phase 1 for the current gaps).
 - Validate and bound every input (`max_length`, ranges, enums). Reject unknown fields.
-- CORS, cookies and headers are configured centrally in `src/main.py`; do not set them per route.
+- CORS, cookies and headers are configured centrally (`create_app()` and `src/app/core/middleware.py`); do not set them per route. The client IP comes only from the ASGI scope; uvicorn's proxy headers are enabled with trusted `FORWARDED_ALLOW_IPS`.
 - Do not log request bodies, query strings, `Authorization`, cookies, emails or usernames. User context in logs is `user_id` only.
 - Log unexpected exceptions with `log_unexpected_error(logger, event, exc)` or `error_type=type(exc).__name__`, never `error=str(e)`: database error text can contain user data.
 
 ## Database and migrations
 
-- SQLAlchemy 2 style only: `Mapped[...]`, `mapped_column`, `select()`; no legacy `Query`.
+- SQLAlchemy 2 style only: `Mapped[...]`, `mapped_column`, `select()`; no legacy `Query`. The driver is psycopg 3.
+- Models live in `src/app/modules/<name>/models.py` and subclass `Base` from `app.core`. Alembic collects them through `MODULES`.
 - Avoid lazy loads in async code: use `selectinload`/`joinedload` or `await session.refresh(obj, [...])`.
 - `expire_on_commit=False` is set; still re-read objects you need after a commit if another transaction may have changed them.
-- Model change → `uv run alembic revision --autogenerate -m "..."` → read the generated file, fix types and names, add indexes → `uv run alembic upgrade head` locally only. Downgrade must work. Prefer expand/contract for data migrations.
+- Model change → autogenerate → read the generated file, fix types and names, add indexes → `uv run alembic upgrade head` locally only. Downgrade must work. Prefer expand/contract for data migrations.
 - New tables get `created_at`/`updated_at` `timestamptz`, UUID PK, explicit indexes for every FK and filter column.
 
-## Caching and background jobs
+## Caching and background jobs *(target)*
 
-- Route cache: `@cache(ttl=cache_control_ttl(default=settings.ROUTE_CACHE_TTL), key="route:<name>")` from `cashews` on idempotent GETs only. TTLs come from `Settings`.
-- Background work that may be lost is fine in FastAPI `BackgroundTasks`; everything else is a taskiq task in `src/utils/`, registered in `src/common/taskiq.py`, enqueued with `await task.kiq(...)`, and must be retry-safe (idempotent).
-- Tasks receive IDs and primitives, never ORM objects.
+- The core offers `@cached(ttl, key)` and `invalidate(pattern)`: a thin cashews wrapper that caches return values on the one Redis client. See [ADR 0003](documentation/adr/0003-caching-via-cached-decorator.md).
+- Cache keys include every input that changes the result, `{user_id}` included for per-user data. A missing component leaks data across users.
+- Mutations call `invalidate(...)` in the service. TTLs come from `Settings`.
+- There is no ETag middleware, no client cache-control middleware and no route-cache settings.
+- All background work is a taskiq task in the module's `tasks.py`, exported through `Module(tasks=...)` and enqueued with `await task.kiq(...)`. Tasks are retry-safe (idempotent) and receive IDs and primitives, never ORM objects. Do not use FastAPI `BackgroundTasks`.
 
-## Testing
+## Testing *(target)*
 
-- Integration tests through `TestClient` against real Postgres and Redis (Testcontainers). Do not mock the DB. Patch only external side effects (email dispatch via the `captured_emails` fixture).
+- `tests/unit/` needs no Docker and runs in seconds. Rule: if the code under test needs no DB or Redis, it is a unit test.
+- `tests/integration/` uses `TestClient` with Postgres and Redis Testcontainers. Do not mock the DB. Patch only external side effects (email dispatch via the `captured_emails` fixture).
+- Layout: `tests/unit/{core,modules/<name>}` and `tests/integration/{core,contract,modules/<name>,admin}`. A new module brings its own `conftest.py` and never edits the root one.
+- There is no backend e2e folder. End-to-end journeys are covered by frontend Playwright.
+- Do not test third-party libraries. Guard our own configuration of them.
 - Each new endpoint gets: happy path, validation error, auth failure (missing, invalid, expired token), not-found or conflict, and one test proving the side effect (audit row, email, cache invalidation).
-- Tests are independent; `clean_db` truncates auth tables after every test. Use plain helper functions (`register`, `login`, `bearer`) as in `tests/auth/test_auth.py`.
+- Tests are independent. The autouse `clean_db` fixture truncates the application tables **before** each test. Use plain helper functions (`register`, `login`, `bearer`) as in the existing auth tests.
 - Every test must fail without the change it covers. Keep the suite deterministic (no sleeps, no real network).
-- Coverage threshold is enforced by pytest-cov; do not lower it to make a PR pass.
+- The coverage threshold is enforced by pytest-cov on the full run; do not lower it to make a PR pass.
+- ADR: [0007](documentation/adr/0007-test-split-unit-integration.md).
 
 ## Definition of done
 
 - [ ] `uvx ruff@0.15.0 check src tests` and `format --check` pass
 - [ ] `uv run mypy src` passes
 - [ ] `uv run pytest` passes locally with Docker running
-- [ ] New settings added to `src/common/config.py`, `.env` template and the README configuration table
+- [ ] New settings added to `src/app/core/config.py`, the `.env` template and the README configuration table
 - [ ] Migration generated and reviewed if models changed; command listed in the PR description
-- [ ] README sections touched by the change are updated in the same PR (layout, design, roadmap checkbox)
-- [ ] No TODOs without an issue reference; no debug output; no new `# type: ignore` without a reason
+- [ ] README sections touched by the change are updated in the same PR; no TODOs without an issue reference; no new `# type: ignore` without a reason
 
 ## Git and pull requests
 
-- Conventional Commits: `feat(auth): rotate refresh token family on reuse`, `fix(cache): ...`, `chore(deps): ...`, `docs: ...`.
-- One logical change per commit; keep `uv.lock` churn out of unrelated commits.
+- Conventional Commits: `feat(auth): rotate refresh token family on reuse`, `fix(cache): ...`, `docs: ...`. One logical change per commit; keep `uv.lock` churn out of unrelated commits.
 - PR description: what, why, how to verify, migration and config notes, roadmap item reference.
 - Agents do not commit, push, tag or open PRs unless explicitly asked in the task.
 
@@ -140,9 +212,9 @@ Use `uv run ...`; never `pip install` or activate a virtualenv by hand. If `.ven
 
 **Always:** run lint, types and tests before reporting done; keep changes minimal and local; update docs with code; ask when a decision in README → Open decisions is needed.
 
-**Ask first:** adding or upgrading a dependency; changing `pyproject.toml` tooling config, `Dockerfile`, anything under `deployment/`; changing middleware order, security headers, CORS or cookie settings; cross-feature refactors; deleting files; touching `alembic/env.py`.
+**Ask first:** adding or upgrading a dependency; changing `pyproject.toml` tooling config, `Dockerfile`, anything under `deployment/`; changing the middleware, security headers, CORS or cookie settings; any edit to `src/app/core/` (see "Core vs modules"); cross-module refactors; deleting files; touching `alembic/env.py`.
 
-**Never:** apply migrations against a non-local database; run `docker stack deploy`, `docker stack rm` or anything against a Swarm manager; commit secrets or `.env.local`; disable or weaken a security check, a lint rule or a test to make something pass; log credentials, tokens or PII; use `python-jose`, `passlib`, `fastapi-cache2`, `arq`, or sync DB drivers; add business-domain features to this boilerplate.
+**Never:** apply migrations against a non-local database; run `docker stack deploy`, `docker stack rm` or anything against a Swarm manager; commit secrets or `.env.local`; disable or weaken a security check, a lint rule or a test to make something pass; log credentials, tokens or PII; use `python-jose`, `passlib`, `fastapi-cache2`, `arq`, or sync DB drivers; add business-domain features to this boilerplate; import from `app.modules` inside `app.core`.
 
 ## Do not use
 
@@ -150,4 +222,4 @@ Use `uv run ...`; never `pip install` or activate a virtualenv by hand. If `.ven
 
 ## Specialised agents
 
-Claude Code project agents live in `../.claude/agents/` (repository root) and are listed in [CLAUDE.md](CLAUDE.md). Use `backend-engineer` for feature work, `db-engineer` for schema and migrations, `backend-tester` for tests, `security-auditor` for reviews, `observability-engineer` for logging and metrics, `deploy-engineer` for Docker and Swarm, `docs-writer` for documentation, `researcher` for web research.
+Claude Code project agents live in `../.claude/agents/` (repository root) and are listed in [CLAUDE.md](CLAUDE.md).

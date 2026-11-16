@@ -557,7 +557,7 @@ Decisions deliberately deferred. Each should become an ADR when taken.
 
 | # | Topic | Options | Current lean |
 |---|---|---|---|
-| D1 | Error response format | keep the `success/data/error/metadata` envelope, or RFC 9457 `application/problem+json` | RFC 9457 for errors, plain `response_model` for success; frontend contract must change with it |
+| D1 | Error response format | keep the `success/data/error/metadata` envelope, or RFC 9457 `application/problem+json` | **Decided 2026-11-16:** RFC 9457 for errors, plain typed responses for success, API under `/api/v1`; the frontend contract changes with it. See [ADR 0002](documentation/adr/0002-rfc9457-errors-plain-responses-api-v1.md) (implemented in S1 of the 2026-11 cleanup) |
 | D2 | Admin panel | keep `sqladmin` and harden it, or remove it from the boilerplate | keep, disabled in `prod` by default |
 | D3 | Authorization model | generic RBAC/permissions tables in the boilerplate, or leave `roles`/`permissions` placeholders | add RBAC as its own phase |
 | D4 | Rate limiting placement | in-app (`limits` + Redis) plus Traefik, or gateway only | both; app limits are environment-independent |
