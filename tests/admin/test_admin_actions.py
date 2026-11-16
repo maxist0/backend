@@ -39,7 +39,7 @@ def _no_real_email_dispatch(captured_emails):
 
 
 def admin_login(client) -> None:
-    from src.common.config import settings
+    from app.common.config import settings
 
     r = client.post(
         "/admin/login",

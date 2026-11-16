@@ -16,7 +16,7 @@ Fixtures (all defined in conftest.py):
                       (`captured_emails[addr]` still returns the latest token)
 """
 
-from src.common.constants import MAXIMUM_LOGIN_ATTEMPTS
+from app.common.constants import MAXIMUM_LOGIN_ATTEMPTS
 
 
 # ---------------------------------------------------------------------------

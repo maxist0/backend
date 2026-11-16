@@ -33,7 +33,7 @@ import logging
 import jwt
 import pytest
 
-from src.common.constants import MAXIMUM_LOGIN_ATTEMPTS
+from app.common.constants import MAXIMUM_LOGIN_ATTEMPTS
 from tests.helpers import (
     PASSWORD,
     active_session_count,
@@ -531,7 +531,7 @@ class TestEmailTokensSingleUse:
 
 
 def _secret() -> str:
-    from src.common.config import settings
+    from app.common.config import settings
 
     return secret_value(settings.JWT_SECRET_KEY)
 
@@ -760,7 +760,7 @@ class TestLoggingHygiene:
     ):
         import asyncio
 
-        from src.utils import email_tasks
+        from app.utils import email_tasks
 
         async def _send(**_kwargs):
             if outcome == "failed":
@@ -805,8 +805,8 @@ class TestLoggingHygiene:
         """GUARD (fixed in step A, K3): engine creation and init_db logs."""
         import asyncio
 
-        import src.common.database as database
-        from src.common.config import settings
+        import app.common.database as database
+        from app.common.config import settings
 
         password = "S3cr3tPw-Zq91xx"
         monkeypatch.setattr(

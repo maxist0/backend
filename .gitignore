@@ -32,6 +32,12 @@ deployment/
 scripts/
 
 
+# Coverage artefacts (pytest-cov / coverage.py)
 .coverage
+.coverage.*
+htmlcov/
+coverage.xml
+coverage.json
+
 .env.local
 .claude/

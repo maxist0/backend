@@ -24,7 +24,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 # ── Import the project's declarative Base so Alembic can detect schema changes.
 # Add additional model modules here as the project grows.
-from src.common.models import Base  # noqa: F401 – registers metadata
+from app.common.models import Base  # noqa: F401 – registers metadata
 from dotenv import load_dotenv
 
 # ---------------------------------------------------------------------------
@@ -35,7 +35,7 @@ config = context.config
 
 _env_file = ".env.local"
 
-# Only local development reads .env.local (mirrors src.common.config.get_env_file).
+# Only local development reads .env.local (mirrors app.common.config.get_env_file).
 # override=False: variables injected by the runtime or the test harness always win.
 if os.getenv("ENVIRONMENT", "dev") == "dev" and os.path.exists(_env_file):
     load_dotenv(_env_file, override=False)

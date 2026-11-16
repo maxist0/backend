@@ -4,7 +4,7 @@ import os
 import sys
 from dataclasses import dataclass
 
-# MUST run before anything imports ``src``: ``src.common.taskiq`` calls
+# MUST run before anything imports ``app``: ``app.common.taskiq`` calls
 # ``init_settings(os.getenv("ENVIRONMENT", "dev"))`` at import time and would
 # otherwise replace the test settings with the "dev" ones (reads .env.local).
 os.environ["ENVIRONMENT"] = "unittest"
@@ -74,11 +74,11 @@ def pytest_unconfigure(config):
 
 @pytest.fixture(scope="session", autouse=True)
 def init_db():
-    from src.common.config import init_settings
+    from app.common.config import init_settings
 
     init_settings("unittest")
 
-    import src.common.database as database
+    import app.common.database as database
 
     alembic_cfg = Config("alembic.ini")
     alembic_cfg.set_main_option("sqlalchemy.url", os.environ["DATABASE_URL"])
@@ -133,7 +133,7 @@ def flush_redis(init_db):
 
 @pytest.fixture
 def client(init_db, flush_redis):
-    from src.main import app
+    from app.main import app
 
     with TestClient(app) as c:
         yield c
@@ -148,7 +148,7 @@ def client(init_db, flush_redis):
 def clean_db(init_db):
     yield
 
-    import src.common.database as database
+    import app.common.database as database
 
     async def _truncate():
         async with database.engine.begin() as conn:
@@ -227,13 +227,13 @@ def captured_emails(monkeypatch) -> CapturedEmails:
         return _capture
 
     monkeypatch.setattr(
-        "src.api.auth.service.send_verification_email_task.kiq", _make("verify")
+        "app.api.auth.service.send_verification_email_task.kiq", _make("verify")
     )
     monkeypatch.setattr(
-        "src.api.auth.service.send_password_reset_email_task.kiq", _make("reset")
+        "app.api.auth.service.send_password_reset_email_task.kiq", _make("reset")
     )
     monkeypatch.setattr(
-        "src.api.user.service.send_verification_email_task.kiq", _make("verify")
+        "app.api.user.service.send_verification_email_task.kiq", _make("verify")
     )
     return emails
 
@@ -275,9 +275,9 @@ def db():
 
 @pytest.fixture
 def deactivate_user():
-    import src.common.database as database
+    import app.common.database as database
     from sqlalchemy import update
-    from src.api.auth.models import User
+    from app.api.auth.models import User
 
     async def _run(username: str):
         async with database.engine.begin() as conn:

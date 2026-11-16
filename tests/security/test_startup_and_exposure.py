@@ -26,7 +26,7 @@ from pathlib import Path
 
 import pytest
 
-from src.common.config import Settings
+from app.common.config import Settings
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
 
@@ -117,9 +117,9 @@ def _admin_status_in_subprocess(env_overrides: dict[str, str | None]) -> list[in
     """
     code = (
         "from fastapi.testclient import TestClient\n"
-        "from src.common.config import init_settings\n"
+        "from app.common.config import init_settings\n"
         "init_settings('unittest')\n"
-        "from src.main import app\n"
+        "from app.main import app\n"
         "c = TestClient(app, follow_redirects=False)\n"
         "print('STATUS', c.get('/admin/login').status_code, c.get('/admin/').status_code)\n"
     )
@@ -242,8 +242,8 @@ class TestHarness:
         assert kwargs["port"] != 6379
 
     def test_taskiq_broker_uses_the_redis_container(self):
-        from src.common.taskiq import broker  # noqa: F401  (import for side effect check)
-        from src.common.config import settings
+        from app.common.taskiq import broker  # noqa: F401  (import for side effect check)
+        from app.common.config import settings
 
         assert settings.TASKIQ_BROKER_URL == os.environ["TASKIQ_BROKER_URL"]
         assert (
@@ -252,8 +252,8 @@ class TestHarness:
         )
 
     def test_settings_object_is_the_unittest_one(self):
-        """src.common.taskiq must not replace the settings with the dev ones."""
-        from src.common.config import settings
+        """app.common.taskiq must not replace the settings with the dev ones."""
+        from app.common.config import settings
 
         assert settings.ENVIRONMENT.value == "unittest"
 

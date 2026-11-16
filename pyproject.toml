@@ -2,7 +2,7 @@
 name = "api"
 version = "1.0.0"
 description = "API Application"
-requires-python = ">=3.13"
+requires-python = ">=3.14"
 dependencies = [
     "fastapi>=0.136.1",
     "uvicorn[standard]>=0.34.0",
@@ -13,8 +13,6 @@ dependencies = [
     "pyjwt[crypto]>=2.15.1",
     "argon2-cffi>=23.1.0",
     "redis>=5.0.0",
-    "pytest>=9.0.2",
-    "httpx>=0.28.1",
     "sqlalchemy[asyncio]>=2.0.49",
     "asyncpg>=0.31.0",
     "alembic>=1.18.4",
@@ -26,36 +24,32 @@ dependencies = [
     "python-multipart>=0.0.33",
     "opentelemetry-exporter-otlp>=1.31.0",
     "opentelemetry-sdk>=1.31.0",
-    "testcontainers[postgres]>=4.14.1",
     "psycopg[binary]>=3.3.3",
-    "pytest-cov>=7.0.0",
     "fastapi-mail>=1.6.2",
     "taskiq>=0.12.2",
     "taskiq-redis>=1.2.2",
-    "mypy>=1.19.1",
     "cashews>=7.5.0",
     "sqladmin>=0.32.0",
     "starlette>=1.3.1",
     "itsdangerous>=2.2.0",
 ]
 
-[project.optional-dependencies]
-dev = [
-    "pytest>=9.0.0",
-    "pytest-asyncio>=0.25.0",
-    "httpx>=0.28.0",
-    "testcontainers[postgres]>=4.14.0",
-]
-
 [build-system]
-requires = ["setuptools>=61.0"]
-build-backend = "setuptools.build_meta"
+# uv's own build backend, bounded above as uv recommends
+# (https://docs.astral.sh/uv/concepts/build-backend/, checked 2026-11-16).
+# The lower bound admits the uv used locally (0.11.7), so uv builds with its
+# built-in backend; sdists from uv_build 0.13 cannot be unpacked by uv 0.11.
+requires = ["uv_build>=0.11.7,<0.14"]
+build-backend = "uv_build"
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["src*"]
+[tool.uv.build-backend]
+# Distribution "api", import package "app" in src/app/ (src layout).
+module-name = "app"
+module-root = "src"
 
 [tool.uv]
+# `uv sync` installs the full dev toolchain (test + lint); images use --no-dev.
+default-groups = ["dev"]
 # Security floors for transitive dependencies (review 2026-11, H15). These do not
 # add the packages as direct dependencies; they only bound the resolver.
 constraint-dependencies = [
@@ -70,10 +64,26 @@ constraint-dependencies = [
 ]
 
 [dependency-groups]
-dev = [
-    "mypy>=1.19.1",
-    "ruff>=0.15.0",
+# PEP 735 groups. None of them is installed in the runtime image (uv sync --no-dev).
+test = [
+    "pytest>=9.0.2",
+    "pytest-cov>=7.0.0",
+    "testcontainers[postgres]>=4.14.1",
+    # fastapi.testclient.TestClient needs httpx; the app itself does not import it.
+    "httpx>=0.28.1",
+    "time-machine>=3.6.0",
 ]
+lint = [
+    "ruff>=0.15.0",
+    "mypy>=1.19.1",
+    # Informational only (open decision D6); mypy is the gate.
+    "ty>=0.0.104",
+]
+dev = [
+    { include-group = "test" },
+    { include-group = "lint" },
+]
+
 [[tool.mypy.overrides]]
 module = [
     "alembic.*",
@@ -83,7 +93,8 @@ module = [
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
-addopts = "-v -ra --tb=short --cov=src --cov-report=term-missing --cov-fail-under=80"
+# The coverage threshold lives only in [tool.coverage.report].fail_under.
+addopts = "-v -ra --tb=short --cov=app --cov-report=term-missing"
 markers = [
     "auth: tests related to authentication and authorization",
     "users: tests for user management",
@@ -97,26 +108,19 @@ filterwarnings = [
 ]
 
 [tool.coverage.run]
-source = ["src"]
+# Import package name, not a path: measures src/app via the editable install.
+source_pkgs = ["app"]
 branch = true
-parallel = false 
-concurrency = ["thread"]
-omit = [
-    "src/common/logging.py",
-    "src/main.py",
-    "*/__init__.py",
-]
-include = [
-    "src/*",
-]
-data_file = ".coverage"           # where to store coverage data
-
-
+parallel = false
+# SQLAlchemy's async layer runs DB calls inside greenlets; without "greenlet"
+# lines executed there are reported as missed. "thread" covers the TestClient
+# portal and anyio worker threads.
+concurrency = ["greenlet", "thread"]
+data_file = ".coverage"
 
 [tool.coverage.report]
-exclude_lines = [
-    # default pragmas
-    "pragma: no cover",
+# exclude_also keeps coverage's default "pragma: no cover" pattern.
+exclude_also = [
     # abstract/protocol methods
     "raise NotImplementedError",
     "@abstractmethod",
@@ -125,17 +129,17 @@ exclude_lines = [
     "if typing.TYPE_CHECKING:",
     # defensive programming
     "raise AssertionError",
-    # unreachable
-    "pass",
+    # a statement consisting only of `pass` (anchored: must not match "password")
+    '^\s*pass\s*$',
     # main guard
     'if __name__ == "__main__":',
 ]
 skip_empty = true                 # ignore files with no executable lines
-skip_covered = false              # hide 100% covered files from report
-fail_under = 85                  # fail if total coverage below this %
-precision = 2                     # decimal places in percentages
-show_missing = true               # show missing line numbers
-sort = "cover"                    # sort by: "name", "stmts", "miss", "cover"
+skip_covered = false
+fail_under = 85                   # honest measured total, rounded down (review 2026-11, H14)
+precision = 2
+show_missing = true
+sort = "cover"
 
 [tool.coverage.html]
 directory = "htmlcov"

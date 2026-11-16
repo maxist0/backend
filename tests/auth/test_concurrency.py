@@ -37,7 +37,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from src.common.constants import MAXIMUM_LOGIN_ATTEMPTS
+from app.common.constants import MAXIMUM_LOGIN_ATTEMPTS
 from tests.helpers import (
     PASSWORD,
     active_session_count,
@@ -89,7 +89,7 @@ class _RotationGate:
 def rotation_gate(monkeypatch):
     import asyncio
 
-    import src.api.auth.service as service
+    import app.api.auth.service as service
 
     original = service.create_session_tokens
     gate = _RotationGate()
@@ -265,8 +265,8 @@ def verify_spy(monkeypatch, db):
     """
     import asyncio
 
-    import src.api.auth.service as service
-    from src.api.auth import crud
+    import app.api.auth.service as service
+    from app.api.auth import crud
 
     original_verify = service.verify_password
     original_lookup = crud.get_user_by_username
@@ -329,7 +329,7 @@ class TestLoginBurst:
         after the Argon2 slot wait (or the attempt to be reserved atomically
         before the verify) plus the conditional success UPDATE.
         """
-        from src.common.config import settings
+        from app.common.config import settings
 
         _alice(client)
         burst, correct_index = 30, 0
@@ -530,7 +530,7 @@ class TestAccountDisabledRefresh:
         async def _no_audit(*_args, **_kwargs) -> None:
             return None
 
-        monkeypatch.setattr("src.api.auth.service._audit", _no_audit)
+        monkeypatch.setattr("app.api.auth.service._audit", _no_audit)
 
         r = _refresh_raw(client, t0.refresh)[0]
         client.cookies.clear()
