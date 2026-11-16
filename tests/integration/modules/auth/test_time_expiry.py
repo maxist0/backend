@@ -22,8 +22,11 @@ from datetime import datetime, timedelta, timezone
 import jwt
 import time_machine
 
-from app.common.config import get_settings
-from app.common.constants import LOGIN_ATTEMPT_WINDOW_SECONDS, MAXIMUM_LOGIN_ATTEMPTS
+from app.core.config import get_settings
+from app.modules.auth.service import (
+    LOGIN_ATTEMPT_WINDOW_SECONDS,
+    MAXIMUM_LOGIN_ATTEMPTS,
+)
 from tests.helpers import (
     PASSWORD,
     audit_count,

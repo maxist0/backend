@@ -48,13 +48,15 @@ def test_list_detail_and_edit_pages_render(
         assert edit_page.status_code == 200, edit_page.text[:500]
 
 
-def test_user_detail_shows_its_related_rows(populated_admin, db):
-    """Relationships of the user (sessions, tokens, audit log) are loaded."""
-    user_id = str(db.scalar("SELECT id FROM users WHERE username = 'adminview'"))
+def test_session_detail_shows_its_user(populated_admin, db):
+    """The many-to-one relationship `Session.user` is loaded on the detail page.
+
+    `User` has no reverse relationships (the users module does not depend on
+    auth), so the relationship loading is checked from the session side.
+    """
     session_id = str(db.scalar("SELECT id FROM sessions LIMIT 1"))
 
-    r = populated_admin.get(f"/admin/user/details/{user_id}")
+    r = populated_admin.get(f"/admin/session/details/{session_id}")
 
     assert r.status_code == 200
-    assert "adminview" in r.text
-    assert session_id in r.text
+    assert "adminview (adminview@example.com)" in r.text  # User.__str__

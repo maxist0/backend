@@ -51,33 +51,55 @@ docker build -t api:latest .                # image
 | Launcher (uvicorn, dev worker) | `run.py` |
 | Public core facade | `src/app/core/__init__.py` |
 | Settings and environments | `src/app/core/config.py` (`Settings`, `get_settings`, `SettingsDep`) |
-| DB engine, session, `DbSession`, `Base`; DB error details | `src/app/core/database.py`, `src/app/core/db_errors.py` |
-| `AppError` family and RFC 9457 handlers | `src/app/core/errors.py` |
-| Request middleware (request id, access log, metrics, security headers) | `src/app/core/middleware.py` |
-| Health, metrics | `src/app/core/health.py`, `src/app/core/metrics.py` |
+| DB engine, session, `DbSession`, `Base`, `utcnow` | `src/app/core/database.py` |
+| Errors: `AppError` family, RFC 9457 handlers, DB error details, `log_unexpected_error` | `src/app/core/errors.py` |
+| Security: JWT encode/decode, Argon2 password hashing, token generation and hashing | `src/app/core/security.py` |
+| Request middleware (request id, access log, HTTP metrics, security headers) | `src/app/core/middleware.py` |
+| `/health`, `/health/ready`, `/metrics` | `src/app/core/health.py` |
 | Cache (`cached`, `invalidate`, `RedisDep`) | `src/app/core/cache.py` |
-| Logging (`get_logger`, `log_unexpected_error`) | `src/app/core/logging.py` |
-| Taskiq broker, email (templates in `src/app/templates/email/`) | `src/app/core/tasks.py`, `src/app/core/mail.py` |
-| Module contract (`Module`), admin (sqladmin), helpers (`utcnow`) | `src/app/core/module.py`, `admin.py`, `utils.py` |
-| Auth and users (`module`, `CurrentUser`, `OptionalUser`, `User`) | `src/app/modules/auth/` |
+| Logging setup, `get_logger` | `src/app/core/logging.py` |
+| Taskiq (`task` decorator, broker and scheduler builders), email (core layout `src/app/core/templates/base.html`) | `src/app/core/tasks.py`, `src/app/core/mail.py`; worker root `src/app/worker.py` |
+| Module contract (`Module`), admin (sqladmin) base | `src/app/core/module.py`, `src/app/core/admin.py` |
+| Users: `User` model, profile, `CurrentUser`, `OptionalUser` | `src/app/modules/users/` |
+| Auth: register, login, refresh, logout, sessions, password and email flows, audit log | `src/app/modules/auth/` |
 | Migrations | `alembic/versions/`, async `alembic/env.py` |
 | Tests | `tests/unit/`, `tests/integration/` (see Testing) |
 | Deployment | `deployment/docker/api/` (Swarm), `deployment/docker/monitoring/` |
 
 ## Core vs modules *(target)*
 
-- `src/app/core/` is the infrastructure. `src/app/modules/` holds the modules. The built-in module `modules/auth` merges the former auth and user packages.
-- **The core never imports from `app.modules`.** Modules import infrastructure from `app.core` and user/auth from `app.modules.auth`.
-- `app.core` is a facade. It exports `DbSession`, `SettingsDep`, `get_settings`, `Base`, `get_logger`, `log_unexpected_error`, the `AppError` family, `cached`, `invalidate`, `RedisDep`, `broker`, `Module` and `utcnow`. Import from `app.core`, not from its submodules.
+- `src/app/core/` is the infrastructure. `src/app/modules/` holds the modules. Two modules are built in: `users` (the `User` entity, profile, later settings) and `auth` (how a user proves identity: credentials, sessions, tokens, audit log). See [ADR 0008](documentation/adr/0008-module-layout-and-users-auth-split.md).
+- **Imports point one way: `core ← users ← auth ← app modules`.** The core never imports from `app.modules`; `users` never imports `auth`; a module never imports a module that depends on it. Modules import infrastructure from `app.core`, and `CurrentUser`, `OptionalUser`, `User` from `app.modules.users`.
+- **URLs follow the resource, code follows the responsibility.** Endpoints for the signed-in user live under `/users/me/...`; flows for signed-out users live under `/auth/...`. `PUT /users/me/password` and `PUT /users/me/email` need credentials and verification, so the `auth` module serves them (OpenAPI tag `users`).
+- `app.core` is a facade. It exports `Settings`, `DbSession`, `SettingsDep`, `get_settings`, `Base`, `utcnow`, `get_logger`, `log_unexpected_error`, the `AppError` family, `cached`, `invalidate`, `RedisDep`, `task` (taskiq's shared task decorator) and `Module`. Import from `app.core`, not from its submodules.
 - An app built on this boilerplate adds modules. If a task seems to need a core edit, stop and ask: either the core has a gap (a core change with an ADR) or the code belongs in a module.
+
+## Module layout *(target)*
+
+Every module uses the same file names, and only these. A module creates the files it needs; it never adds other names. Code that fits none of them is infrastructure (core) or a sign the module should be split. A unit test enforces the vocabulary.
+
+```
+src/app/modules/<name>/
+  __init__.py       module = Module(...) and the module's public exports
+  router.py         HTTP routes: thin, typed, one service call each
+  schemas.py        Pydantic request/response models
+  service.py        business logic; owns the transaction
+  crud.py           database queries; no business rules
+  models.py         SQLAlchemy models
+  dependencies.py   FastAPI dependencies
+  errors.py         AppError subclasses with the module's error codes
+  tasks.py          taskiq tasks (`@task`)
+  admin.py          sqladmin views
+  templates/        email templates (never named `base.html`; that is the core layout)
+```
 
 ## Adding a module *(target)*
 
-1. Create the package `src/app/modules/<name>/` with the files the module needs (`router.py`, `service.py`, `models.py`, `schemas.py`, `errors.py`, `tasks.py`). Skip empty files.
+1. Create the package `src/app/modules/<name>/` using the file names from "Module layout".
 2. In `__init__.py`, define `module = Module(name=..., router=..., models=..., tasks=..., admin_views=...)`. `Module` is a frozen dataclass; `models`, `tasks` and `admin_views` are optional. The router carries its own `prefix` and `tags`. Module resources use `APIRouter(lifespan=...)`.
-3. Add one line to `MODULES = (auth.module, ...)` in `src/app/modules/__init__.py`. There is no auto-discovery.
+3. Add one line to `MODULES = (users.module, auth.module, ...)` in `src/app/modules/__init__.py`, after the modules it depends on. There is no auto-discovery.
 4. Autogenerate a migration (`uv run alembic revision --autogenerate -m "add_<name>"`), review it, apply it locally only.
-5. Add tests under `tests/unit/modules/<name>/` and `tests/integration/modules/<name>/`, with the module's own `conftest.py`. Never edit the root `conftest.py`.
+5. Add tests under `tests/unit/modules/<name>/` and `tests/integration/modules/<name>/`. Module-specific fixtures go into a `conftest.py` there; never edit the root `conftest.py`.
 
 `create_app()` mounts every module router under `settings.API_PREFIX` (default `/api/v1`). The worker imports `module.tasks`, Alembic imports `module.models`, and the admin registers `module.admin_views`.
 
@@ -88,7 +110,7 @@ docker build -t api:latest .                # image
 - Dependencies use `Annotated`: `db: DbSession`, `user: CurrentUser`. Never instantiate `AsyncSession` yourself. Use `Depends(..., scope="function")` only when cleanup must happen before the response is sent.
 - Lifespan is the only startup/shutdown mechanism. No `on_event`, no work at import time.
 - No shared base classes for crud/service; keep modules explicit and standalone.
-- Auth hooks for modules are the `CurrentUser`/`OptionalUser` aliases only. Roles and permissions (D3), user events and per-module settings are deferred; do not build them. The 2FA stubs stay.
+- User hooks for modules are the `CurrentUser`/`OptionalUser` aliases only. Roles and permissions (D3), user events and per-module settings are deferred; do not build them. The 2FA stubs stay.
 
 ## Errors and responses *(target)*
 
@@ -109,7 +131,7 @@ docker build -t api:latest .                # image
 - Pydantic v2 only: `model_config = ConfigDict(...)`, `field_validator`, `model_validator`, `model_dump(mode="json")`. Request models set `extra="forbid"`. Separate `XCreate`, `XUpdate`, `XResponse`; never return ORM objects.
 - Naming: `snake_case` functions and modules, `PascalCase` classes, `UPPER_SNAKE` constants, schemas suffixed `Request`/`Response`, exceptions suffixed `Error`.
 - Structured log events, not messages: `logger.info("auth.login_success", user_id=str(user.id))`. Event names are `area.action`.
-- Imports are absolute: `from app.core import DbSession`, `from app.modules.auth import CurrentUser`. No circular imports.
+- Imports are absolute: `from app.core import DbSession`, `from app.modules.users import CurrentUser`. No circular imports.
 
 ## Comments and docstrings
 
@@ -152,11 +174,11 @@ async def revoke_user_sessions(
 
 ## Security rules
 
-- Passwords: `argon2-cffi` via `hash_password`/`verify_password` in the auth service (`src/app/modules/auth/`). Never store or log a plaintext password or token; tokens at rest are SHA-256 (`hash_token`).
-- JWT via `PyJWT` with an explicit `algorithms=[...]` list (HS256, pinned in the auth module). Never read the algorithm from the token.
+- Passwords: `argon2-cffi` via `hash_password`/`verify_password` in `src/app/core/security.py`. Never store or log a plaintext password or token; tokens at rest are SHA-256 (`hash_token`).
+- JWT via `PyJWT` with an explicit `algorithms=[...]` list (HS256, pinned in `src/app/core/security.py`). Never read the algorithm from the token.
 - Refresh tokens live only in Postgres; the refresh gate is one atomic `UPDATE ... RETURNING`. Do not add a Redis mirror.
 - Secrets are `SecretStr` in `Settings`; a startup guard rejects defaults outside `dev`/`unittest`. New secrets need a guard entry and a README configuration row.
-- Auth-protected routes use `CurrentUser` (or `OptionalUser`); do not re-implement token parsing. Do not change `src/app/modules/auth/` internals unless the task is about auth.
+- Auth-protected routes use `CurrentUser` (or `OptionalUser`); do not re-implement token parsing. Do not change `src/app/modules/auth/`, `src/app/modules/users/` or `src/app/core/security.py` internals unless the task is about auth.
 - Error messages must not reveal whether an account exists (see Roadmap Phase 1 for the current gaps).
 - Validate and bound every input (`max_length`, ranges, enums). Reject unknown fields.
 - CORS, cookies and headers are configured centrally (`create_app()` and `src/app/core/middleware.py`); do not set them per route. The client IP comes only from the ASGI scope; uvicorn's proxy headers are enabled with trusted `FORWARDED_ALLOW_IPS`.
@@ -178,7 +200,7 @@ async def revoke_user_sessions(
 - Cache keys include every input that changes the result, `{user_id}` included for per-user data. A missing component leaks data across users.
 - Mutations call `invalidate(...)` in the service. TTLs come from `Settings`.
 - There is no ETag middleware, no client cache-control middleware and no route-cache settings.
-- All background work is a taskiq task in the module's `tasks.py`, exported through `Module(tasks=...)` and enqueued with `await task.kiq(...)`. Tasks are retry-safe (idempotent) and receive IDs and primitives, never ORM objects. Do not use FastAPI `BackgroundTasks`.
+- All background work is a taskiq task in the module's `tasks.py`, declared with `@task(task_name=...)` from `app.core`, exported through `Module(tasks=...)` and enqueued with `await my_task.kiq(...)`. Importing a module must read no settings: the broker is built by `app.worker` (worker, scheduler) and by the API lifespan. Email templates live in the module and are passed as `send_templated_email(..., template_dir=...)`. Tasks are retry-safe (idempotent) and receive IDs and primitives, never ORM objects. Do not use FastAPI `BackgroundTasks`.
 
 ## Testing *(target)*
 

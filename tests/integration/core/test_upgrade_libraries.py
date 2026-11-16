@@ -14,10 +14,10 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from taskiq.message import BrokerMessage
 from taskiq_redis import ListQueueBroker
 
-from app.api.auth.models import AuditEventType, AuthAuditLog
-from app.common.cache import close_cache_pool, init_cache_pool
-from app.common.config import get_settings
-from app.common.database import build_engine, create_session_factory
+from app.modules.auth.models import AuditEventType, AuthAuditLog
+from app.core.cache import close_cache_pool, init_cache_pool
+from app.core.config import get_settings
+from app.core.database import build_engine, create_session_factory
 from tests.helpers import run_async
 
 
@@ -108,7 +108,9 @@ class TestTaskiqBroker:
         ``socket_timeout=None``; with that setting the listener keeps waiting
         and still receives the next job.
         """
-        from app.common.taskiq import broker as app_broker
+        from app.core.tasks import build_broker
+
+        app_broker = build_broker(get_settings())
 
         socket_timeout = app_broker.connection_pool.connection_kwargs["socket_timeout"]
         assert socket_timeout is None

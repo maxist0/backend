@@ -25,7 +25,7 @@ BACKEND_DIR = Path(__file__).resolve().parents[1]
 PASSWORD = "Password123!"
 
 # psycopg's async mode cannot run on Windows' default ProactorEventLoop (the app
-# refuses to start on it, see app.common.database.ensure_supported_event_loop).
+# refuses to start on it, see app.core.database.ensure_supported_event_loop).
 # Event loops are therefore created through this factory instead of the
 # deprecated `WindowsSelectorEventLoopPolicy`; `None` means the platform
 # default (uvloop-compatible asyncio default on POSIX).
@@ -78,7 +78,7 @@ def register_ok(client, *, username: str, **kwargs):
     """register() that fails loudly unless the API answered 201.
 
     Callers must use the `captured_emails` fixture: without it the email task
-    hits the real broker and register can 500 after the user is committed.
+    is enqueued on the real broker, and the test cannot read the token.
     """
     r = register(client, username=username, **kwargs)
     assert r.status_code == 201, f"register failed: {r.status_code} {r.text[:200]}"

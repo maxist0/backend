@@ -11,8 +11,8 @@ import pytest
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.exceptions import FastAPIDeprecationWarning
 
-from app.common.metrics import REGISTRY
-from app.common.middleware import MetricsMiddleware
+from app.core.metrics import REGISTRY
+from app.core.middleware import MetricsMiddleware
 from app.main import create_app
 from tests.helpers import new_test_client
 

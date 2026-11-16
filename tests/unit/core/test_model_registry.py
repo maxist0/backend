@@ -1,10 +1,11 @@
-"""Model registry for Alembic."""
+"""Alembic sees every table through `MODULES`, without application settings."""
 
 import os
 import subprocess
 import sys
 
-from app.models import Base
+from app.core import Base
+from app.modules import MODULES
 from tests.helpers import BACKEND_DIR
 
 EXPECTED_TABLES = {
@@ -15,20 +16,22 @@ EXPECTED_TABLES = {
     "sessions",
 }
 
+# What alembic/env.py does, in a fresh interpreter without ENVIRONMENT (like
+# the deployed migrate job, which gets only DATABASE_URL), so no other import
+# of this test session can have registered the models or built the settings.
+_ALEMBIC_IMPORTS = (
+    "import app.modules\n"
+    "from app.core import Base, get_settings\n"
+    "print(sorted(Base.metadata.tables))\n"
+    "print('SETTINGS_BUILT', get_settings.cache_info().currsize)\n"
+)
 
-def test_registry_alone_registers_every_table():
-    """alembic/env.py imports only the registry; it must see all tables.
 
-    A fresh interpreter without ENVIRONMENT, like an Alembic run, so no other
-    import of this test session can have registered the models.
-    """
+def test_modules_register_every_table_without_environment():
+    """`import app.modules` needs no `ENVIRONMENT` and reads no settings."""
     env = {k: v for k, v in os.environ.items() if k != "ENVIRONMENT"}
     proc = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            "from app.models import Base; print(sorted(Base.metadata.tables))",
-        ],
+        [sys.executable, "-c", _ALEMBIC_IMPORTS],
         cwd=BACKEND_DIR,
         env=env,
         capture_output=True,
@@ -37,11 +40,21 @@ def test_registry_alone_registers_every_table():
     )
 
     assert proc.returncode == 0, proc.stderr[-1500:]
-    assert proc.stdout.strip() == str(sorted(EXPECTED_TABLES))
+    tables, settings_built = proc.stdout.strip().splitlines()
+    assert tables == str(sorted(EXPECTED_TABLES))
+    assert settings_built == "SETTINGS_BUILT 0"
 
 
-def test_every_mapped_class_is_in_the_registry_metadata():
-    mapped_tables = {mapper.local_table.name for mapper in Base.registry.mappers}
+def test_modules_models_cover_every_mapped_table():
+    """Every mapped table belongs to the `models` of a registered module."""
+    module_tables = {
+        mapper.local_table.name
+        for mapper in Base.registry.mappers
+        if any(
+            module.models is not None
+            and mapper.class_.__module__ == module.models.__name__
+            for module in MODULES
+        )
+    }
 
-    assert mapped_tables == set(Base.metadata.tables)
-    assert set(Base.metadata.tables) == EXPECTED_TABLES
+    assert module_tables == set(Base.metadata.tables) == EXPECTED_TABLES

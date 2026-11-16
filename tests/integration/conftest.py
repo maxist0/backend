@@ -58,7 +58,7 @@ def test_environment(postgres_container, redis_container):
     Settings are cached per process, so the cache is cleared after wiring and
     again when the environment is restored.
     """
-    from app.common.config import get_settings
+    from app.core.config import get_settings
 
     redis_port = redis_container.get_exposed_port(6379)
     with pytest.MonkeyPatch.context() as mp:
@@ -95,8 +95,8 @@ def migrated_db(sync_engine):
 
     Returns the comma-separated, quoted table list that `clean_db` truncates.
     """
-    from app.common.config import get_settings
-    from app.common.logging import setup_logging
+    from app.core.config import get_settings
+    from app.core.logging import setup_logging
 
     cfg = Config(str(BACKEND_DIR / "alembic.ini"))
     cfg.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
@@ -163,7 +163,7 @@ def app(test_environment):
     The collection-time `app.main.app` was created before the containers
     existed. `create_app()` does no I/O.
     """
-    from app.common.config import get_settings
+    from app.core.config import get_settings
     from app.main import create_app
 
     return create_app(get_settings())
@@ -239,14 +239,13 @@ def captured_emails(monkeypatch) -> CapturedEmails:
 
         return _capture
 
+    # One patch site per task: `.kiq` is an attribute of the task object, which
+    # every caller imports from `app.modules.auth.tasks`.
     monkeypatch.setattr(
-        "app.api.auth.service.send_verification_email_task.kiq", _make("verify")
+        "app.modules.auth.tasks.send_verification_email_task.kiq", _make("verify")
     )
     monkeypatch.setattr(
-        "app.api.auth.service.send_password_reset_email_task.kiq", _make("reset")
-    )
-    monkeypatch.setattr(
-        "app.api.user.service.send_verification_email_task.kiq", _make("verify")
+        "app.modules.auth.tasks.send_password_reset_email_task.kiq", _make("reset")
     )
     return emails
 

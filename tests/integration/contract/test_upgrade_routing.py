@@ -9,7 +9,7 @@
 import pytest
 from fastapi.routing import iter_route_contexts
 
-from app.common.metrics import REGISTRY
+from app.core.metrics import REGISTRY
 from tests.helpers import new_test_client
 
 EXPECTED_OPENAPI_PATHS = {

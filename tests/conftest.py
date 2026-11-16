@@ -18,14 +18,14 @@ os.environ["ENVIRONMENT"] = "unittest"
 # The admin panel is opt-in outside "dev". The admin tests drive the real
 # sqladmin app, so enable it explicitly for the test process.
 os.environ["ADMIN_ENABLED"] = "true"
-# Collection imports app modules (`app.main` builds an app, `app.common.taskiq`
-# builds the broker) before any container exists and its port is known. Until
-# the integration `test_environment` fixture wires the real addresses, every
-# service address points at a closed port, so nothing imported early can reach
-# a developer's own Postgres or Redis on the default ports. Unit tests keep
-# these addresses for the whole run: they never connect. The broker is the
-# exception in the integration suite: its enqueue stays unreachable on purpose,
-# and tests that register users use `captured_emails`.
+# Collection imports app modules (`app.main` builds an app) before any
+# container exists and its port is known. Until the integration
+# `test_environment` fixture wires the real addresses, every service address
+# points at a closed port, so nothing imported early can reach a developer's
+# own Postgres or Redis on the default ports. Unit tests keep these addresses
+# for the whole run: they never connect. In the integration suite the app
+# lifespan builds the taskiq broker from the wired settings; tests that
+# register users use `captured_emails`, so no mail task is enqueued.
 _UNREACHABLE = "127.0.0.1:1"
 os.environ["DATABASE_URL"] = f"postgresql+psycopg://x:x@{_UNREACHABLE}/unconfigured"
 os.environ["CACHE_HOST"] = "127.0.0.1"

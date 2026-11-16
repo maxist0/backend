@@ -1,4 +1,3 @@
-# run.py
 """
 Thin launcher for the API (uvicorn on ``app.main:app``).
 
@@ -63,7 +62,7 @@ def main() -> None:
             "or run 'python run.py dev' for local development."
         )
 
-    from app.common.config import ConfigurationError, get_settings
+    from app.core.config import ConfigurationError, get_settings
 
     try:
         settings = get_settings()
@@ -80,7 +79,7 @@ def main() -> None:
     # Start a taskiq worker process automatically in development mode. On
     # Windows the taskiq CLI runs on a ProactorEventLoop; that is fine while
     # tasks use no database (mail, heartbeat). A worker that uses psycopg
-    # needs its own entrypoint there (review 2026-11, step 1.5).
+    # needs its own entrypoint there.
     if settings.is_development:
         worker_process = subprocess.Popen(
             [
@@ -88,7 +87,7 @@ def main() -> None:
                 "-m",
                 "taskiq",
                 "worker",
-                "app.common.taskiq:broker",
+                "app.worker:broker",
                 f"--workers={settings.TASKIQ_WORKERS}",
                 f"--log-level={settings.LOG_LEVEL.upper()}",
             ]

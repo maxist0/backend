@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: accepted (amended by ADR 0008)
 date: 2026-11-16
 decision-makers: project owner
 ---

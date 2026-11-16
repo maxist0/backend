@@ -4,10 +4,13 @@ import os
 import subprocess
 import sys
 
+from fastapi import APIRouter
 from fastapi.routing import iter_route_contexts
 
 import app.main as main
-from app.common.config import Settings
+from app.core import Module
+from app.core.config import Settings
+from app.modules import MODULES
 from tests.helpers import BACKEND_DIR
 
 STRONG = {
@@ -76,3 +79,36 @@ class TestCreateApp:
         app = main.create_app(settings)
 
         assert app.state.session_factory.kw.get("bind") is None
+
+
+def _paths(routes) -> set[str]:
+    return {context.path for context in iter_route_contexts(routes)}
+
+
+class TestModuleMounting:
+    def test_every_route_of_every_module_is_mounted(self, settings_factory):
+        app = main.create_app(settings_factory())
+
+        mounted = _paths(app.routes)
+
+        for module in MODULES:
+            module_paths = _paths(module.router.routes)
+            assert module_paths, f"module {module.name} has no routes"
+            assert module_paths <= mounted, module.name
+
+    def test_a_registered_module_is_mounted_without_core_changes(
+        self, monkeypatch, settings_factory
+    ):
+        """A new entry in `MODULES` is all it takes; no API prefix yet."""
+        router = APIRouter(prefix="/probe-items", tags=["probe"])
+
+        @router.get("/")
+        async def list_probe_items() -> list[str]:
+            return []
+
+        probe = Module(name="probe", router=router)
+        monkeypatch.setattr(main, "MODULES", (*MODULES, probe))
+
+        app = main.create_app(settings_factory())
+
+        assert "/probe-items/" in _paths(app.routes)

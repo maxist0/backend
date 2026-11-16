@@ -1,21 +1,32 @@
-"""No import-time side effects in the taskiq module; logging set up once per process."""
+"""Taskiq wiring: shared tasks, broker builders, worker root; logging once per process."""
 
 import asyncio
 import os
 import subprocess
 import sys
 
-import app.common.logging as app_logging
-import app.common.taskiq as app_taskiq
-from app.common.config import get_settings
+from taskiq import TaskiqEvents
+from taskiq.schedule_sources import LabelScheduleSource
+
+import app.core.logging as app_logging
+import app.core.tasks as app_tasks
+import app.modules  # noqa: F401  (registers the module tasks)
+from app.core.config import get_settings
 from tests.helpers import BACKEND_DIR
 
+# Queued messages carry these names; renaming one strands messages in Redis.
+TASK_NAMES = {
+    "email.send_password_reset_email",
+    "email.send_verification_email",
+    "maintenance.taskiq_heartbeat",
+}
 
-def test_importing_the_broker_does_not_configure_logging():
-    """Importing `app.common.taskiq` must not call `setup_logging`."""
+
+def test_importing_the_worker_does_not_configure_logging():
+    """Importing `app.worker` must not call `setup_logging`."""
     code = (
         "import structlog\n"
-        "import app.common.taskiq\n"
+        "import app.worker\n"
         "print('CONFIGURED', structlog.is_configured())\n"
     )
     proc = subprocess.run(
@@ -31,11 +42,62 @@ def test_importing_the_broker_does_not_configure_logging():
     assert "CONFIGURED False" in proc.stdout
 
 
+def test_worker_broker_serves_every_task_under_its_name():
+    """`app.worker:broker` finds the shared tasks of the core and the modules."""
+    code = (
+        "import app.worker\n"
+        "from app.modules.auth.tasks import send_verification_email_task as t\n"
+        "print(sorted(app.worker.broker.get_all_tasks()))\n"
+        "print('DEFAULT', t.kicker().broker is app.worker.broker)\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=BACKEND_DIR,
+        env=dict(os.environ),
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert proc.returncode == 0, proc.stderr[-1500:]
+    names, default = proc.stdout.strip().splitlines()
+    assert names == str(sorted(TASK_NAMES))
+    assert default == "DEFAULT True"
+
+
+def test_built_broker_registers_the_worker_logging_hook():
+    broker = app_tasks.build_broker(get_settings())
+
+    handlers = broker.event_handlers[TaskiqEvents.WORKER_STARTUP]
+
+    assert app_tasks.configure_worker_logging in handlers
+    assert broker.find_task("maintenance.taskiq_heartbeat") is not None
+
+
+def test_scheduler_finds_the_shared_heartbeat_schedule():
+    """The heartbeat is a shared task; the scheduler must still schedule it."""
+    broker = app_tasks.build_broker(get_settings())
+    scheduler = app_tasks.build_scheduler(broker)
+    (source,) = scheduler.sources
+    assert isinstance(source, LabelScheduleSource)
+
+    async def _schedules() -> list:
+        await source.startup()
+        return await source.get_schedules()
+
+    schedules = asyncio.run(_schedules())
+
+    assert scheduler.broker is broker
+    assert [(s.task_name, s.cron) for s in schedules] == [
+        ("maintenance.taskiq_heartbeat", "*/5 * * * *")
+    ]
+
+
 def test_worker_startup_hook_configures_logging(monkeypatch):
     calls = []
-    monkeypatch.setattr(app_taskiq, "setup_logging", calls.append)
+    monkeypatch.setattr(app_tasks, "setup_logging", calls.append)
 
-    asyncio.run(app_taskiq.configure_worker_logging(None))
+    asyncio.run(app_tasks.configure_worker_logging(None))
 
     assert calls == [get_settings()]
 

@@ -1,1 +1,1 @@
-"""Unit tests for `app.common` (the core)."""
+"""Unit tests for `app.core`."""

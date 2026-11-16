@@ -20,7 +20,7 @@ class TestLoggingHygiene:
     ):
         import asyncio
 
-        from app.utils import email_tasks
+        from app.modules.auth import tasks as email_tasks
 
         async def _send(**_kwargs):
             if outcome == "failed":

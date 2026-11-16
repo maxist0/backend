@@ -13,7 +13,7 @@ import tomllib
 
 from tests.helpers import BACKEND_DIR
 
-import app.common.logging as app_logging
+import app.core.logging as app_logging
 
 
 class TestSqlAlchemy21:
@@ -27,7 +27,7 @@ class TestSqlAlchemy21:
             "import uuid\n"
             "from typing import assert_type\n"
             "from sqlalchemy import Select, select\n"
-            "from app.api.auth.models import User\n"
+            "from app.modules.users.models import User\n"
             "assert_type(select(User.id, User.username), Select[uuid.UUID, str])\n",
             encoding="utf-8",
         )
@@ -67,13 +67,14 @@ class TestSqlAlchemy21:
 class TestTaskiqBroker:
     def test_tasks_are_registered_on_the_broker(self):
         """0.13: broker API unchanged; both mail tasks are registered."""
-        from app.common.taskiq import broker
-        from app.utils.email_tasks import (
+        from app.core.config import get_settings
+        from app.core.tasks import build_broker
+        from app.modules.auth.tasks import (
             send_password_reset_email_task,
             send_verification_email_task,
         )
 
-        names = set(broker.get_all_tasks())
+        names = set(build_broker(get_settings()).get_all_tasks())
 
         assert {
             send_verification_email_task.task_name,
@@ -88,7 +89,7 @@ class TestOtlpLogHandler:
         """1.40: the SDK ``LoggingHandler`` warns (DeprecationWarning) in __init__.
 
         pytest turns deprecations into errors; ``_build_otlp_handler``
-        silences only that one message (see app.common.logging). The global
+        silences only that one message (see app.core.logging). The global
         provider is not replaced, so no other test is affected.
         """
         import opentelemetry._logs as otel_logs

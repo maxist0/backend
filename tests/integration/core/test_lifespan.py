@@ -6,7 +6,7 @@ import pytest
 from sqlalchemy.engine import make_url
 
 import app.main as main
-from app.common.config import Settings
+from app.core.config import Settings
 from tests.helpers import new_test_client
 
 
@@ -102,3 +102,63 @@ class TestLifespan:
                 pass
 
         assert [name for name, _ in calls] == ["close_db"]
+
+    def test_lifespan_starts_and_stops_the_taskiq_broker(self, monkeypatch):
+        """The broker is started, used for `.kiq()` and shut down on exit."""
+        from app.modules.auth.tasks import send_verification_email_task
+
+        events: list[str] = []
+        real_build_broker = main.build_broker
+
+        def _build_broker(settings):
+            broker = real_build_broker(settings)
+            real_startup, real_shutdown = broker.startup, broker.shutdown
+
+            async def _startup():
+                events.append("startup")
+                await real_startup()
+
+            async def _shutdown():
+                events.append("shutdown")
+                await real_shutdown()
+
+            broker.startup, broker.shutdown = _startup, _shutdown
+            return broker
+
+        monkeypatch.setattr(main, "build_broker", _build_broker)
+        app = main.create_app(_settings())
+
+        with new_test_client(app):
+            assert events == ["startup"]
+            broker = app.state.broker
+            assert send_verification_email_task.kicker().broker is broker
+
+        assert events == ["startup", "shutdown"]
+
+    def test_broker_failure_closes_redis_and_database(self, monkeypatch):
+        calls: list = []
+        for name in ("close_db", "close_cache_pool", "close_route_cache"):
+            _spy(monkeypatch, name, calls)
+        real_build_broker = main.build_broker
+
+        def _broken_broker(settings):
+            broker = real_build_broker(settings)
+
+            async def _startup():
+                raise ConnectionError("broker down")
+
+            broker.startup = _startup
+            return broker
+
+        monkeypatch.setattr(main, "build_broker", _broken_broker)
+        app = main.create_app(_settings())
+
+        with pytest.raises(ConnectionError, match="broker down"):
+            with new_test_client(app):
+                pass
+
+        assert [name for name, _ in calls] == [
+            "close_route_cache",
+            "close_cache_pool",
+            "close_db",
+        ]

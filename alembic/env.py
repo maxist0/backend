@@ -1,4 +1,3 @@
-# alembic/env.py
 """
 Alembic environment for async migrations.
 
@@ -34,11 +33,12 @@ from sqlalchemy import pool
 from sqlalchemy.engine import Connection, make_url
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from app.common.config import LOCAL_ENV_FILE, Environment, normalize_database_url
-
-# The model registry imports every feature's models, so the metadata holds
-# all tables (autogenerate must never see an empty metadata).
-from app.models import Base
+# Importing app.modules imports every registered module (MODULES), and with
+# it each module's models, so the metadata holds all tables (autogenerate
+# must never see an empty metadata). It reads no settings.
+import app.modules  # noqa: F401
+from app.core import Base
+from app.core.config import LOCAL_ENV_FILE, Environment, normalize_database_url
 
 
 class MigrationConfigError(RuntimeError):

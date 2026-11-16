@@ -8,8 +8,8 @@ import sys
 import pytest
 from pydantic import ValidationError
 
-import app.common.database as database
-from app.common.config import normalize_database_url
+import app.core.database as database
+from app.core.config import normalize_database_url
 from tests.helpers import LOOP_FACTORY
 
 SECRET = "pw-must-not-leak"

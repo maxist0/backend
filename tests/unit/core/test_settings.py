@@ -3,7 +3,7 @@
 import pytest
 from pydantic import ValidationError
 
-from app.common.config import (
+from app.core.config import (
     ConfigurationError,
     Environment,
     Settings,

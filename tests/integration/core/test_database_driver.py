@@ -8,8 +8,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.pool import NullPool
 
-from app.api.auth.models import User
-from app.common.db_errors import constraint_name, find_db_error, sqlstate
+from app.modules.users.models import User
+from app.core.errors import constraint_name, find_db_error, sqlstate
 from tests.helpers import LOOP_FACTORY
 
 

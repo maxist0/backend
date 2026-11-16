@@ -197,7 +197,7 @@ class TestPasswordHashSettings:
 
 class TestHarness:
     def test_settings_object_is_the_unittest_one(self):
-        """app.common.taskiq must not replace the settings with the dev ones."""
-        from app.common.config import get_settings
+        """No imported module may replace the settings with the dev ones."""
+        from app.core.config import get_settings
 
         assert get_settings().ENVIRONMENT.value == "unittest"

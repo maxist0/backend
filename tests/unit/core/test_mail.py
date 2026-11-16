@@ -3,10 +3,10 @@
 import asyncio
 
 import pytest
-from fastapi_mail import FastMail
+from fastapi_mail import FastMail, MessageType
 
-import app.common.mail as mail
-from app.common.config import get_settings
+import app.core.mail as mail
+from app.core.config import get_settings
 
 MAIL = {
     "MAIL_USERNAME": "mailer",
@@ -46,7 +46,8 @@ class TestMailConfig:
         assert config.MAIL_SERVER == "smtp.example.com"
         assert config.MAIL_PORT == 2525
         assert config.MAIL_STARTTLS is False
-        assert config.TEMPLATE_FOLDER == mail.TEMPLATE_FOLDER
+        # Templates are rendered by `render_email`, not by fastapi-mail.
+        assert config.TEMPLATE_FOLDER is None
 
     def test_mail_password_is_not_exposed(self, mail_settings):
         settings = mail_settings()
@@ -107,7 +108,43 @@ class TestMailer:
             mail.send_templated_email(
                 to="someone@example.com",
                 subject="s",
-                template_name="auth/verify_email.html",
+                template_name="verify_email.html",
                 context={},
             )
         )
+
+    def test_sending_passes_the_rendered_html_body(
+        self, monkeypatch, tmp_path, mail_settings
+    ):
+        """The module's template is rendered with the core layout and sent as HTML."""
+        (tmp_path / "probe").mkdir()
+        (tmp_path / "probe" / "hello.html").write_text(
+            '{% extends "base.html" %}{% block content %}Hi {{ username }}{% endblock %}',
+            encoding="utf-8",
+        )
+        sent = []
+
+        class _Mailer:
+            async def send_message(self, message, template_name=None):
+                sent.append((message, template_name))
+
+        monkeypatch.setattr(mail, "get_mailer", lambda: _Mailer())
+        monkeypatch.setattr(
+            mail, "get_settings", lambda: mail_settings(APP_NAME="Probe")
+        )
+
+        asyncio.run(
+            mail.send_templated_email(
+                to="someone@example.com",
+                subject="s",
+                template_name="probe/hello.html",
+                context={"username": "<b>zed</b>"},
+                template_dir=tmp_path,
+            )
+        )
+
+        ((message, template_name),) = sent
+        assert template_name is None
+        assert message.subtype is MessageType.html
+        assert "Hi &lt;b&gt;zed&lt;/b&gt;" in message.body
+        assert "<html" in message.body.lower()

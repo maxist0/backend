@@ -1,6 +1,6 @@
 """Routes read their settings through the `get_settings` dependency."""
 
-from app.common.config import get_settings
+from app.core.config import get_settings
 
 
 class TestSettingsDependency:

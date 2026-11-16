@@ -26,7 +26,7 @@ import logging
 import jwt
 import pytest
 
-from app.common.constants import MAXIMUM_LOGIN_ATTEMPTS
+from app.modules.auth.service import MAXIMUM_LOGIN_ATTEMPTS
 from tests.helpers import (
     PASSWORD,
     active_session_count,
@@ -500,7 +500,7 @@ class TestEmailTokensSingleUse:
 
 
 def _secret() -> str:
-    from app.common.config import get_settings
+    from app.core.config import get_settings
 
     return secret_value(get_settings().JWT_SECRET_KEY)
 
@@ -733,8 +733,8 @@ class TestLoggingHygiene:
         """GUARD: engine creation and init_db logs."""
         import os
 
-        import app.common.database as database
-        from app.common.config import get_settings
+        import app.core.database as database
+        from app.core.config import get_settings
 
         from sqlalchemy.engine import make_url
 

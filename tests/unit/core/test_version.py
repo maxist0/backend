@@ -5,8 +5,8 @@ from importlib.metadata import PackageNotFoundError
 
 import pytest
 
-from app.common import config
-from app.common.config import Settings
+from app.core import config
+from app.core.config import Settings
 from tests.helpers import BACKEND_DIR
 
 PYPROJECT = BACKEND_DIR / "pyproject.toml"

@@ -9,8 +9,8 @@ from collections.abc import Callable, Iterator
 
 import pytest
 
-from app.common.config import Settings, get_settings
-from app.common.logging import setup_logging
+from app.core.config import Settings, get_settings
+from app.core.logging import setup_logging
 
 
 @pytest.fixture(scope="session", autouse=True)
