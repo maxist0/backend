@@ -1,14 +1,19 @@
 # src/app/common/middleware.py
+import re
 import time
 import uuid
-from typing import Callable
+from typing import Any, Callable
 
 import structlog
+from fastapi.routing import iter_route_contexts
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
 from app.common.logging import get_access_logger
+
+# (path regex, full path template) of every place a route object is reachable.
+_RouteTemplates = tuple[tuple[re.Pattern[str], str], ...]
 
 # The request method is client-controlled; as a metric label it must come from
 # a fixed set, or invented methods create unbounded time series.
@@ -103,6 +108,9 @@ class MetricsMiddleware(BaseHTTPMiddleware):
         from app.common.metrics import REGISTRY
 
         self.registry = registry or REGISTRY
+        # id(route) -> (route, templates). The route object is kept so its id
+        # cannot be reused; routes live as long as the app.
+        self._templates: dict[int, tuple[Any, _RouteTemplates]] = {}
 
     async def dispatch(self, request: Request, call_next):
         # Skip metrics collection for the metrics endpoint itself
@@ -183,8 +191,54 @@ class MetricsMiddleware(BaseHTTPMiddleware):
         (bounded cardinality).
         """
         route = request.scope.get("route")
+        if route is None:
+            return "unmatched"
+        templates = self._route_templates(request, route)
+        if len(templates) == 1:
+            return templates[0][1]
+        if templates:
+            # The same router included under several prefixes (e.g. two API
+            # versions): pick the template that matched this request.
+            route_path = _route_path(request.scope)
+            for regex, template in templates:
+                if regex.match(route_path):
+                    return template
         path = getattr(route, "path", None)
         return path if isinstance(path, str) and path else "unmatched"
+
+    def _route_templates(self, request: Request, route: Any) -> _RouteTemplates:
+        """Full path templates of *route* in this app (cached per route).
+
+        Since FastAPI 0.137 included routers are kept as a tree: the matched
+        ``scope["route"]`` is the router's own ``APIRoute`` whose ``path`` lacks
+        the include prefixes (``/login`` instead of ``/auth/login``). The
+        prefixed template comes from ``fastapi.routing.iter_route_contexts``.
+        Routes outside the app's tree (e.g. inside the mounted admin app)
+        yield no template and keep their own ``path``.
+        """
+        cached = self._templates.get(id(route))
+        if cached is not None and cached[0] is route:
+            return cached[1]
+        templates: _RouteTemplates = tuple(
+            (context.path_regex, context.path_format)
+            for context in iter_route_contexts(request.app.routes)
+            if context.original_route is route
+            and isinstance(context.path_format, str)
+            and context.path_format
+        )
+        self._templates[id(route)] = (route, templates)
+        return templates
+
+
+def _route_path(scope: Any) -> str:
+    """The request path relative to ``root_path`` (what routes match against)."""
+    path: str = scope.get("path", "")
+    root_path: str = scope.get("root_path", "")
+    if root_path and path.startswith(root_path):
+        rest = path[len(root_path) :]
+        if not rest or rest.startswith("/"):
+            return rest
+    return path
 
 
 class CORSMiddleware(BaseHTTPMiddleware):

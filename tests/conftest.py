@@ -49,8 +49,8 @@ import redis as redis_sync  # noqa: E402
 from alembic import command  # noqa: E402
 from alembic.config import Config  # noqa: E402
 from sqlalchemy import create_engine, text  # noqa: E402
-from testcontainers.postgres import PostgresContainer  # type: ignore  # noqa: E402
-from testcontainers.redis import RedisContainer  # type: ignore  # noqa: E402
+from testcontainers.community.postgres import PostgresContainer  # noqa: E402
+from testcontainers.community.redis import RedisContainer  # noqa: E402
 
 from tests.helpers import new_test_client  # noqa: E402
 

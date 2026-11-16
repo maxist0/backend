@@ -4,33 +4,35 @@ version = "1.0.0"
 description = "API Application"
 requires-python = ">=3.14"
 dependencies = [
-    "fastapi>=0.136.1",
-    "uvicorn[standard]>=0.34.0",
-    "pydantic[email]>=2.13.3",
-    "pydantic-settings>=2.14.2",
-    "python-dotenv>=1.0.0",
-    "prometheus-client>=0.21.0",
-    "pyjwt[crypto]>=2.15.1",
-    "argon2-cffi>=23.1.0",
-    "redis>=5.0.0",
-    "sqlalchemy[asyncio]>=2.0.49",
-    "alembic>=1.18.4",
-    "greenlet>=3.1.0",
-    "structlog>=25.0.0",
-    "rich>=13.0.0",
-    "opentelemetry-api>=1.31.0",
-    "opentelemetry-exporter-otlp-proto-http>=1.31.0",
-    "python-multipart>=0.0.33",
-    "opentelemetry-exporter-otlp>=1.31.0",
-    "opentelemetry-sdk>=1.31.0",
-    "psycopg[binary]>=3.3.3",
-    "fastapi-mail>=1.6.2",
-    "taskiq>=0.12.2",
-    "taskiq-redis>=1.2.2",
-    "cashews>=7.5.0",
-    "sqladmin>=0.32.0",
-    "starlette>=1.3.1",
+    # Lower bounds = the versions verified in review step 1.4 (2026-11-16).
+    "fastapi>=0.163.1",
+    "starlette>=1.10.0",
+    "uvicorn[standard]>=0.54.0",
+    "pydantic[email]>=2.14.3",
+    "pydantic-settings>=2.16.3",
+    "python-dotenv>=1.2.4",
+    "python-multipart>=0.0.34",
     "itsdangerous>=2.2.0",
+    "prometheus-client>=0.26.0",
+    "pyjwt[crypto]>=2.15.1",
+    "argon2-cffi>=25.1.0",
+    "redis>=8.1.0",
+    # SQLAlchemy 2.1 installs greenlet only through the [asyncio] extra.
+    "sqlalchemy[asyncio]>=2.1.8",
+    "greenlet>=3.5.6",
+    "alembic>=1.20.1",
+    "psycopg[binary]>=3.3.9",
+    "structlog>=26.1.0",
+    "rich>=15.0.0",
+    "opentelemetry-api>=1.45.2",
+    "opentelemetry-sdk>=1.45.2",
+    "opentelemetry-exporter-otlp>=1.45.2",
+    "opentelemetry-exporter-otlp-proto-http>=1.45.2",
+    "fastapi-mail>=1.6.8",
+    "taskiq>=0.13.0",
+    "taskiq-redis>=1.2.4",
+    "cashews>=7.6.0",
+    "sqladmin>=0.32.0",
 ]
 
 [build-system]
@@ -60,16 +62,33 @@ constraint-dependencies = [
     "cryptography>=50.0.0",
     # Reachable via EmailStr (email-validator -> idna) on public endpoints.
     "idna>=3.15",
+    # Step 1.4: fixed-in versions of the advisories `uv audit` reported on the
+    # previous lock (2026-11-16). Installed at runtime but not on a request
+    # path unless noted.
+    # taskiq -> aiohttp (+ multidict); the Redis broker does not use aiohttp.
+    "aiohttp>=3.14.4",
+    "multidict>=6.9.1",
+    # email-validator -> dnspython; used only for deliverability checks (off).
+    "dnspython>=2.9.2",
+    # alembic -> mako; renders new revision files (developer machines).
+    "mako>=1.4.2",
+    # rich -> pygments; console tracebacks in dev.
+    "pygments>=2.20.0",
+    # OTLP/HTTP log exporter -> requests -> urllib3; reachable when
+    # OTLP_LOGS_ENABLED (outbound to the configured collector only).
+    "requests>=2.33.0",
+    "urllib3>=2.8.0",
 ]
 
 [dependency-groups]
 # PEP 735 groups. None of them is installed in the runtime image (uv sync --no-dev).
 test = [
-    "pytest>=9.0.2",
-    "pytest-cov>=7.0.0",
-    "testcontainers[postgres]>=4.14.1",
-    # fastapi.testclient.TestClient needs httpx; the app itself does not import it.
-    "httpx>=0.28.1",
+    "pytest>=9.2.0",
+    "pytest-cov>=7.1.0",
+    "testcontainers[postgres]>=4.15.0",
+    # fastapi.testclient.TestClient (Starlette >= 1.x) prefers httpx2 and
+    # deprecates httpx; the app itself imports neither.
+    "httpx2>=2.16.2",
     "time-machine>=3.6.0",
 ]
 lint = [
@@ -116,18 +135,16 @@ filterwarnings = [
     "error::DeprecationWarning",
     "error::PendingDeprecationWarning",
     "error::RuntimeWarning",
-    # testcontainers 4.14.1: RedisContainer still uses its own deprecated
-    # @wait_container_is_ready decorator (emitted at import). Upstream issue, no
-    # first-party code involved. Remove when testcontainers drops the decorator.
-    "ignore:The @wait_container_is_ready decorator is deprecated:DeprecationWarning:testcontainers",
-    # cashews 7.x calls the deprecated redis-py Redis.close() when the route cache
-    # shuts down. Upstream; the app's own redis client already uses aclose().
-    # Step 1.4 (dependency upgrades) re-checks this and removes the line.
+    # FastAPI and Starlette deprecations derive from UserWarning, not from
+    # DeprecationWarning, so the first line does not cover them (step 1.4).
+    "error::fastapi.exceptions.FastAPIDeprecationWarning",
+    "error::starlette.exceptions.StarletteDeprecationWarning",
+    # cashews 7.6.0 (latest on 2026-11-16) still calls the deprecated redis-py
+    # Redis.close() in backends/redis/backend.py when the route cache shuts
+    # down. Upstream; the app's own redis client uses aclose(). Remove together
+    # with tests/common/test_upgrade_libraries.py::TestRedisPy8::
+    # test_cashews_still_calls_the_deprecated_redis_close once that test fails.
     "ignore:Call to deprecated close:DeprecationWarning:cashews",
-    # starlette's TestClient prefers httpx2 over httpx (StarletteDeprecationWarning,
-    # a UserWarning). Switching the test client dependency is part of step 1.4
-    # (major upgrades), not of the harness rework. Remove it there.
-    "ignore:Using `httpx` with `starlette.testclient` is deprecated:starlette.exceptions.StarletteDeprecationWarning",
 ]
 
 [tool.coverage.run]

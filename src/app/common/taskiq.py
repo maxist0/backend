@@ -19,9 +19,15 @@ from app.common.logging import setup_logging
 
 _settings = get_settings()
 
-broker = ListQueueBroker(_settings.TASKIQ_BROKER_URL).with_result_backend(
-    RedisAsyncResultBackend(_settings.TASKIQ_RESULT_BACKEND_URL)
-)
+# socket_timeout=None: the worker waits for jobs with BRPOP without a server
+# timeout. redis-py >= 8 defaults to a 5 s socket read timeout, which turns an
+# idle queue into redis.exceptions.TimeoutError after 5 s (taskiq-redis 1.2.4
+# only retries ConnectionError). None restores the redis-py 7 read behaviour;
+# connecting stays bounded by redis-py's default socket_connect_timeout (5 s).
+# Step 1.5 revisits the broker type (streams use a bounded XREADGROUP block).
+broker = ListQueueBroker(
+    _settings.TASKIQ_BROKER_URL, socket_timeout=None
+).with_result_backend(RedisAsyncResultBackend(_settings.TASKIQ_RESULT_BACKEND_URL))
 
 scheduler = TaskiqScheduler(
     broker=broker,

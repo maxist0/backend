@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from fastapi.routing import iter_route_contexts
 from sqlalchemy.engine import make_url
 
 import app.main as main
@@ -69,8 +70,10 @@ class TestCreateApp:
 
         assert app.title == "factory-app"
         assert app.state.settings is settings
-        paths = {getattr(route, "path", None) for route in app.routes}
-        assert "/" in paths
+        # FastAPI >= 0.137 keeps included routers as a tree in app.routes;
+        # iter_route_contexts() flattens it with the full (prefixed) paths.
+        paths = {context.path for context in iter_route_contexts(app.routes)}
+        assert {"/", "/auth/login", "/user/me"} <= paths
         assert "/metrics/" not in paths
         assert "/admin" not in paths
 

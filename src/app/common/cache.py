@@ -41,8 +41,8 @@ async def init_cache_pool(settings: Settings) -> redis.Redis:
         max_connections=settings.CACHE_MAX_CONNECTIONS,
     )
     try:
-        # redis-py types ping() for sync and async clients alike.
-        await client.ping()  # type: ignore[misc]
+        # redis-py >= 8 types ping() per client: Awaitable[bool] on asyncio.
+        await client.ping()
     except redis.RedisError as e:
         await client.aclose()
         logger.error("cache.connect_failed", error_type=type(e).__name__)

@@ -53,8 +53,8 @@ services:
     restart: unless-stopped
 
   redis:
-    # Redis 7 like the current deployment stack; the redis-py 8 client
-    # upgrade is a separate step (review 2026-11, step 1.4).
+    # Redis 7 like the current deployment stack. redis-py 8 (step 1.4) speaks
+    # RESP3 by default, which Redis >= 6 supports.
     image: redis:7.4.12-alpine3.22@sha256:7f7d30b7fdd09467bac58198a1f166dd69789d348d4fe859cccb20e0cf287fbe
     # Persistence is not needed for dev (cache, task queue); the volume keeps
     # the RDB snapshot only so a restart does not drop queued tasks.

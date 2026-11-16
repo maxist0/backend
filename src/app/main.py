@@ -167,6 +167,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         docs_url=None if settings.is_production else "/docs",
         redoc_url=None if settings.is_production else "/redoc",
         openapi_url=None if settings.is_production else "/openapi.json",
+        # FastAPI >= 0.142 emits its own OpenTelemetry spans, metrics and log
+        # records through the global providers. With OTLP_LOGS_ENABLED the
+        # logging setup installs a global logger provider, and FastAPI would
+        # then export unhandled exceptions with their message and stack trace
+        # (which can carry personal data), bypassing log_unexpected_error.
+        # Off until the observability redesign (review Phase 5) decides.
+        telemetry={"tracing": False, "metrics": False, "logs": False},
     )
     app.state.settings = settings
     # Unbound until the lifespan has created the engine.

@@ -27,6 +27,7 @@ import importlib.util
 import logging
 import socket
 import sys
+import warnings
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -95,7 +96,18 @@ def _build_otlp_handler(settings: "Settings") -> logging.Handler | None:
     provider.add_log_record_processor(BatchLogRecordProcessor(exporter))
     set_logger_provider(provider)
 
-    otlp_handler = OtelLoggingHandler(logger_provider=provider)
+    # opentelemetry-sdk >= 1.40 deprecates its LoggingHandler in favour of the
+    # one in opentelemetry-instrumentation-logging (warns in __init__). That
+    # replacement (0.66b2) exports structlog's event dict as a repr string
+    # instead of a structured body, so the switch belongs to the observability
+    # redesign (review Phase 5). Until then only this one warning is silenced.
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="`LoggingHandler` in `opentelemetry-sdk` is deprecated",
+            category=DeprecationWarning,
+        )
+        otlp_handler = OtelLoggingHandler(logger_provider=provider)
     otlp_handler.setLevel(logging.DEBUG)
     return otlp_handler
 
