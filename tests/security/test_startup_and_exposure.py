@@ -112,13 +112,13 @@ class TestStartupGuard:
 def _admin_status_in_subprocess(env_overrides: dict[str, str | None]) -> list[int]:
     """Import the real app in a fresh interpreter and request /admin routes.
 
+    ENVIRONMENT=unittest is inherited from the test process.
+
     The TestClient is NOT entered as a context manager, so no lifespan (and no
     database) is needed: an unmounted /admin yields a plain 404.
     """
     code = (
         "from fastapi.testclient import TestClient\n"
-        "from app.common.config import init_settings\n"
-        "init_settings('unittest')\n"
         "from app.main import app\n"
         "c = TestClient(app, follow_redirects=False)\n"
         "print('STATUS', c.get('/admin/login').status_code, c.get('/admin/').status_code)\n"
@@ -243,8 +243,9 @@ class TestHarness:
 
     def test_taskiq_broker_uses_the_redis_container(self):
         from app.common.taskiq import broker  # noqa: F401  (import for side effect check)
-        from app.common.config import settings
+        from app.common.config import get_settings
 
+        settings = get_settings()
         assert settings.TASKIQ_BROKER_URL == os.environ["TASKIQ_BROKER_URL"]
         assert (
             settings.TASKIQ_RESULT_BACKEND_URL
@@ -253,9 +254,9 @@ class TestHarness:
 
     def test_settings_object_is_the_unittest_one(self):
         """app.common.taskiq must not replace the settings with the dev ones."""
-        from app.common.config import settings
+        from app.common.config import get_settings
 
-        assert settings.ENVIRONMENT.value == "unittest"
+        assert get_settings().ENVIRONMENT.value == "unittest"
 
     def test_flush_redis_fixture_empties_the_container(self, flush_redis):
         import redis as redis_sync

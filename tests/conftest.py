@@ -4,9 +4,8 @@ import os
 import sys
 from dataclasses import dataclass
 
-# MUST run before anything imports ``app``: ``app.common.taskiq`` calls
-# ``init_settings(os.getenv("ENVIRONMENT", "dev"))`` at import time and would
-# otherwise replace the test settings with the "dev" ones (reads .env.local).
+# MUST run before anything calls ``get_settings()``: ENVIRONMENT is required
+# (no fallback to dev), and "unittest" never reads .env.local.
 os.environ["ENVIRONMENT"] = "unittest"
 # Admin panel is opt-in outside "dev" (Phase 0 fix 6). The admin tests drive the
 # real sqladmin app, so enable it explicitly for the test process.
@@ -58,6 +57,12 @@ def pytest_configure(config):
     os.environ["TASKIQ_BROKER_URL"] = f"redis://localhost:{redis_port}/1"
     os.environ["TASKIQ_RESULT_BACKEND_URL"] = f"redis://localhost:{redis_port}/2"
 
+    # Settings are cached per process: drop anything read before the
+    # containers' addresses were known.
+    from app.common.config import get_settings
+
+    get_settings.cache_clear()
+
 
 def pytest_unconfigure(config):
     global _pg_container, _redis_container
@@ -74,28 +79,31 @@ def pytest_unconfigure(config):
 
 @pytest.fixture(scope="session", autouse=True)
 def init_db():
-    from app.common.config import init_settings
+    from sqlalchemy import create_engine
 
-    init_settings("unittest")
-
-    import app.common.database as database
+    from app.common.config import get_settings
+    from app.common.logging import setup_logging
+    from app.models import Base
 
     alembic_cfg = Config("alembic.ini")
     alembic_cfg.set_main_option("sqlalchemy.url", os.environ["DATABASE_URL"])
     command.upgrade(alembic_cfg, "head")
 
-    async def _create():
-        async with database.engine.begin() as conn:
-            await conn.run_sync(database.Base.metadata.create_all)
+    # Known issue 2 (create_all after alembic) is removed by the harness rework
+    # (review 2026-11, step 1.3). A short-lived sync engine (psycopg 3) keeps
+    # this off the app's event loops.
+    engine = create_engine(os.environ["DATABASE_URL"])
+    Base.metadata.create_all(engine)
 
-    asyncio.run(_create())
-    yield
-
-    async def _drop():
-        async with database.engine.begin() as conn:
-            await conn.run_sync(database.Base.metadata.drop_all)
-
-    asyncio.run(_drop())
+    # Like a process start: code tested outside a lifespan logs through the
+    # configured structlog/stdlib chain. After alembic, whose fileConfig
+    # replaces the root handlers.
+    setup_logging(get_settings())
+    try:
+        yield
+    finally:
+        Base.metadata.drop_all(engine)
+        engine.dispose()
 
 
 # ---------------------------------------------------------------------------
@@ -148,19 +156,20 @@ def client(init_db, flush_redis):
 def clean_db(init_db):
     yield
 
-    import app.common.database as database
+    from sqlalchemy import create_engine
 
-    async def _truncate():
-        async with database.engine.begin() as conn:
+    engine = create_engine(os.environ["DATABASE_URL"])
+    try:
+        with engine.begin() as conn:
             # CASCADE handles FK ordering automatically.
-            await conn.execute(
+            conn.execute(
                 text(
                     "TRUNCATE auth_audit_log, email_tokens, sessions, "
                     "password_credentials, users CASCADE"
                 )
             )
-
-    asyncio.run(_truncate())
+    finally:
+        engine.dispose()
 
 
 # ---------------------------------------------------------------------------
@@ -275,14 +284,23 @@ def db():
 
 @pytest.fixture
 def deactivate_user():
-    import app.common.database as database
     from sqlalchemy import update
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from sqlalchemy.pool import NullPool
+
     from app.api.auth.models import User
 
     async def _run(username: str):
-        async with database.engine.begin() as conn:
-            await conn.execute(
-                update(User).where(User.username == username).values(is_active=False)
-            )
+        # Own engine: the app's engine lives on the TestClient's event loop.
+        engine = create_async_engine(os.environ["DATABASE_URL"], poolclass=NullPool)
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(
+                    update(User)
+                    .where(User.username == username)
+                    .values(is_active=False)
+                )
+        finally:
+            await engine.dispose()
 
     return _run

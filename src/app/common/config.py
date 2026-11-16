@@ -1,4 +1,13 @@
 # src/app/common/config.py
+"""Application settings.
+
+``get_settings()`` is the only way to obtain the process settings. It reads
+the environment once (cached) and requires ``ENVIRONMENT`` to be set
+explicitly; there is no silent fallback to ``dev``. Only ``dev`` additionally
+reads ``.env.local``; real environment variables always win over that file.
+"""
+
+import os
 from enum import Enum
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError
@@ -32,6 +41,13 @@ def _installed_version() -> str:
         return _UNKNOWN_VERSION
 
 
+class ConfigurationError(RuntimeError):
+    """The process environment does not allow building the settings.
+
+    Messages never contain secret values.
+    """
+
+
 class Environment(str, Enum):
     DEV = "dev"
     TEST = "test"
@@ -41,8 +57,8 @@ class Environment(str, Enum):
 
 
 class Settings(BaseSettings):
-    # Environment
-    ENVIRONMENT: Environment = Environment.DEV
+    # Environment: required, never defaulted (no silent fallback to dev).
+    ENVIRONMENT: Environment
 
     # Database
     DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/api"
@@ -101,7 +117,7 @@ class Settings(BaseSettings):
 
     # Mail Server
     MAIL_USERNAME: Optional[str] = None
-    MAIL_PASSWORD: Optional[str] = None
+    MAIL_PASSWORD: SecretStr | None = None
     MAIL_FROM: Optional[str] = None
     MAIL_PORT: int = 587
     MAIL_SERVER: Optional[str] = None
@@ -179,7 +195,9 @@ class Settings(BaseSettings):
         return self
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        # No dotenv file by default: `.env` is a template with empty values.
+        # get_settings() adds .env.local for ENVIRONMENT=dev only.
+        env_file=None,
         env_file_encoding="utf-8",
         extra="ignore",
         # Validation errors must not echo input values: they contain secrets.
@@ -187,49 +205,53 @@ class Settings(BaseSettings):
     )
 
 
-def get_env_file(env: str | None) -> list[str]:
-    """Get env files to load based on startup mode.
+# Read by get_settings() for ENVIRONMENT=dev only (relative to the working
+# directory, i.e. backend/ when started via run.py or uv run).
+LOCAL_ENV_FILE = Path(".env.local")
+_ENVIRONMENT_VARIABLE = "ENVIRONMENT"
 
-    Only local development reads from .env.local. All other modes rely on
-    environment variables already injected by the runtime.
+
+def environment_from_os() -> Environment:
+    """Return ``ENVIRONMENT`` from the process environment.
+
+    Raises ConfigurationError when it is missing, empty or unknown. It is
+    read from the process environment only, because it decides whether
+    ``.env.local`` is read at all.
     """
-    if env != Environment.DEV.value:
-        return []
-
-    local_env = Path(".env.local")
-    return [str(local_env)] if local_env.exists() else []
-
-
-@lru_cache
-def get_settings(env: str | None = None) -> Settings:
-    """
-    Get settings for the specified environment.
-
-    - env="dev": reads .env.local
-    - env=None or any other mode: expects injected environment variables
-    """
-    env_files = get_env_file(env)
-
-    class _Settings(Settings):
-        model_config = SettingsConfigDict(
-            env_file=tuple(env_files),
-            env_file_encoding="utf-8",
-            extra="ignore",
-            hide_input_in_errors=True,
+    raw = os.environ.get(_ENVIRONMENT_VARIABLE, "").strip()
+    allowed = ", ".join(e.value for e in Environment)
+    if not raw:
+        raise ConfigurationError(
+            f"ENVIRONMENT is not set. Set it to one of: {allowed} "
+            "(for local development: 'python run.py dev')."
         )
-
-    if env is None:
-        return _Settings()
-
-    return _Settings(ENVIRONMENT=Environment(env))
-
-
-def init_settings(env: str | None = None) -> Settings:
-    """Initialize settings with the given environment."""
-    global settings
-    settings = get_settings(env)
-    return settings
+    try:
+        return Environment(raw)
+    except ValueError:
+        raise ConfigurationError(
+            f"ENVIRONMENT={raw!r} is not valid. Expected one of: {allowed}."
+        ) from None
 
 
-# Global settings instance - will be set by app.py
-settings: Settings = None  # type: ignore
+class _DevSettings(Settings):
+    """Settings for ENVIRONMENT=dev: additionally read ``.env.local``.
+
+    pydantic-settings skips a missing file. All other environments rely on
+    variables injected by the runtime (Docker, Swarm, CI, the test harness).
+    """
+
+    model_config = SettingsConfigDict(env_file=LOCAL_ENV_FILE)
+
+
+@lru_cache(maxsize=1)
+def get_settings() -> Settings:
+    """Return the process settings, built once from the environment.
+
+    Priority (pydantic-settings): environment variables > ``.env.local``
+    (dev only) > code defaults. ``ENVIRONMENT`` itself comes from the
+    process environment only. Tests that change the environment call
+    ``get_settings.cache_clear()``.
+    """
+    environment = environment_from_os()
+    settings_class = _DevSettings if environment is Environment.DEV else Settings
+    return settings_class(ENVIRONMENT=environment)

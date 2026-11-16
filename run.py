@@ -1,11 +1,16 @@
 # run.py
 """
-Entry point for the API application.
+Thin launcher for the API (uvicorn on ``app.main:app``).
 
 Usage:
-    python run.py           # Environment injected by Docker/Kubernetes
-    python run.py dev       # Development environment from .env.local
-    python run.py unittest  # Unit testing environment (not for running the server)
+    python run.py           # ENVIRONMENT injected by Docker/Kubernetes
+    python run.py dev       # sets ENVIRONMENT=dev (reads .env.local) and
+                            # also starts a taskiq worker
+    python run.py unittest  # unit testing environment (not for serving)
+
+Settings, logging and resources are handled by the app itself
+(``get_settings()`` and the lifespan); this file only selects the
+environment and starts the processes.
 """
 
 import argparse
@@ -14,14 +19,14 @@ import subprocess
 import sys
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="Run the API server")
     parser.add_argument(
         "env",
         nargs="?",
         default=None,
         choices=["dev", "unittest"],
-        help="Environment mode to run (optional)",
+        help="Environment mode to run (optional; sets ENVIRONMENT)",
     )
     parser.add_argument(
         "--host",
@@ -37,35 +42,36 @@ def main():
     parser.add_argument(
         "--reload",
         action="store_true",
-        default=None,
-        help="Enable auto-reload (default: from settings)",
+        help="Enable auto-reload (development only)",
     )
 
     args = parser.parse_args()
 
-    if args.env is None and not os.getenv("ENVIRONMENT"):
+    # An explicit mode wins over an inherited ENVIRONMENT. Child processes
+    # (uvicorn reloader, taskiq worker) inherit it.
+    if args.env is not None:
+        os.environ["ENVIRONMENT"] = args.env
+    elif not os.environ.get("ENVIRONMENT", "").strip():
         parser.error(
             "No mode provided. Set ENVIRONMENT via Docker/Kubernetes, "
             "or run 'python run.py dev' for local development."
         )
 
-    # Initialize settings BEFORE importing the app
-    from app.common.config import init_settings
-    from app.common.logging import setup_logging
+    from app.common.config import ConfigurationError, get_settings
 
-    settings = init_settings(args.env)
-    setup_logging(settings)
+    try:
+        settings = get_settings()
+    except ConfigurationError as exc:
+        parser.error(str(exc))
 
-    # Now import and run the app
     import uvicorn
 
-    # Use command-line args if provided, otherwise use settings from config
     host = args.host if args.host is not None else settings.HOST
     port = args.port if args.port is not None else settings.PORT
 
     worker_process = None
 
-    # Start Taskiq worker process automatically in development mode.
+    # Start a taskiq worker process automatically in development mode.
     if settings.is_development:
         worker_process = subprocess.Popen(
             [
@@ -84,8 +90,8 @@ def main():
             "app.main:app",
             host=host,
             port=port,
-            reload=False,
-            log_config=None,  # Disable uvicorn's default logging configuration
+            reload=args.reload,
+            log_config=None,  # logging is configured by the app's lifespan
         )
     finally:
         if worker_process is not None and worker_process.poll() is None:

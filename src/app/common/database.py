@@ -1,7 +1,13 @@
 # src/app/common/database.py
 
 """
-Database engine, session factory, and declarative Base for SQLAlchemy 2.0 + asyncpg.
+Database engine, session factory, and declarative Base for SQLAlchemy 2.0.
+
+Nothing is created at import time. ``create_app()`` creates an unbound
+session factory (the admin panel needs it while the app is assembled); the
+lifespan builds the engine with ``build_engine()``, checks it with
+``init_db()`` and binds the factory to it. ``get_db`` reads the factory from
+``request.app.state``.
 
 Usage in routers / services:
     from app.common.dependencies import DbSession
@@ -9,42 +15,43 @@ Usage in routers / services:
     async def my_endpoint(db: DbSession) -> ...
 """
 
-from typing import AsyncGenerator
-from sqlalchemy.engine import make_url
+from collections.abc import AsyncIterator
+
+from fastapi import Request
 from sqlalchemy import text
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
     async_sessionmaker,
     create_async_engine,
 )
-from app.common.models import Base  # noqa: F401 – registers metadata
 
-from app.common.config import settings
+from app.common.config import Settings
 from app.common.logging import get_logger
+from app.common.models import Base
 
-__all__ = ["get_db", "init_db", "close_db", "Base"]
+__all__ = [
+    "Base",
+    "build_engine",
+    "close_db",
+    "create_session_factory",
+    "get_db",
+    "init_db",
+]
 
 logger = get_logger(__name__)
 
+
 # ---------------------------------------------------------------------------
-# Engine – created once, reused for the lifetime of the process
+# Engine and session factory (created by the app factory / lifespan)
 # ---------------------------------------------------------------------------
 
 
-def _build_engine() -> AsyncEngine:
-    """Create the async SQLAlchemy engine from application settings."""
-    url: str = settings.DATABASE_URL
-
-    maked_url = make_url(url)  # validate and parse the URL
-    logger.info(
-        "db.engine_creating", url=maked_url.render_as_string(hide_password=True)
-    )
-
-    # asyncpg requires the postgresql+asyncpg:// scheme
-    # if url.startswith("postgresql://") or url.startswith("postgres://"):
-    #    url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
-    #    url = url.replace("postgres://", "postgresql+asyncpg://", 1)
+def build_engine(settings: Settings) -> AsyncEngine:
+    """Create the async SQLAlchemy engine from *settings* (no I/O yet)."""
+    url = make_url(settings.DATABASE_URL)  # validate and parse the URL
+    logger.info("db.engine_creating", url=url.render_as_string(hide_password=True))
 
     return create_async_engine(
         url,
@@ -56,47 +63,41 @@ def _build_engine() -> AsyncEngine:
         pool_pre_ping=True,  # discard stale connections
         # --- misc ---
         hide_parameters=True,  # keep bound parameters out of SQL error messages
-        echo=False,  # SQL echo only in debug mode
-        future=True,  # SQLAlchemy 2.0 style
+        echo=False,
     )
 
 
-engine: AsyncEngine = _build_engine()
-
-# ---------------------------------------------------------------------------
-# Session factory
-# ---------------------------------------------------------------------------
-
-AsyncSessionFactory: async_sessionmaker[AsyncSession] = async_sessionmaker(
-    bind=engine,
-    class_=AsyncSession,
-    expire_on_commit=False,  # avoid implicit I/O after commit
-    autoflush=False,
-    autocommit=False,
-)
+def create_session_factory(
+    engine: AsyncEngine | None = None,
+) -> async_sessionmaker[AsyncSession]:
+    """Create the session factory; bind it later with ``configure(bind=...)``."""
+    return async_sessionmaker(
+        bind=engine,
+        class_=AsyncSession,
+        expire_on_commit=False,  # avoid implicit I/O after commit
+        autoflush=False,
+    )
 
 
 # ---------------------------------------------------------------------------
-# Lifecycle helpers – called from main.py lifespan
+# Lifecycle helpers – called from the lifespan in main.py
 # ---------------------------------------------------------------------------
 
 
-def _redact_db_secrets(message: str) -> str:
+def _redact_db_secrets(message: str, database_url: str) -> str:
     """Remove the database URL and password from an error message.
 
-    Driver errors (asyncpg, socket errors) can echo DSN fragments; the
-    password must never reach logs or tracebacks.
+    Driver errors (asyncpg, psycopg, socket errors) can echo DSN fragments;
+    the password must never reach logs or tracebacks.
     """
-    url = make_url(settings.DATABASE_URL)
-    masked = message.replace(
-        settings.DATABASE_URL, url.render_as_string(hide_password=True)
-    )
+    url = make_url(database_url)
+    masked = message.replace(database_url, url.render_as_string(hide_password=True))
     if url.password:
         masked = masked.replace(str(url.password), "***")
     return masked
 
 
-async def init_db() -> None:
+async def init_db(engine: AsyncEngine, settings: Settings) -> None:
     """Verify the database is reachable on startup."""
     try:
         async with engine.connect() as conn:
@@ -106,7 +107,7 @@ async def init_db() -> None:
             url=make_url(settings.DATABASE_URL).render_as_string(hide_password=True),
         )
     except Exception as e:
-        error = _redact_db_secrets(str(e))
+        error = _redact_db_secrets(str(e), settings.DATABASE_URL)
         logger.error("db.pool_init_failed", error_type=type(e).__name__, error=error)
         # ``from None``: the chained original exception could print the raw DSN.
         raise RuntimeError(
@@ -114,7 +115,7 @@ async def init_db() -> None:
         ) from None
 
 
-async def close_db() -> None:
+async def close_db(engine: AsyncEngine) -> None:
     """Dispose the engine / connection pool on shutdown."""
     await engine.dispose()
     logger.info("db.pool_closed")
@@ -125,12 +126,14 @@ async def close_db() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def get_db() -> AsyncGenerator[AsyncSession, None]:
-    async with AsyncSessionFactory() as session:
+async def get_db(request: Request) -> AsyncIterator[AsyncSession]:
+    """Yield a session from the factory the lifespan bound to the engine."""
+    session_factory: async_sessionmaker[AsyncSession] = (
+        request.app.state.session_factory
+    )
+    async with session_factory() as session:
         try:
             yield session
         except Exception:
             await session.rollback()
             raise
-        finally:
-            await session.close()

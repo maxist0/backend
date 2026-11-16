@@ -1,10 +1,17 @@
 # src/app/admin.py
 
+"""sqladmin panel, mounted by ``create_app()`` when ``admin_enabled``.
+
+sqladmin stores the session factory on the ModelView classes (class
+attributes), so one admin-enabled app per process is supported.
+"""
+
 import hmac
 import uuid
 
 from fastapi import FastAPI
 from sqlalchemy import and_, update
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqladmin import Admin, ModelView, action
 from sqladmin.authentication import AuthenticationBackend
 from starlette.requests import Request
@@ -19,8 +26,7 @@ from app.api.auth.models import (
     User,
     utcnow,
 )
-from app.common.config import settings
-from app.common.database import AsyncSessionFactory, engine
+from app.common.config import Settings
 from app.common.logging import get_logger
 
 logger = get_logger(__name__)
@@ -47,6 +53,14 @@ def _selected_ids(request: Request) -> list[uuid.UUID]:
     return ids
 
 
+def _session_factory(view: ModelView) -> async_sessionmaker[AsyncSession]:
+    """The async session factory sqladmin assigned to *view* (see create_admin)."""
+    factory = view.session_maker
+    if not isinstance(factory, async_sessionmaker):
+        raise TypeError("the admin panel requires an async session factory")
+    return factory
+
+
 def _back_to_list(request: Request, identity: str) -> RedirectResponse:
     """Redirect to the model's list view: a fixed admin path.
 
@@ -63,17 +77,20 @@ def _back_to_list(request: Request, identity: str) -> RedirectResponse:
 
 
 class AdminAuth(AuthenticationBackend):
+    def __init__(self, settings: Settings) -> None:
+        super().__init__(secret_key=settings.ADMIN_SECRET_KEY.get_secret_value())
+        self._username = settings.ADMIN_USERNAME
+        self._password = settings.ADMIN_PASSWORD
+
     async def login(self, request: Request) -> bool:
         form = await request.form()
         username, password = form.get("username"), form.get("password")
         if not isinstance(username, str) or not isinstance(password, str):
             return False
         # Constant-time comparison of both values (no timing side channel).
-        username_ok = hmac.compare_digest(
-            username.encode(), settings.ADMIN_USERNAME.encode()
-        )
+        username_ok = hmac.compare_digest(username.encode(), self._username.encode())
         password_ok = hmac.compare_digest(
-            password.encode(), settings.ADMIN_PASSWORD.get_secret_value().encode()
+            password.encode(), self._password.get_secret_value().encode()
         )
         if username_ok and password_ok:
             request.session.update({"admin": True})
@@ -134,7 +151,7 @@ class UserAdmin(ModelView, model=User):
         """Lock indefinitely (locked_until NULL) and end all sessions."""
         ids = _selected_ids(request)
         if ids:
-            async with AsyncSessionFactory() as session:
+            async with _session_factory(self)() as session:
                 await session.execute(
                     update(User)
                     .where(User.id.in_(ids))
@@ -156,7 +173,7 @@ class UserAdmin(ModelView, model=User):
     async def unlock_users(self, request: Request) -> Response:
         ids = _selected_ids(request)
         if ids:
-            async with AsyncSessionFactory() as session:
+            async with _session_factory(self)() as session:
                 await session.execute(
                     update(User)
                     .where(User.id.in_(ids))
@@ -183,7 +200,7 @@ class UserAdmin(ModelView, model=User):
         # the API contract and is planned for Roadmap Phase 3.
         ids = _selected_ids(request)
         if ids:
-            async with AsyncSessionFactory() as session:
+            async with _session_factory(self)() as session:
                 await session.execute(
                     update(PasswordCredential)
                     .where(PasswordCredential.user_id.in_(ids))
@@ -204,7 +221,7 @@ class UserAdmin(ModelView, model=User):
         """Deactivate and end all sessions."""
         ids = _selected_ids(request)
         if ids:
-            async with AsyncSessionFactory() as session:
+            async with _session_factory(self)() as session:
                 await session.execute(
                     update(User)
                     .where(User.id.in_(ids))
@@ -309,7 +326,7 @@ class EmailTokenAdmin(ModelView, model=EmailToken):
     async def invalidate_tokens(self, request: Request) -> Response:
         ids = _selected_ids(request)
         if ids:
-            async with AsyncSessionFactory() as session:
+            async with _session_factory(self)() as session:
                 await session.execute(
                     update(EmailToken)
                     .where(
@@ -367,7 +384,7 @@ class SessionAdmin(ModelView, model=Session):
     async def revoke_sessions(self, request: Request) -> Response:
         ids = _selected_ids(request)
         if ids:
-            async with AsyncSessionFactory() as session:
+            async with _session_factory(self)() as session:
                 await session.execute(
                     update(Session)
                     .where(Session.id.in_(ids), Session.is_revoked.is_(False))
@@ -385,7 +402,7 @@ class SessionAdmin(ModelView, model=Session):
     )
     async def revoke_all_expired(self, request: Request) -> Response:
         now = utcnow()
-        async with AsyncSessionFactory() as session:
+        async with _session_factory(self)() as session:
             await session.execute(
                 update(Session)
                 .where(and_(Session.expires_at < now, Session.is_revoked.is_(False)))
@@ -400,11 +417,20 @@ class SessionAdmin(ModelView, model=Session):
 # ---------------------------------------------------------------------------
 
 
-def create_admin(app: FastAPI) -> Admin:
-    auth = AdminAuth(secret_key=settings.ADMIN_SECRET_KEY.get_secret_value())
+def create_admin(
+    app: FastAPI,
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> Admin:
+    """Mount the admin panel on *app*.
+
+    *session_factory* may still be unbound: the lifespan binds it to the
+    engine before the first request.
+    """
+    auth = AdminAuth(settings)
     admin = Admin(
         app,
-        engine,
+        session_maker=session_factory,
         authentication_backend=auth,
         title=f"{settings.APP_NAME} Admin",
     )

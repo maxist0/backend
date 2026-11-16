@@ -12,7 +12,7 @@ from typing import Final
 import jwt
 
 from app.api.auth.schemas import TokenData
-from app.common.config import settings
+from app.common.config import get_settings
 from app.common.logging import get_logger
 
 logger = get_logger(__name__)
@@ -37,7 +37,7 @@ def create_access_token(
     stable across refresh rotation and identifies the caller's session.
     """
     if expires_delta is None:
-        expires_delta = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+        expires_delta = timedelta(minutes=get_settings().ACCESS_TOKEN_EXPIRE_MINUTES)
 
     now = datetime.now(timezone.utc)
     to_encode = {
@@ -53,7 +53,7 @@ def create_access_token(
 
     return jwt.encode(
         to_encode,
-        settings.JWT_SECRET_KEY.get_secret_value(),
+        get_settings().JWT_SECRET_KEY.get_secret_value(),
         algorithm=JWT_ALGORITHM,
     )
 
@@ -76,7 +76,7 @@ def decode_token(token: str) -> TokenData | None:
     try:
         payload = jwt.decode(
             token,
-            settings.JWT_SECRET_KEY.get_secret_value(),
+            get_settings().JWT_SECRET_KEY.get_secret_value(),
             algorithms=[JWT_ALGORITHM],
             options={"require": _REQUIRED_CLAIMS},
         )

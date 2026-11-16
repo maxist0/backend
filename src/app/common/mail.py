@@ -1,3 +1,17 @@
+# src/app/common/mail.py
+
+"""
+Transactional email via fastapi-mail.
+
+The mail client is built lazily on the first send (in practice: in the taskiq
+worker) from ``Settings``; nothing is configured at import time. When the
+``MAIL_*`` settings are incomplete, sending is skipped with a warning.
+"""
+
+from functools import lru_cache
+from pathlib import Path
+from typing import Any
+
 from fastapi_mail import (
     ConnectionConfig,
     FastMail,
@@ -5,69 +19,77 @@ from fastapi_mail import (
     MessageType,
     NameEmail,
 )
-from app.common.config import settings
+
+from app.common.config import Settings, get_settings
 from app.common.logging import get_logger
-from typing import Optional
-from pathlib import Path
-import os
 
 logger = get_logger(__name__)
 
+TEMPLATE_FOLDER = Path(__file__).resolve().parent.parent / "templates" / "email"
 
-def setup_mail() -> Optional[FastMail]:
-    # Check if mail settings are configured; if not, skip mail setup (e.g. for local dev without .env)
-    if not all(
-        [
-            os.getenv("MAIL_USERNAME"),
-            os.getenv("MAIL_PASSWORD"),
-            os.getenv("MAIL_FROM"),
-            os.getenv("MAIL_SERVER"),
-        ]
+
+def build_mail_config(settings: Settings) -> ConnectionConfig | None:
+    """Build the fastapi-mail configuration from *settings*.
+
+    Returns None when username, password, sender or server is missing.
+    """
+    password = settings.MAIL_PASSWORD
+    if not (
+        settings.MAIL_USERNAME
+        and password is not None
+        and password.get_secret_value()
+        and settings.MAIL_FROM
+        and settings.MAIL_SERVER
     ):
-        logger.warning("Mail settings not fully configured; skipping mail setup.")
         return None
-    template_folder = Path(__file__).parent.parent / "templates" / "email"
-    mail_config = ConnectionConfig(
-        MAIL_USERNAME=os.getenv("MAIL_USERNAME"),  # type: ignore[arg-type]
-        MAIL_PASSWORD=os.getenv("MAIL_PASSWORD"),  # type: ignore[arg-type]
-        MAIL_FROM=os.getenv("MAIL_FROM"),  # type: ignore[arg-type]
-        MAIL_PORT=int(os.getenv("MAIL_PORT", 587)),
-        MAIL_SERVER=os.getenv("MAIL_SERVER"),  # type: ignore[arg-type]
-        MAIL_STARTTLS=True,
+    return ConnectionConfig(
+        MAIL_USERNAME=settings.MAIL_USERNAME,
+        MAIL_PASSWORD=password,
+        MAIL_FROM=settings.MAIL_FROM,
+        MAIL_PORT=settings.MAIL_PORT,
+        MAIL_SERVER=settings.MAIL_SERVER,
+        MAIL_STARTTLS=settings.MAIL_STARTTLS,
         MAIL_SSL_TLS=False,
         USE_CREDENTIALS=True,
-        TEMPLATE_FOLDER=template_folder,
+        TEMPLATE_FOLDER=TEMPLATE_FOLDER,
     )
+
+
+@lru_cache(maxsize=1)
+def get_mailer() -> FastMail | None:
+    """Return the process-wide mail client, built on first use (or None)."""
+    config = build_mail_config(get_settings())
+    if config is None:
+        logger.warning("mail.not_configured")
+        return None
+    # Server and port only: the username is often an email address (PII).
     logger.info(
-        "Mail configuration set up successfully.",
-        server=os.getenv("MAIL_SERVER"),
-        port=os.getenv("MAIL_PORT", 587),
-        starttls=True,
-        ssl_tls=mail_config.MAIL_SSL_TLS,
-        use_credentials=mail_config.USE_CREDENTIALS,
-        template_folder=template_folder,
+        "mail.configured",
+        server=config.MAIL_SERVER,
+        port=config.MAIL_PORT,
+        starttls=config.MAIL_STARTTLS,
     )
-    fm = FastMail(mail_config)
-    return fm
-
-
-# Module-level singleton – imported by email_tasks and other consumers
-fm: Optional[FastMail] = setup_mail()
+    return FastMail(config)
 
 
 async def send_templated_email(
-    to: str, subject: str, template_name: str, context: dict
+    to: str,
+    subject: str,
+    template_name: str,
+    # Any: arbitrary Jinja2 template variables.
+    context: dict[str, Any],
 ) -> None:
-    """Render *template_name* with *context* via fastapi-mail's Jinja2 integration and send it."""
-    if fm is None:
-        logger.warning("FastMail not configured; skipping email.", subject=subject)
+    """Render *template_name* with *context* via fastapi-mail and send it."""
+    mailer = get_mailer()
+    if mailer is None:
+        logger.warning("mail.skipped_not_configured", template=template_name)
         return
-    context.setdefault("app_name", settings.APP_NAME)
-    _to = NameEmail(name=context.get("username", ""), email=to)
+    context.setdefault("app_name", get_settings().APP_NAME)
+    recipient = NameEmail(name=context.get("username", ""), email=to)
     message = MessageSchema(
         subject=subject,
-        recipients=[_to],
+        recipients=[recipient],
         template_body=context,
         subtype=MessageType.html,
     )
-    await fm.send_message(message, template_name=template_name)
+    await mailer.send_message(message, template_name=template_name)

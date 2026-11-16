@@ -23,6 +23,7 @@ Architecture
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 import socket
 import sys
@@ -99,6 +100,20 @@ def _build_otlp_handler(settings: "Settings") -> logging.Handler | None:
     return otlp_handler
 
 
+def _console_colors() -> bool:
+    """Colour the console renderer only on a TTY that can show colours.
+
+    Container logs (no TTY) stay free of ANSI codes. On Windows, structlog
+    needs colorama for colours and raises without it, so colours are only
+    enabled when colorama is importable.
+    """
+    if not sys.stdout.isatty():
+        return False
+    if sys.platform == "win32":
+        return importlib.util.find_spec("colorama") is not None
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Shared structlog processor chain
 # ---------------------------------------------------------------------------
@@ -144,7 +159,9 @@ def setup_logging(settings: "Settings") -> None:
     Logs are written to stdout only.  When OTLP_LOGS_ENABLED is True,
     records are additionally pushed to an OTLP/HTTP endpoint (Grafana Alloy).
 
-    Call once at application start-up (before any log calls).
+    Called once per process: by the lifespan (API) and by the taskiq
+    ``WORKER_STARTUP`` hook (worker). Safe to call again (the test suite
+    runs one lifespan per test): handlers are replaced, not added.
     """
     log_level_int = getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO)
 
@@ -177,7 +194,7 @@ def setup_logging(settings: "Settings") -> None:
     console_formatter = structlog.stdlib.ProcessorFormatter(
         processors=[
             structlog.stdlib.ProcessorFormatter.remove_processors_meta,
-            structlog.dev.ConsoleRenderer(colors=True),
+            structlog.dev.ConsoleRenderer(colors=_console_colors()),
         ],
         foreign_pre_chain=_SHARED_PROCESSORS,
     )

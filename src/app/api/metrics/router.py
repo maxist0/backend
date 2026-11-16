@@ -6,8 +6,8 @@ Metrics API endpoints.
 from datetime import datetime
 from fastapi import APIRouter, Response, Request
 from app.common.metrics import get_metrics, get_metrics_content_type
+from app.common.dependencies import SettingsDep
 from app.common.responses import ok_response, SuccessResponse
-from app.common.config import settings
 import os
 
 router = APIRouter()
@@ -25,7 +25,7 @@ async def metrics(request: Request):
 
 
 @router.get("/health", response_model=SuccessResponse)
-async def health_check(request: Request):
+async def health_check(request: Request, settings: SettingsDep):
     """
     Health check endpoint with standardized response.
 

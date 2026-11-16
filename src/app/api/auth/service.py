@@ -36,7 +36,7 @@ from app.api.auth.models import (
     utcnow,
 )
 from app.api.auth.schemas import UserResponse
-from app.common.config import settings
+from app.common.config import get_settings
 from app.common.constants import MAXIMUM_LOGIN_ATTEMPTS, LOGIN_ATTEMPT_WINDOW_SECONDS
 from app.common.db_errors import constraint_name
 from app.common.logging import get_logger
@@ -75,7 +75,7 @@ def _password_hash_limiter() -> anyio.CapacityLimiter:
     try:
         return _password_hash_limiter_var.get()
     except LookupError:
-        limiter = anyio.CapacityLimiter(settings.PASSWORD_HASH_CONCURRENCY)
+        limiter = anyio.CapacityLimiter(get_settings().PASSWORD_HASH_CONCURRENCY)
         _password_hash_limiter_var.set(limiter)
         return limiter
 
@@ -97,7 +97,7 @@ def _login_admission_limiter() -> anyio.CapacityLimiter:
     try:
         return _login_admission_limiter_var.get()
     except LookupError:
-        limiter = anyio.CapacityLimiter(settings.PASSWORD_HASH_CONCURRENCY)
+        limiter = anyio.CapacityLimiter(get_settings().PASSWORD_HASH_CONCURRENCY)
         _login_admission_limiter_var.set(limiter)
         return limiter
 
@@ -105,6 +105,7 @@ def _login_admission_limiter() -> anyio.CapacityLimiter:
 @lru_cache(maxsize=1)
 def _password_hasher() -> PasswordHasher:
     """Argon2id hasher configured from Settings (created on first use)."""
+    settings = get_settings()
     return PasswordHasher(
         time_cost=settings.ARGON2_TIME_COST,
         memory_cost=settings.ARGON2_MEMORY_KIB,
@@ -506,7 +507,7 @@ async def create_session_tokens(
         user_id=user.id,
         token_hash=hash_token(raw_refresh),
         family_id=fam_id,
-        expires_at=utcnow() + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS),
+        expires_at=utcnow() + timedelta(days=get_settings().REFRESH_TOKEN_EXPIRE_DAYS),
         device_id=_bounded_header(request, "x-device-id", _DEVICE_HEADER_MAX_LENGTH),
         device_name=_bounded_header(
             request, "x-device-name", _DEVICE_HEADER_MAX_LENGTH

@@ -82,7 +82,15 @@ lint = [
 dev = [
     { include-group = "test" },
     { include-group = "lint" },
+    # `fastapi dev` / `fastapi run` for local use (reads [tool.fastapi]). Plain
+    # fastapi-cli, not fastapi[standard]: that extra also pulls
+    # fastapi-cloud-cli, fastar and pydantic-extra-types. Images start via run.py.
+    "fastapi-cli>=0.0.34",
 ]
+
+[tool.fastapi]
+# Import string for `fastapi dev` / `fastapi run` (requires ENVIRONMENT).
+entrypoint = "app.main:app"
 
 [[tool.mypy.overrides]]
 module = [

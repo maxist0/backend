@@ -2,50 +2,64 @@
 
 """
 Cache management module.
-This module provides Redis connection management and fastapi-cache2 integration.
-All Redis-related setup lives here; other modules can build on the client
-as needed.
+
+Redis client and cashews route-cache setup. Nothing connects at import time:
+the lifespan in main.py calls ``init_cache_pool()`` and ``init_route_cache()``
+and closes both on shutdown.
 """
 
-from typing import Optional
-import redis.asyncio as redis  # type: ignore
-from cashews import cache as route_cache
-from fastapi import Request
 from urllib.parse import quote_plus
 
-from app.common.config import settings
+import redis.asyncio as redis
+from cashews import cache as route_cache
+from fastapi import Request
+
+from app.common.config import Settings
 from app.common.logging import get_logger
 
 logger = get_logger(__name__)
 
 
-async def get_cache_connection(request: Request) -> Optional[redis.Redis]:
+async def get_cache_connection(request: Request) -> redis.Redis | None:
     """Dependency to get the Redis client stored on app state."""
-    return request.app.state.cache
+    client: redis.Redis | None = getattr(request.app.state, "cache", None)
+    return client
 
 
-async def init_cache_pool() -> redis.Redis:
-    """Create and verify the async Redis connection pool, return the client."""
-    pool = redis.ConnectionPool(
+async def init_cache_pool(settings: Settings) -> redis.Redis:
+    """Create and verify the async Redis client, return it.
+
+    The client owns its connection pool, so ``close_cache_pool()`` (``aclose``)
+    also disconnects the pool. On a failed ping the client is closed before
+    the error propagates.
+    """
+    client = redis.Redis(
         host=settings.CACHE_HOST,
         port=settings.CACHE_PORT,
         db=settings.CACHE_DB,
         password=settings.CACHE_PASSWORD,
         max_connections=settings.CACHE_MAX_CONNECTIONS,
     )
-    client = redis.Redis(connection_pool=pool)
     try:
+        # redis-py types ping() for sync and async clients alike.
         await client.ping()  # type: ignore[misc]
     except redis.RedisError as e:
-        logger.error("cache.connect_failed", error=str(e))
+        await client.aclose()
+        logger.error("cache.connect_failed", error_type=type(e).__name__)
         raise
 
     logger.info("cache.pool_init")
     return client
 
 
-def init_fastapi_cache() -> None:
-    """Initialise cashews cache used by route decorators and cache middlewares."""
+async def close_cache_pool(client: redis.Redis) -> None:
+    """Close the Redis client and its connection pool."""
+    await client.aclose()
+    logger.info("cache.pool_closed")
+
+
+def init_route_cache(settings: Settings) -> None:
+    """Initialise the cashews cache used by route decorators and middlewares."""
     if not settings.ROUTE_CACHE_ENABLED:
         logger.info("cache.route_cache_disabled")
         return
@@ -63,8 +77,8 @@ def init_fastapi_cache() -> None:
     )
 
 
-async def close_fastapi_cache() -> None:
-    """Close cashews cache backend on shutdown."""
+async def close_route_cache(settings: Settings) -> None:
+    """Close the cashews cache backend on shutdown."""
     if not settings.ROUTE_CACHE_ENABLED:
         return
     await route_cache.close()

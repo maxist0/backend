@@ -1,62 +1,80 @@
 # alembic/env.py
 """
-Alembic environment for async (asyncpg) migrations.
+Alembic environment for async migrations.
+
+The database URL comes from ``DATABASE_URL`` only. With ``ENVIRONMENT=dev``
+a missing variable is filled from ``.env.local`` (``override=False``: injected
+variables always win). No fallback to dev: without ``ENVIRONMENT=dev`` the
+file is never read. The application settings are not built here, so a
+migration job needs no application secrets.
 
 Run autogenerate:
-    alembic revision --autogenerate -m "description"
+    ENVIRONMENT=dev alembic revision --autogenerate -m "description"
 
 Apply migrations:
-    alembic upgrade head
-    alembic -x env=test upgrade head
+    ENVIRONMENT=dev alembic upgrade head
+    DATABASE_URL=postgresql+asyncpg://... alembic upgrade head
 
 Downgrade one step:
-    alembic downgrade -1
+    ENVIRONMENT=dev alembic downgrade -1
 """
 
 import asyncio
-from logging.config import fileConfig
+import logging
 import os
+from logging.config import fileConfig
 
 from alembic import context
+from dotenv import load_dotenv
 from sqlalchemy import pool
 from sqlalchemy.engine import Connection, make_url
 from sqlalchemy.ext.asyncio import create_async_engine
 
-# ── Import the project's declarative Base so Alembic can detect schema changes.
-# Add additional model modules here as the project grows.
-from app.common.models import Base  # noqa: F401 – registers metadata
-from dotenv import load_dotenv
+from app.common.config import LOCAL_ENV_FILE, Environment
+
+# The model registry imports every feature's models, so the metadata holds
+# all tables (autogenerate must never see an empty metadata).
+from app.models import Base
+
+
+class MigrationConfigError(RuntimeError):
+    """The environment does not name a database to migrate."""
+
 
 # ---------------------------------------------------------------------------
 # Alembic Config object – gives access to values in alembic.ini
 # ---------------------------------------------------------------------------
 config = context.config
 
-
-_env_file = ".env.local"
-
-# Only local development reads .env.local (mirrors app.common.config.get_env_file).
-# override=False: variables injected by the runtime or the test harness always win.
-if os.getenv("ENVIRONMENT", "dev") == "dev" and os.path.exists(_env_file):
-    load_dotenv(_env_file, override=False)
-
-# Inject the live DATABASE_URL so we never hard-code it in alembic.ini
-_url = os.getenv("DATABASE_URL")
-assert _url, "DATABASE_URL environment variable must be set for Alembic migrations"
-
-print(
-    "[alembic] Using DATABASE_URL: "
-    f"{make_url(_url).render_as_string(hide_password=True)}"
-)
-
-if _url.startswith("postgresql://") or _url.startswith("postgres://"):
-    _url = _url.replace("postgresql://", "postgresql+asyncpg://", 1)
-    _url = _url.replace("postgres://", "postgresql+asyncpg://", 1)
-config.set_main_option("sqlalchemy.url", _url)
-
 # Set up Python logging from alembic.ini [loggers] section
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
+
+logger = logging.getLogger("alembic.env")
+
+
+def _database_url() -> str:
+    """Resolve the migration URL (see module docstring)."""
+    environment = os.environ.get("ENVIRONMENT", "").strip()
+    if environment == Environment.DEV.value and LOCAL_ENV_FILE.exists():
+        load_dotenv(LOCAL_ENV_FILE, override=False)
+
+    url = os.environ.get("DATABASE_URL", "").strip()
+    if not url:
+        raise MigrationConfigError(
+            "DATABASE_URL is not set. Export it, or set ENVIRONMENT=dev to "
+            "read it from .env.local."
+        )
+    if url.startswith("postgresql://") or url.startswith("postgres://"):
+        url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
+        url = url.replace("postgres://", "postgresql+asyncpg://", 1)
+    return url
+
+
+_url = _database_url()
+logger.info(
+    "Using DATABASE_URL %s", make_url(_url).render_as_string(hide_password=True)
+)
 
 # Metadata that Alembic inspects for autogenerate
 target_metadata = Base.metadata
@@ -68,9 +86,8 @@ target_metadata = Base.metadata
 
 def run_migrations_offline() -> None:
     """Generate SQL scripts without a live connection."""
-    url = config.get_main_option("sqlalchemy.url")
     context.configure(
-        url=url,
+        url=_url,
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
@@ -100,7 +117,7 @@ def do_run_migrations(connection: Connection) -> None:
 async def run_async_migrations() -> None:
     """Create an async engine and run migrations inside a sync wrapper."""
     connectable = create_async_engine(
-        config.get_main_option("sqlalchemy.url"),  # type: ignore[arg-type]
+        _url,
         poolclass=pool.NullPool,  # no pool needed for one-shot migration runs
     )
 
@@ -122,4 +139,4 @@ if context.is_offline_mode():
 else:
     run_migrations_online()
 
-print("[alembic] Migration complete")
+logger.info("Migration complete")

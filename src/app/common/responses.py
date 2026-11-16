@@ -14,7 +14,7 @@ from .schemas import (
     ErrorCode,
     ResponseMetadata,
 )
-from .config import settings
+from .config import get_settings
 
 
 def create_response_metadata(
@@ -23,7 +23,7 @@ def create_response_metadata(
     """Create response metadata with optional request information."""
     metadata_dict: dict[str, Any] = {
         "request_id": str(uuid.uuid4()),
-        "version": settings.APP_VERSION,
+        "version": get_settings().APP_VERSION,
     }
 
     if start_time is not None:

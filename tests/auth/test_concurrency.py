@@ -329,7 +329,9 @@ class TestLoginBurst:
         after the Argon2 slot wait (or the attempt to be reserved atomically
         before the verify) plus the conditional success UPDATE.
         """
-        from app.common.config import settings
+        from app.common.config import get_settings
+
+        settings = get_settings()
 
         _alice(client)
         burst, correct_index = 30, 0

@@ -2,7 +2,7 @@
 
 """Taskiq tasks for transactional emails."""
 
-from app.common.config import settings
+from app.common.config import get_settings
 from app.common.logging import get_logger
 from app.common.mail import send_templated_email
 from app.common.taskiq import broker
@@ -16,7 +16,7 @@ logger = get_logger(__name__)
 )
 async def send_verification_email_task(to: str, username: str, token: str) -> None:
     """Dispatch an email-verification message to *to*."""
-    verify_url = f"{settings.FRONTEND_URL}/auth/verify-email?token={token}"
+    verify_url = f"{get_settings().FRONTEND_URL}/auth/verify-email?token={token}"
     context = {
         "username": username,
         "token": token,

@@ -531,9 +531,9 @@ class TestEmailTokensSingleUse:
 
 
 def _secret() -> str:
-    from app.common.config import settings
+    from app.common.config import get_settings
 
-    return secret_value(settings.JWT_SECRET_KEY)
+    return secret_value(get_settings().JWT_SECRET_KEY)
 
 
 def _call_me(client, token: str):
@@ -801,28 +801,38 @@ class TestLoggingHygiene:
         assert "SUPERSECRETQUERY" not in text
         assert "SECRETREFERER" not in text
 
-    def test_database_url_password_is_not_logged(self, monkeypatch, caplog):
+    def test_database_url_password_is_not_logged(self, caplog):
         """GUARD (fixed in step A, K3): engine creation and init_db logs."""
         import asyncio
+        import os
 
         import app.common.database as database
-        from app.common.config import settings
+        from app.common.config import get_settings
 
+        from sqlalchemy.engine import make_url
+
+        # The real test database with a wrong password: fails fast (an
+        # unreachable port takes minutes on Windows) and the driver error
+        # is a real authentication failure.
         password = "S3cr3tPw-Zq91xx"
-        monkeypatch.setattr(
-            settings,
-            "DATABASE_URL",
-            f"postgresql+psycopg://dbuser:{password}@localhost:1/db",
+        url = make_url(os.environ["DATABASE_URL"]).set(password=password)
+        settings = get_settings().model_copy(
+            update={"DATABASE_URL": url.render_as_string(hide_password=False)}
         )
         caplog.set_level(logging.DEBUG)
 
-        engine = database._build_engine()  # logs db.engine_creating
-        asyncio.run(engine.dispose())
-        try:
-            asyncio.run(database.init_db())  # uses the real engine, logs the URL
-        except RuntimeError:
-            pass
+        engine = database.build_engine(settings)  # logs db.engine_creating
 
+        async def _init_and_dispose() -> None:
+            try:
+                await database.init_db(engine, settings)  # fails, logs redacted
+            finally:
+                await engine.dispose()
+
+        with pytest.raises(RuntimeError) as raised:
+            asyncio.run(_init_and_dispose())
+
+        assert password not in str(raised.value)
         text = _log_text(caplog)
         assert caplog.records
         assert password not in text
