@@ -1,5 +1,7 @@
 # Authentication System
 
+> **Status (2026-11-16):** this page is partly stale. Paths, response bodies and token formats below predate the review. The current behaviour is described in [README.md → Authentication design](../README.md#authentication-design) and [Security posture](../README.md#security-posture). Corrected in this page: refresh tokens (Postgres only), replay detection, session revocation, `logout-all`, password hashing settings.
+
 ## Overview
 
 This application implements a comprehensive, production-ready authentication system with:
@@ -34,13 +36,16 @@ User Email Verification
 User Login (Password)
   ├─ POST /api/auth/login (username/email, password)
   ├─ Find user by username or email
-  ├─ Check if account is locked (failed_login_attempts > 5)
+  ├─ Check if account is locked (timed lock or admin lock)
   │  └─ If locked and locked_until < now: unlock
   │  └─ If still locked: reject with "account locked" error
+  ├─ Wait for the admission limiter (PASSWORD_HASH_CONCURRENCY per process), then re-check the lock
   ├─ Verify password hash matches
-  ├─ If password invalid: increment failed_login_attempts
-  │  └─ If >= 5: set is_locked=true, locked_until=now+30min
-  ├─ If password valid: reset failed_login_attempts=0
+  ├─ If password invalid: increment failed_login_attempts (atomic)
+  │  └─ If >= MAXIMUM_LOGIN_ATTEMPTS (5): set is_locked=true,
+  │     locked_until=now+LOGIN_ATTEMPT_WINDOW_SECONDS (timed lock)
+  ├─ If password valid: conditional atomic UPDATE resets failed_login_attempts=0
+  │  (refused if a lock was committed meanwhile)
   ├─ Create session with token family
   ├─ Generate JWT access + refresh tokens
   ├─ Store session in database
@@ -52,12 +57,11 @@ Auto-Refresh (Access Token Expires)
   ├─ GET /api/user (Authorization: Bearer expired_token)
   ├─ Check raises InvalidTokenError
   ├─ Client detects: POST /api/auth/refresh (refresh_token)
-  ├─ Verify refresh_token hash in sessions table
-  ├─ Check session not revoked, not expired
-  ├─ Verify family_id unchanged (detect replay attacks)
-  │  └─ If family_id changed: revoke all sessions
-  ├─ Generate new access_token + refresh_token with new family_id
-  ├─ Update session record
+  ├─ Atomic UPDATE ... RETURNING on the session row (sessions table, Postgres only)
+  │  └─ matches only if not revoked and not expired
+  ├─ If the token was already rotated or revoked: reuse detected, revoke the whole family
+  ├─ If the user is inactive or admin-locked: refresh denied, family revoked (a timed lock does not affect refresh)
+  ├─ Issue new access_token + refresh_token in the same family
   └─ Return: new access_token, new refresh_token
 
 Logout
@@ -102,9 +106,9 @@ See [database_schemas/user.md](database_schemas/user.md) for complete schema.
 Key fields:
 - `is_active`: Whether account is operational
 - `is_email_verified`: Email verification status
-- `is_locked`: Account locked due to brute force
+- `is_locked`: Account locked (timed lock after failed logins, or admin lock)
 - `failed_login_attempts`: Counter (reset on successful login)
-- `locked_until`: Unlock timestamp
+- `locked_until`: Unlock timestamp of a timed lock; NULL with `is_locked` means an indefinite admin lock
 
 ### Session Model
 
@@ -366,7 +370,12 @@ hasher.verify(hash, "WrongPassword")       # Raises VerifyMismatchError
 
 Settings in [src/common/config.py](../src/common/config.py):
 ```python
-BCRYPT_ROUNDS=12  # Actually Argon2 parameters
+ARGON2_TIME_COST=3          # default
+ARGON2_MEMORY_KIB=65536     # default (64 MiB)
+ARGON2_PARALLELISM=4        # default
+PASSWORD_HASH_CONCURRENCY=4 # max concurrent hashes per process
+# BCRYPT_ROUNDS was removed; it never applied to Argon2.
+# Hashing runs in a thread pool; hashes with old parameters are rehashed on login.
 ```
 
 ### Token Hashing
@@ -389,46 +398,69 @@ session = db.get(Session).filter_by(token_hash=incoming_hash).first()
 
 ### Token Rotation & Replay Detection
 
-Prevents refresh token replay attacks:
+Refresh tokens are opaque random strings, stored only as SHA-256 hashes in the `sessions` table. Redis holds no refresh tokens.
 
 ```
-Initial Login
-├─ Create session with family_id=UUID1
-├─ Issue access_token, refresh_token (JWT)
-└─ tokens include family_id claim
+Login
+├─ Create a session row with family_id=F
+└─ Issue access token (claim sid=F) and an opaque refresh token
 
-First Refresh
-├─ Receive refresh_token with family_id=UUID1
-├─ Verify family_id unchanged
-├─ Create NEW family_id=UUID2
-├─ Issue new tokens with family_id=UUID2
-└─ Old refresh_token cannot be used again
+Refresh (valid token)
+├─ Atomic UPDATE ... RETURNING marks the session row rotated
+│  (only matches while not revoked and not expired)
+└─ Issue a new pair in the same family F
 
-Replay Attack Detected
-├─ Attacker replays old refresh_token with family_id=UUID1
-├─ Server finds session with family_id=UUID1
-├─ But token family changed to UUID2 (last legitimate refresh)
-├─ REVOKE ALL SESSIONS for this user
-└─ User must re-login
+Reuse (token already rotated or revoked)
+├─ The UPDATE matches no row
+├─ Revoke every session in family F
+└─ The client must log in again
+   (two concurrent refreshes of the same token count as reuse)
+
+Refresh for an inactive or admin-locked user
+└─ Denied, family revoked
+   (a timed lock from failed logins does not deny refresh)
+
+Concurrency
+└─ Refresh and bulk revocations take a row lock on users (FOR NO KEY UPDATE) first,
+   so a revocation always sees the successor session of a parallel refresh
+   (lock order: email_tokens → users → sessions)
 ```
+
+### Session Revocation
+
+| Event | Effect |
+|---|---|
+| `POST /auth/logout` | revokes the current session |
+| `POST /auth/logout-all` (bearer) | revokes all sessions of the user and clears the cookie |
+| Password reset | revokes all sessions |
+| Password change | revokes all sessions except the caller's (`sid` claim) |
+| Reuse of a rotated refresh token | revokes the whole family |
+
+Access tokens already issued stay valid until they expire (15 minutes), except for admin-locked users, who get 401.
 
 ### Brute-Force Protection
 
+There are two kinds of lock. See [README.md → Authentication design](../README.md#authentication-design) for the full comparison.
+
+- **Timed lock:** set after `MAXIMUM_LOGIN_ATTEMPTS` (5) failed logins, for `LOGIN_ATTEMPT_WINDOW_SECONDS` (900 s, `src/common/constants.py`). It blocks only password login. Existing sessions, access tokens and refresh stay valid, so a stranger cannot log a user out by guessing passwords.
+- **Admin lock:** `is_locked` with `locked_until` NULL. Access tokens get 401, refresh is denied, and the admin action "Lock selected" revokes all sessions.
+
 ```python
-MAX_LOGIN_ATTEMPTS = 5
-LOCKOUT_DURATION = 30  # minutes
-
-# Login failure
+# Login failure (one atomic UPDATE in crud.register_failed_login)
 user.failed_login_attempts += 1
-if user.failed_login_attempts >= MAX_LOGIN_ATTEMPTS:
+if user.failed_login_attempts >= MAXIMUM_LOGIN_ATTEMPTS:
     user.is_locked = True
-    user.locked_until = now() + timedelta(minutes=LOCKOUT_DURATION)
+    user.locked_until = now() + timedelta(seconds=LOGIN_ATTEMPT_WINDOW_SECONDS)
 
-# Login success
+# Login success (one conditional UPDATE in crud.record_successful_login)
+# applies only if no lock is active:
+#   is_locked and (locked_until is NULL or locked_until > now())
 user.failed_login_attempts = 0
-if user.is_locked and user.locked_until < now():
-    user.is_locked = False
+user.is_locked = False
+user.locked_until = None
 ```
+
+Per process, at most `PASSWORD_HASH_CONCURRENCY` password evaluations run at once, and the lock is re-checked after admission. This bounds a login burst but does not replace rate limiting (open decision D4).
 
 ## Security Best Practices
 

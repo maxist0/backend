@@ -19,7 +19,7 @@ import os
 
 from alembic import context
 from sqlalchemy import pool
-from sqlalchemy.engine import Connection
+from sqlalchemy.engine import Connection, make_url
 from sqlalchemy.ext.asyncio import create_async_engine
 
 # ── Import the project's declarative Base so Alembic can detect schema changes.
@@ -35,18 +35,19 @@ config = context.config
 
 _env_file = ".env.local"
 
-if os.path.exists(_env_file):
-    load_dotenv(_env_file, override=True)
-    print(f"[alembic] Loaded {_env_file}")
-else:
-    print(f"[alembic] {_env_file} not found – falling back to injecting DATABASE_URL from environment")
+# Only local development reads .env.local (mirrors src.common.config.get_env_file).
+# override=False: variables injected by the runtime or the test harness always win.
+if os.getenv("ENVIRONMENT", "dev") == "dev" and os.path.exists(_env_file):
+    load_dotenv(_env_file, override=False)
 
 # Inject the live DATABASE_URL so we never hard-code it in alembic.ini
-## Get database from .env
 _url = os.getenv("DATABASE_URL")
 assert _url, "DATABASE_URL environment variable must be set for Alembic migrations"
 
-print(f"[alembic] Using DATABASE_URL: {_url}")
+print(
+    "[alembic] Using DATABASE_URL: "
+    f"{make_url(_url).render_as_string(hide_password=True)}"
+)
 
 if _url.startswith("postgresql://") or _url.startswith("postgres://"):
     _url = _url.replace("postgresql://", "postgresql+asyncpg://", 1)

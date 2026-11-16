@@ -55,6 +55,7 @@ def _build_engine() -> AsyncEngine:
         pool_recycle=settings.DB_POOL_RECYCLE,
         pool_pre_ping=True,  # discard stale connections
         # --- misc ---
+        hide_parameters=True,  # keep bound parameters out of SQL error messages
         echo=False,  # SQL echo only in debug mode
         future=True,  # SQLAlchemy 2.0 style
     )
@@ -80,15 +81,37 @@ AsyncSessionFactory: async_sessionmaker[AsyncSession] = async_sessionmaker(
 # ---------------------------------------------------------------------------
 
 
+def _redact_db_secrets(message: str) -> str:
+    """Remove the database URL and password from an error message.
+
+    Driver errors (asyncpg, socket errors) can echo DSN fragments; the
+    password must never reach logs or tracebacks.
+    """
+    url = make_url(settings.DATABASE_URL)
+    masked = message.replace(
+        settings.DATABASE_URL, url.render_as_string(hide_password=True)
+    )
+    if url.password:
+        masked = masked.replace(str(url.password), "***")
+    return masked
+
+
 async def init_db() -> None:
     """Verify the database is reachable on startup."""
     try:
         async with engine.connect() as conn:
             await conn.execute(text("SELECT 1"))
-        logger.info("db.pool_init", url=settings.DATABASE_URL)
+        logger.info(
+            "db.pool_init",
+            url=make_url(settings.DATABASE_URL).render_as_string(hide_password=True),
+        )
     except Exception as e:
-        logger.error("db.pool_init_failed", error=str(e), exc_info=True)
-        raise RuntimeError(f"Database connection failed: {e}") from e
+        error = _redact_db_secrets(str(e))
+        logger.error("db.pool_init_failed", error_type=type(e).__name__, error=error)
+        # ``from None``: the chained original exception could print the raw DSN.
+        raise RuntimeError(
+            f"Database connection failed ({type(e).__name__}): {error}"
+        ) from None
 
 
 async def close_db() -> None:

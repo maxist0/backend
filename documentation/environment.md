@@ -1,5 +1,7 @@
 # Environment Configuration
 
+> **Status (2026-11-16):** this page is partly stale. The authoritative configuration table is [README.md → Configuration](../README.md#configuration). Corrected here: `JWT_ALGORITHM` and `BCRYPT_ROUNDS` were removed; new settings `ADMIN_ENABLED`, `ARGON2_*`, `PASSWORD_HASH_CONCURRENCY`; the startup guard. Outside `dev` and `unittest` the application refuses to start when `JWT_SECRET_KEY` is the default or shorter than 32 characters, and (with the admin panel enabled) when `ADMIN_PASSWORD` or `ADMIN_SECRET_KEY` are defaults. `docker stack deploy` needs `JWT_SECRET_KEY` exported in the deploy shell and does not read `.env`.
+
 ## Overview
 
 The application supports **four deployment environments**, each with distinct configurations:
@@ -54,13 +56,18 @@ CACHE_DB=0
 CACHE_MAX_CONNECTIONS=10
 CACHE_KEY_PREFIX=fastapi-cache
 
-# JWT
-JWT_ALGORITHM=HS256
+# JWT (algorithm HS256 is pinned in code; JWT_ALGORITHM was removed)
 ACCESS_TOKEN_EXPIRE_MINUTES=15
 REFRESH_TOKEN_EXPIRE_DAYS=30
 
-# Password hashing
-BCRYPT_ROUNDS=12
+# Password hashing (Argon2id; BCRYPT_ROUNDS was removed)
+ARGON2_TIME_COST=3
+ARGON2_MEMORY_KIB=65536
+ARGON2_PARALLELISM=4
+PASSWORD_HASH_CONCURRENCY=4
+
+# Admin panel: unset = enabled only in dev
+# ADMIN_ENABLED=false
 
 # Server
 HOST=0.0.0.0

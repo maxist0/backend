@@ -30,6 +30,8 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from src.common.db_errors import constraint_name, find_db_error, sqlstate
+
 if TYPE_CHECKING:
     from src.common.config import Settings
 
@@ -279,3 +281,27 @@ def get_logger(name: str) -> structlog.stdlib.BoundLogger:
 def get_access_logger() -> structlog.stdlib.BoundLogger:
     """Return the dedicated HTTP access logger."""
     return structlog.get_logger("access")
+
+
+def log_unexpected_error(
+    log: structlog.stdlib.BoundLogger, event: str, exc: BaseException
+) -> None:
+    """Log an unexpected exception at error level without its message text.
+
+    Exception messages can carry personal data (a PostgreSQL ``DETAIL`` line
+    echoes the conflicting email or username), so only ``error_type`` is
+    logged. For database errors the SQLSTATE and constraint name are added
+    and the traceback is left out, because rendering it would print the
+    driver's message again. Other errors keep the traceback.
+    """
+    db_error = find_db_error(exc)
+    if db_error is None:
+        log.error(event, error_type=type(exc).__name__, exc_info=True)
+        return
+    log.error(
+        event,
+        error_type=type(exc).__name__,
+        db_error_type=type(db_error).__name__,
+        sqlstate=sqlstate(db_error),
+        constraint=constraint_name(db_error),
+    )

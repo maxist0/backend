@@ -2,7 +2,7 @@
 
 A production-grade, framework-complete REST API skeleton built on **FastAPI**, **PostgreSQL**, **Redis** and **Python 3.14**. It ships authentication, sessions, background jobs, caching, structured logging, metrics and a Docker Swarm deployment, and deliberately **no business features**. Add a domain module, not plumbing.
 
-> **Status:** hardening in progress. The foundation is sound (async everywhere, Argon2id, PyJWT, refresh-token rotation, Testcontainers), but several production gaps are documented in [Roadmap](#roadmap) and [Known issues](#known-issues). Treat `main` as a boilerplate under review, not as a release.
+> **Status:** hardening in progress. The foundation is sound (async everywhere, Argon2id, PyJWT, refresh-token rotation, Testcontainers), but several production gaps are documented in [Roadmap](#roadmap) and [Known issues](#known-issues). Phase 0 and Phase 0b of the November 2026 review (security fixes and the follow-up from the re-audit) are implemented but not yet committed (223 tests pass; ruff and mypy are clean). The consolidated review and its re-prioritised plan are in [documentation/review-2026-11/README.md](documentation/review-2026-11/README.md). Treat `main` as a boilerplate under review, not as a release.
 
 Contributor and AI-agent conventions live in [AGENTS.md](AGENTS.md). Read it before changing code.
 
@@ -30,14 +30,14 @@ Contributor and AI-agent conventions live in [AGENTS.md](AGENTS.md). Read it bef
 | Area | Implemented today |
 |---|---|
 | Framework | FastAPI 0.136 on Starlette, Pydantic v2, fully async (SQLAlchemy 2 async + asyncpg, redis asyncio) |
-| Auth | Register, login (OAuth2 password form), logout, refresh with rotation and reuse detection, email verification, password reset, account lockout, audit log |
-| Sessions | Opaque refresh tokens (SHA-256 hashed in Postgres, mirrored in Redis), JWT access tokens (15 min) |
+| Auth | Register, login (OAuth2 password form), logout, logout-all, refresh with rotation and reuse detection (family revocation), email verification, password reset, account lockout, audit log |
+| Sessions | Opaque refresh tokens (SHA-256 hashed, stored only in Postgres), JWT access tokens (15 min, HS256, `sid` claim = session family id) |
 | Users | `GET/PATCH /user/me`, password change, email-change flow (partial, see Known issues) |
 | Data | PostgreSQL, Alembic migrations, UUID primary keys, timezone-aware timestamps |
 | Caching | Redis via `cashews` route cache with ETag and Cache-Control middleware |
 | Background jobs | `taskiq` with Redis broker, result backend, cron scheduler, transactional email tasks |
 | Observability | `structlog` JSON logs with request IDs, Prometheus metrics, optional OTLP log export, Grafana/Loki/Tempo/Alloy stack |
-| Admin | `sqladmin` panel at `/admin` (users, credentials, sessions, tokens, audit log) |
+| Admin | `sqladmin` panel at `/admin` (users, credentials, sessions, tokens, audit log); opt-in outside `dev` via `ADMIN_ENABLED` |
 | Testing | pytest integration suite against real Postgres and Redis via Testcontainers |
 | Packaging | `uv` lockfile, multi-stage Dockerfile, non-root container, Docker Swarm stack with Traefik |
 
@@ -96,7 +96,7 @@ The dev launcher also starts a `taskiq` worker as a child process so emails and 
 | http://localhost:8000/redoc | ReDoc |
 | http://localhost:8000/metrics/ | Prometheus metrics |
 | http://localhost:8000/metrics/health | Health check |
-| http://localhost:8000/admin | Admin panel (`admin` / `admin` by default, change it) |
+| http://localhost:8000/admin | Admin panel (mounted by default only in `dev`; `admin` / `admin` by default, change it) |
 
 ### 5. Verify
 
@@ -106,7 +106,7 @@ uvx ruff@0.15.0 check src tests
 uvx ruff@0.15.0 format --check src tests
 uv run mypy src
 
-# Tests (needs a running Docker daemon; see Known issues for the Redis caveat)
+# Tests (needs a running Docker daemon; the suite starts Postgres and Redis containers)
 uv run pytest
 uv run pytest tests/auth/test_auth.py::TestLogin -x     # one class
 uv run pytest -k "refresh" -x                           # by keyword
@@ -138,8 +138,9 @@ backend/
 │   │   ├── cache.py           # Redis pool + cashews setup
 │   │   ├── taskiq.py          # broker, scheduler, task registration
 │   │   ├── mail.py            # fastapi-mail configuration
-│   │   ├── logging.py         # structlog + stdlib bridge + OTLP handler
-│   │   ├── middleware.py      # access log, metrics, security headers, request id
+│   │   ├── logging.py         # structlog + stdlib bridge + OTLP handler, log_unexpected_error
+│   │   ├── db_errors.py       # constraint_name, sqlstate, find_db_error for DB errors
+│   │   ├── middleware.py      # access log, metrics (bounded method label), security headers, request id
 │   │   ├── metrics.py         # Prometheus registry and collectors
 │   │   ├── responses.py       # response envelope helpers
 │   │   ├── schemas.py         # envelope models, ErrorCode enum
@@ -153,7 +154,7 @@ backend/
 │   ├── api/                   # Swarm stack: Traefik, Postgres, Redis, API x3, taskiq worker/scheduler/dashboard
 │   ├── monitoring/            # Prometheus, Grafana, Loki, Tempo, Alloy, exporters
 │   └── network/               # standalone Traefik for local compose
-├── documentation/             # Topic docs (partly stale, see Roadmap Phase 7)
+├── documentation/             # Topic docs (partly stale, see Roadmap Phase 7); review-2026-11/ holds the review backlog
 └── implementation-plan/       # Superseded by AGENTS.md and this README
 ```
 
@@ -219,30 +220,57 @@ The dependency arrow points inward: `router → service → crud → models`. Ro
 
 ### Configuration and environments
 
-`src/common/config.py` defines one `Settings` class (pydantic-settings). `ENVIRONMENT` selects behaviour:
+`src/common/config.py` defines one `Settings` class (pydantic-settings). `ENVIRONMENT` selects behaviour. Outside `dev` and `unittest` a startup guard refuses to boot with default or weak secrets (see [Configuration](#configuration)):
 
 | Value | Docs | Log format | `.env.local` | Notes |
 |---|---|---|---|---|
 | `dev` | on | coloured console | read | taskiq worker auto-started by `app.py` |
 | `unittest` | on | console | ignored | used by `tests/conftest.py` |
 | `test`, `stage` | on | console | ignored | runtime injects variables |
-| `prod` | off | JSON | ignored | admin panel still mounted (see Roadmap) |
+| `prod` | off | JSON | ignored | admin panel mounted only with `ADMIN_ENABLED=true`; startup guard active |
 
 ### Authentication design
 
 ```
 register ──▶ user + argon2id credential + VERIFY_EMAIL token ──▶ email task
-login    ──▶ verify password, lockout check ──▶ JWT access (15 min)
-                                             └▶ opaque refresh (32 B urlsafe)
-                                                  ├─ sha256 → sessions table (family_id, device, ip)
-                                                  ├─ raw    → Redis rt:<token> with TTL (fast path)
-                                                  └─ cookie refresh_token, HttpOnly, SameSite=Lax, Path=/auth
-refresh  ──▶ Redis hit: revoke old session, issue new pair in same family
-         └▶ Redis miss + revoked session in DB: reuse detected → revoke whole family
-logout   ──▶ delete Redis key, mark session revoked
+login    ──▶ lock check, admission limiter (PASSWORD_HASH_CONCURRENCY), lock re-check,
+             verify password (Argon2 in thread pool; dummy verify for unknown or inactive users),
+             success = conditional atomic UPDATE (refused once locked) ──▶ JWT access (15 min, HS256; claims exp, iat, nbf, sub, jti, type=access, sid)
+                           └▶ opaque refresh (32 B urlsafe)
+                                ├─ sha256 → sessions table (family_id, device, ip), Postgres only
+                                └─ cookie refresh_token, HttpOnly, SameSite=Lax, Path=/auth
+refresh  ──▶ atomic UPDATE ... RETURNING on the session row (not revoked, not expired)
+         ├─ success: issue new pair in the same family
+         ├─ token already rotated or revoked: reuse detected → revoke the whole family
+         │   (strict: two concurrent refreshes of the same token count as reuse)
+         └─ user inactive or admin-locked: refresh denied, family revoked
+            (a timed lock does not affect refresh)
+logout       ──▶ mark the session revoked
+logout-all   ──▶ revoke all sessions of the user, clear the cookie (bearer required)
+password reset  ──▶ revoke all sessions
+password change ──▶ revoke all sessions except the caller's (`sid`)
 ```
 
-Access tokens are stateless and remain valid until expiry; revocation only affects refresh tokens. Every auth event is written to `auth_audit_log`.
+Access tokens are stateless and remain valid until expiry (up to 15 minutes), with one exception: requests with an access token of an admin-locked user get 401. Revoking a session therefore ends refresh, not already issued access tokens. Every auth event is written to `auth_audit_log`.
+
+**Two kinds of lock.**
+
+| | Timed lock | Admin lock |
+|---|---|---|
+| Set by | `MAXIMUM_LOGIN_ATTEMPTS` (5) failed logins within the window | admin panel action "Lock selected" |
+| `users` columns | `is_locked`, `locked_until` set (`LOGIN_ATTEMPT_WINDOW_SECONDS`, 900 s) | `is_locked`, `locked_until` NULL (indefinite) |
+| Password login | blocked | blocked |
+| Existing sessions, access tokens, refresh | stay valid | access tokens get 401 at once; refresh is denied and the family revoked |
+| Sessions | untouched | all revoked by the admin action |
+| Ends | on its own when `locked_until` has passed | admin unlocks |
+
+A timed lock blocks only password login. Anyone who knows a username could otherwise trigger it and log that user out, so it must not end sessions (source: `User.is_admin_locked()` in `src/api/auth/models.py`, used by `src/api/auth/dependencies.py` and the refresh gate in `src/api/auth/service.py`).
+
+**Login burst protection.** Each process admits at most `PASSWORD_HASH_CONCURRENCY` password evaluations at a time. A login re-reads the lock state after it is admitted, so guesses queued behind the one that locked the account are refused without an Argon2 evaluation. A successful login is one conditional atomic `UPDATE`: no login succeeds once a lock is committed. With N worker processes the bound is N × `PASSWORD_HASH_CONCURRENCY`. Rate limiting ([D4](#open-decisions)) is still the main control and is still open.
+
+**Serialisation.** Refresh and the bulk revocations (`revoke_user_sessions`: logout-all, password reset and change, admin lock; `revoke_family`: reuse detection, denied refresh) first take a row lock on the user (`SELECT ... FOR NO KEY UPDATE` on `users`, `lock_user` in `src/api/auth/crud.py`). They queue per user, so a revocation always sees the successor session of a parallel refresh. The global lock order is `email_tokens` → `users` → `sessions`.
+
+**Duplicate registrations.** Two parallel registrations with the same username or email are decided by the unique constraints. The loser gets 409 with the same message as the pre-check, never 500.
 
 ### Data model
 
@@ -259,13 +287,12 @@ All primary keys are UUIDv4 generated in the application. Timestamps are `timest
 ### Caching and background work
 
 - **Route cache:** `@cache(ttl=cache_control_ttl(default=settings.ROUTE_CACHE_TTL), key=...)` from `cashews` on idempotent GET routes. ETag and `Cache-Control` request directives are honoured by the two cashews middlewares.
-- **Refresh-token cache:** raw token → JSON payload in Redis db 0 with TTL equal to the session lifetime.
 - **Jobs:** `taskiq` `ListQueueBroker` on Redis db 1, results in db 2. Tasks are declared with `@broker.task(...)` in `src/utils/`; the scheduler reads `schedule=[{"cron": ...}]` labels. Workers and scheduler are separate Swarm services.
 
 ### Observability
 
-- **Logs:** `structlog` with contextvars. Every request has `request_id`; authenticated requests add `user_id` and `username`. Dev renders coloured console output, `prod` renders JSON lines to stdout. Optional OTLP/HTTP export of the same records to Grafana Alloy (`OTLP_LOGS_ENABLED`).
-- **Metrics:** custom Prometheus registry exposed at `GET /metrics/`: `http_requests_total`, `http_request_duration_seconds`, request and response size histograms, `active_connections`, `database_operations_total`, `database_operation_duration_seconds`, `api_errors_total`, `application_info`.
+- **Logs:** `structlog` with contextvars. Every request has `request_id`; authenticated requests add `user_id` only. Logs contain no usernames, emails, query strings, `Referer` or token prefixes, and the database password is masked. Dev renders coloured console output, `prod` renders JSON lines to stdout. Optional OTLP/HTTP export of the same records to Grafana Alloy (`OTLP_LOGS_ENABLED`).
+- **Metrics:** custom Prometheus registry exposed at `GET /metrics/`: `http_requests_total`, `http_request_duration_seconds`, request and response size histograms, `active_connections`, `database_operations_total`, `database_operation_duration_seconds`, `api_errors_total`, `application_info`. The `endpoint` label is the route template (for example `/user/{id}`) or `unmatched`, so arbitrary paths cannot create label values. The `active_refresh_tokens` gauge was removed.
 - **Traces:** not yet wired (Tempo is deployed, the application does not emit spans; see Roadmap Phase 3).
 
 ### Error handling
@@ -288,10 +315,10 @@ Whether to keep this envelope or move to RFC 9457 Problem Details is an [open de
 | Concurrency | async end to end, no sync DB or Redis calls | FastAPI and uvicorn are ASGI; one blocking call stalls the event loop | sync SQLAlchemy with threadpool |
 | Package manager | `uv` with committed `uv.lock` | reproducible installs, fast CI and Docker builds, PEP 735 groups | pip-tools, Poetry |
 | Python | 3.14 target | bugfix phase, full wheel coverage, deferred annotations, required by Starlette 1.x and SQLAlchemy 2.1 floors (3.11+) | 3.13 (security-only from 2026-10), 3.15 (too new for all wheels) |
-| Password hashing | `argon2-cffi` Argon2id, library defaults (t=3, m=64 MiB, p=4) | OWASP first choice; defaults exceed the OWASP minimum (m=19 MiB, t=2) | bcrypt (72-byte limit), passlib (unmaintained) |
-| JWT | `PyJWT[crypto]`, HS256 | maintained, what the FastAPI tutorial uses | python-jose (critical unpatched CVE in 2026) |
+| Password hashing | `argon2-cffi` Argon2id, parameters from `Settings` (defaults t=3, m=64 MiB, p=4), run in a thread pool behind a concurrency limiter, rehash on login | OWASP first choice; defaults exceed the OWASP minimum (m=19 MiB, t=2); the limiter bounds memory use | bcrypt (72-byte limit), passlib (unmaintained) |
+| JWT | `PyJWT[crypto]`, HS256 pinned in code (not configurable) | maintained, what the FastAPI tutorial uses; a fixed algorithm list prevents algorithm confusion | python-jose (critical unpatched CVE in 2026) |
 | Refresh tokens | opaque, hashed at rest, rotated on every use, family-based reuse detection, HttpOnly cookie | OAuth 2.1 / RFC 9700 guidance for public clients; stolen tokens are detectable | JWT refresh tokens (not revocable without a denylist) |
-| Session store | Postgres as source of truth, Redis as fast path | audit trail survives Redis restarts; hot path stays O(1) | Redis only |
+| Session store | Postgres only; refresh is one atomic `UPDATE ... RETURNING` | a single gate removes the race between a Redis mirror and the database; the audit trail survives Redis restarts | Redis fast path (removed in Phase 0), Redis only |
 | ORM | SQLAlchemy 2 async, `expire_on_commit=False`, explicit `select()` | typed, mature, Alembic autogenerate | SQLModel, raw asyncpg |
 | Migrations | Alembic with async `env.py`, run as a separate step before rollout | never migrate at import time; CI can run `alembic check` | app-startup migrations |
 | Primary keys | UUID generated client-side | safe to expose, mergeable across environments | bigint identity (planned evaluation of UUIDv7, Postgres 18) |
@@ -311,26 +338,35 @@ Whether to keep this envelope or move to RFC 9457 Problem Details is an [open de
 
 Implemented:
 
-- Argon2id password hashing, constant-time verification through the library
-- Account lockout after 5 failed logins for 15 minutes, audit-logged
-- Refresh-token rotation with reuse detection and family revocation
-- Tokens (refresh, email) stored only as SHA-256 hashes
+- Argon2id password hashing (parameters from `Settings`, thread pool with concurrency limiter, rehash on login); dummy verify for unknown and inactive users to reduce timing differences
+- Account lockout after 5 failed logins for 15 minutes with an atomic counter, audit-logged. This timed lock blocks only password login; existing sessions, access tokens and refresh stay valid, so nobody can log another user out by guessing. The admin lock is indefinite: it rejects access tokens at once, ends sessions on refresh, and the admin action "Lock selected" revokes all sessions
+- Login burst protection: at most `PASSWORD_HASH_CONCURRENCY` password evaluations in flight per process, lock re-checked after admission, success as a conditional atomic `UPDATE` (N processes allow N times that bound). Not a substitute for rate limiting ([D4](#open-decisions), open)
+- Atomic refresh gate in Postgres; reuse of a rotated token revokes the whole family; refresh is denied and the family revoked for inactive or admin-locked users. Refresh and bulk revocations are serialised per user by a row lock (`FOR NO KEY UPDATE` on `users`; lock order `email_tokens` → `users` → `sessions`)
+- Parallel duplicate registrations return 409 with the normal message, never 500
+- Error logs carry `error_type` and, for database errors, `db_error_type`, `sqlstate` and `constraint`, but no exception text (database error text can contain user data); tracebacks of database errors are not logged (`log_unexpected_error` in `src/common/logging.py`)
+- Metrics label `method` is limited to the standard HTTP methods plus `other`
+- Session revocation on password reset (all) and password change (all except the caller's); `POST /auth/logout-all`
+- JWT: HS256 pinned in code; required claims `exp`, `iat`, `nbf`, `sub`, `jti`; `type=access` checked; `sub` must be a UUID; admin-locked users get 401 on access tokens
+- Tokens (refresh, email) stored only as SHA-256 hashes; email tokens are atomic and single use
 - Email-enumeration-safe `password/forgot`
+- `EmailStr`-based email validation that rejects whitespace and control characters; `User-Agent` truncated to 512 and `X-Device-*` headers to 255 characters
+- Startup guard outside `dev` and `unittest`: `JWT_SECRET_KEY` must not be the default and must be at least 32 characters; admin secrets are checked only when the admin panel is enabled
+- Admin panel opt-in (`ADMIN_ENABLED`, default on only in `dev`), actions use `?pks=`, fixed redirect, constant-time credential comparison
+- Logs without usernames, emails, query strings, `Referer` or token prefixes; database password masked in logs; SQLAlchemy engine uses `hide_parameters`
 - Security headers, GZip, request-id correlation
 - OpenAPI docs disabled in `prod`
 - Non-root container user, multi-stage image
+- Security upgrades of dependencies (starlette 1.10, python-multipart 0.0.33, pyjwt 2.15.1, sqladmin 0.32, aiosmtplib 5.1.3, cryptography 50, certifi, pydantic-settings 2.16, idna) and transitive security floors in `[tool.uv] constraint-dependencies`
 
-Not yet implemented (tracked in the [Roadmap](#roadmap)):
+Not yet implemented (tracked in the [Roadmap](#roadmap) and the [review backlog](documentation/review-2026-11/README.md)):
 
-- Startup validation that no default secret is in use
 - `Secure` flag and `__Host-` prefix on the refresh cookie
 - Rate limiting (per IP and per account), request body size limit, request timeout
-- JWT `iss`/`aud`/`typ` claims and token-type check; algorithm pinned in code
-- Session revocation on password reset and password change
+- JWT `iss` and `aud` claims
 - HSTS, `Cache-Control: no-store`, CSP `frame-ancestors 'none'`; removal of the obsolete `X-XSS-Protection`
 - Trusted-proxy handling for `X-Forwarded-For`
-- Authentication on `/metrics`, admin panel disabled in `prod` by default
-- PII minimisation in logs (usernames, emails, query strings)
+- Authentication on `/metrics`
+- Hashing or dropping client IPs in logs (IPs are still logged)
 - Dependency and image scanning, SBOM, signed images
 
 ---
@@ -344,20 +380,22 @@ All settings are environment variables read by `Settings` (`src/common/config.py
 | `ENVIRONMENT` | `dev` | `dev`, `unittest`, `test`, `stage`, `prod` |
 | `DATABASE_URL` | `postgresql+asyncpg://postgres:postgres@localhost:5432/api` | asyncpg driver required at runtime |
 | `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` | `10` / `20` | per process |
-| `CACHE_HOST` / `CACHE_PORT` / `CACHE_DB` / `CACHE_PASSWORD` | `localhost` / `6379` / `0` / empty | Redis for cache and refresh tokens |
+| `CACHE_HOST` / `CACHE_PORT` / `CACHE_DB` / `CACHE_PASSWORD` | `localhost` / `6379` / `0` / empty | Redis for the route cache (refresh tokens are not stored in Redis) |
 | `ROUTE_CACHE_ENABLED` / `ROUTE_CACHE_TTL` | `true` / `2m` | cashews |
 | `TASKIQ_BROKER_URL` / `TASKIQ_RESULT_BACKEND_URL` | Redis db 1 / db 2 | |
-| `JWT_SECRET_KEY` | placeholder | **must** be replaced; 256-bit random value |
-| `JWT_ALGORITHM` | `HS256` | will be pinned in code (Roadmap Phase 1) |
+| `JWT_SECRET_KEY` | placeholder | **Secret.** Startup guard outside `dev`/`unittest`: must not be the default and must be at least 32 characters. Use a 256-bit random value. The JWT algorithm is HS256, pinned in code |
 | `ACCESS_TOKEN_EXPIRE_MINUTES` / `REFRESH_TOKEN_EXPIRE_DAYS` | `15` / `30` | |
-| `ADMIN_USERNAME` / `ADMIN_PASSWORD` / `ADMIN_SECRET_KEY` | `admin` / `admin` / placeholder | **must** be replaced |
+| `ADMIN_ENABLED` | unset | Unset means enabled only in `dev`. Set `true` to mount the admin panel elsewhere; the Swarm stack sets `false` |
+| `ADMIN_USERNAME` / `ADMIN_PASSWORD` / `ADMIN_SECRET_KEY` | `admin` / `admin` / placeholder | **Secrets** (`ADMIN_PASSWORD`, `ADMIN_SECRET_KEY`). The startup guard rejects the defaults outside `dev`/`unittest`, but only when the admin panel is enabled |
+| `ARGON2_TIME_COST` / `ARGON2_MEMORY_KIB` / `ARGON2_PARALLELISM` | `3` / `65536` / `4` | Argon2id parameters. Minimums `≥2` / `≥19456` / `≥1` (OWASP minimum), validated in every environment; lower values stop startup |
+| `PASSWORD_HASH_CONCURRENCY` | `4` | `≥1`, validated in every environment. Maximum concurrent Argon2 operations and concurrent login credential checks per process (the bound is N × this value with N processes); each Argon2 operation needs `ARGON2_MEMORY_KIB` of RAM |
 | `MAIL_*` | unset | mail is skipped when incomplete |
 | `LOG_LEVEL` / `ACCESS_LOG_ENABLED` / `METRICS_ENABLED` | `INFO` / `true` / `true` | |
 | `OTLP_LOGS_ENABLED` / `OTLP_ENDPOINT` | `false` / `http://localhost:4318` | Grafana Alloy |
 | `FRONTEND_URL` | `http://localhost:3000` | used in email links |
 | `HOST` / `PORT` | `0.0.0.0` / `8000` | |
 
-Secrets must never be committed. `.env` in the repository is a template with empty values; `.env.local` is git-ignored.
+Secrets must never be committed. `.env` in the repository is a template with empty values; `.env.local` is git-ignored. When the startup guard fails, the application refuses to start and names the offending variables, not their values.
 
 ---
 
@@ -383,7 +421,7 @@ docker stack deploy -c deployment/docker/api/docker-compose.yml --with-registry-
 docker stack rm prod
 ```
 
-Set `DB_PASSWORD`, `REDIS_PASSWORD`, `JWT_SECRET_KEY` and the admin credentials in the environment before deploying; the compose fallbacks are development values.
+Export `JWT_SECRET_KEY` in the shell that runs `docker stack deploy`. The compose file uses `${JWT_SECRET_KEY:?...}` for `api`, `taskiq-worker` and `taskiq-scheduler`, so the deploy fails when the value is missing or empty. `docker stack deploy` does not read `.env`. Set `DB_PASSWORD` and `REDIS_PASSWORD` the same way; their compose fallbacks are development values. The stack sets `ADMIN_ENABLED=false`, so the admin panel is not mounted.
 
 ### Monitoring stack
 
@@ -393,7 +431,7 @@ Set `DB_PASSWORD`, `REDIS_PASSWORD`, `JWT_SECRET_KEY` and the admin credentials 
 
 ## Roadmap
 
-This is the improved implementation plan. Phases are ordered by risk reduction per effort. Each item is a checkbox so progress is visible in the repo; acceptance criteria are in italics.
+This is the original implementation plan. The re-prioritised plan from the November 2026 review (Phase 0 to 6) is in [documentation/review-2026-11/README.md](documentation/review-2026-11/README.md); where the two orderings differ, the review plan wins. Phases below are ordered by risk reduction per effort. Each item is a checkbox so progress is visible in the repo; acceptance criteria are in italics.
 
 ### Phase 0: Repository and tooling hygiene
 
@@ -411,21 +449,23 @@ This is the improved implementation plan. Phases are ordered by risk reduction p
 
 ### Phase 1: Security hardening
 
-- [ ] Startup guard: refuse to boot in `stage`/`prod` when `JWT_SECRET_KEY`, `ADMIN_PASSWORD`, `ADMIN_SECRET_KEY` or `DATABASE_URL` still carry defaults; require `len(JWT_SECRET_KEY) >= 32`.
-- [ ] Pin the JWT algorithm allowlist in code; add `iss`, `aud`, `typ=access`; verify `type` on decode; reject tokens without `jti`. *RFC 8725 checklist satisfied.*
+- [x] Startup guard: refuse to boot outside `dev`/`unittest` when `JWT_SECRET_KEY` (or, with the admin panel enabled, `ADMIN_PASSWORD`/`ADMIN_SECRET_KEY`) carries a default; require `len(JWT_SECRET_KEY) >= 32`. Partly: `DATABASE_URL` defaults are not checked.
+- [ ] Pin the JWT algorithm allowlist in code; add `iss`, `aud`, `typ=access`; verify `type` on decode; reject tokens without `jti`. *RFC 8725 checklist satisfied.* Partly done: algorithm pinned, claims `exp`/`iat`/`nbf`/`sub`/`jti` required, `type=access` verified, `sub` must be a UUID. `iss` and `aud` are still missing.
 - [ ] Refresh cookie: `Secure=True` outside `dev`, `SameSite=Strict` where the frontend allows it, `__Host-` prefix, explicit `max_age`.
-- [ ] Revoke all sessions on password reset and password change; add `POST /auth/logout-all`.
+- [x] Revoke all sessions on password reset and password change; add `POST /auth/logout-all`. (Password change keeps the caller's session.)
 - [ ] Complete the email-change flow: `POST /auth/email/confirm` consuming `CHANGE_EMAIL` tokens, dedicated template, `EMAIL_CHANGED` audit event, `FRONTEND_URL` in the reset link.
-- [ ] Rate limiting with `limits` + Redis: per IP on `/auth/*`, per account on login; return `429` with `Retry-After`. Decouple lockout from DoS by lockout-by-IP-window instead of hard account locks.
+- [ ] Rate limiting with `limits` + Redis: per IP on `/auth/*`, per account on login; return `429` with `Retry-After`. Decouple lockout from DoS by lockout-by-IP-window instead of hard account locks. Partly mitigated in Phase 0b: the timed account lock blocks only password login and leaves existing sessions valid, and a per-process admission limiter bounds login bursts; both remain no substitute for rate limits.
 - [ ] Uniform credential error (`Invalid username or password`) for locked, inactive and unknown accounts; log the real reason server-side only.
 - [ ] Security headers: add HSTS (behind TLS), `Cache-Control: no-store` on authenticated responses, `Content-Security-Policy: frame-ancestors 'none'`; drop `X-XSS-Protection`.
 - [ ] Trusted proxies: run uvicorn with `--proxy-headers --forwarded-allow-ips=<traefik>`; remove manual `X-Forwarded-For` parsing; use the same client IP source for access logs and audit logs.
 - [ ] CORS origins, methods and headers from `Settings` (`CORS_ORIGINS` list); delete the dead custom `CORSMiddleware` class.
-- [ ] Admin panel: Argon2 hash for the admin password with constant-time compare, `ADMIN_ENABLED` flag defaulting to `false` in `prod`, hide `token_hash` columns.
-- [ ] Protect `/metrics` (network policy or bearer token); remove the `KEYS` scan.
+- [ ] Admin panel: Argon2 hash for the admin password with constant-time compare, `ADMIN_ENABLED` flag defaulting to `false` in `prod`, hide `token_hash` columns. Partly done: `ADMIN_ENABLED` (default on only in `dev`) and constant-time compare of the admin credentials exist. Still open: Argon2 hash for the admin password, and `token_hash` is still shown in the sessions detail view.
+- [ ] Protect `/metrics` (network policy or bearer token); remove the `KEYS` scan. Partly done: the `active_refresh_tokens` gauge and its `KEYS` scan are removed; `/metrics` is still unauthenticated.
 - [ ] Request limits: `max_body_size`, per-request timeout, `strict_content_type` kept on.
 - [ ] Pydantic request models with `extra="forbid"`; separate create/update/response schemas (OWASP API3).
 - [ ] `SECURITY.md` with disclosure process and supported versions.
+- [ ] Email links to the frontend routes (requested by the frontend, [task 2](../frontend/documentation/backend-contract.md#backend-task-2-email-links-to-the-frontend-routes)): absolute URLs from `FRONTEND_URL` to `/user/email-bestaetigen?token=`, `/user/passwort-zuruecksetzen?token=` and `/user/einladung?token=` (`/en/user/…` when the user's locale is known); URL-encoded token; fix the `FRONTEND_URL` default (frontend dev server runs on 5173). Fixes Known issue 7.
+- [ ] `POST /auth/password/forgot`: return 200 even when the email task fails (log internally) and equalise response times for known and unknown addresses (requested by the frontend, [task 3](../frontend/documentation/backend-contract.md#backend-task-3-distinct-error-codes-and-a-consistent-forgot-password-answer); OWASP Forgot Password Cheat Sheet).
 
 ### Phase 2: API contract
 
@@ -439,13 +479,15 @@ This is the improved implementation plan. Phases are ordered by risk reduction p
 - [ ] Health endpoints: `GET /health/live` (no dependencies), `GET /health/ready` (DB `SELECT 1`, Redis `PING`, 503 on failure or during shutdown), `GET /health/startup`. Update the Dockerfile `HEALTHCHECK` and Swarm probes.
 - [ ] OpenAPI: `summary`, `description`, `responses` per route; export the schema in CI and lint it (Spectral or vacuum); diff against the previous release (oasdiff).
 - [ ] Timezone-aware timestamps everywhere (`datetime.now(timezone.utc)`), RFC 3339 output.
+- [ ] Invitation endpoints `POST /auth/invitations/lookup` and `POST /auth/invitations/accept` (requested by the frontend, [task 1](../frontend/documentation/backend-contract.md#backend-task-1-invitation-endpoints-new); the frontend page is built against this contract): tokens only in request bodies, stored as SHA-256 hashes, single use and expiring; the email is bound to the invitation; the accepted user is created with `is_email_verified: true` and joined to the workspace in one transaction; rate limiting, no enumeration, audit events.
+- [ ] Distinct error codes for the token endpoints: `TOKEN_INVALID`, `TOKEN_EXPIRED`, `TOKEN_USED` on `password/reset` and `email/verify`, `EMAIL_ALREADY_VERIFIED` on `email/verify/resend` (requested by the frontend, [task 3](../frontend/documentation/backend-contract.md#backend-task-3-distinct-error-codes-and-a-consistent-forgot-password-answer)).
 
 ### Phase 3: Reliability and observability
 
 - [ ] Replace `BaseHTTPMiddleware` implementations with pure ASGI middleware (streaming-safe, lower overhead).
 - [ ] Tracing: enable FastAPI native OpenTelemetry (`FastAPI(telemetry=...)`, 0.142+) plus SQLAlchemy, asyncpg, redis and httpx instrumentation; export OTLP to Alloy → Tempo; propagate W3C `traceparent`; add `trace_id`/`span_id` to log records.
 - [ ] Logs: redact PII (no emails, usernames or query strings in `http.access`; hash or drop IPs per policy); use `opentelemetry-instrumentation-logging` instead of the deprecated `LoggingHandler` path; keep `uvicorn.error` at INFO.
-- [ ] Metrics: align with OTel HTTP semantic conventions (`http.server.request.duration` in seconds with the standard buckets, `http.route` label); add cache hit/miss, task queue depth, DB pool usage; drop the broken `active_refresh_tokens` gauge or compute it from Postgres.
+- [ ] Metrics: align with OTel HTTP semantic conventions (`http.server.request.duration` in seconds with the standard buckets, `http.route` label); add cache hit/miss, task queue depth, DB pool usage; drop the broken `active_refresh_tokens` gauge (done in review Phase 0) or compute it from Postgres.
 - [ ] Graceful shutdown: `--timeout-graceful-shutdown`, readiness flips to 503 on SIGTERM, lifespan closes pools and flushes OTel; Swarm `stop_grace_period`.
 - [ ] Settings as an explicit dependency (`get_settings()` cached) instead of a mutable module global; no import-time side effects in `taskiq.py` and `mail.py`.
 - [ ] `fastapi run` / `fastapi dev` via `[tool.fastapi] entrypoint`; `app.py` becomes a thin wrapper or is removed.
@@ -485,22 +527,27 @@ This is the improved implementation plan. Phases are ordered by risk reduction p
 
 ## Known issues
 
-Verified during the November 2026 review. None are fixed yet; the Roadmap phase is given in brackets.
+Verified during the November 2026 review and updated after the review's Phase 0 and 0b (uncommitted). The Roadmap phase of each open issue is given in brackets. The authoritative backlog, including findings that are not listed here, is [documentation/review-2026-11/README.md](documentation/review-2026-11/README.md).
 
-1. The test suite starts a Redis Testcontainer but the application reads `CACHE_HOST`/`CACHE_PORT`, not `REDIS_URL`, so tests require a local Redis on `localhost:6379` and ignore the container. [Phase 0]
+Fixed in Phase 0:
+
+- ~~1~~ The test harness now uses the Redis Testcontainer.
+- ~~3~~ `/metrics/` no longer scans Redis; the `active_refresh_tokens` gauge is removed.
+- ~~5~~ Password reset and password change revoke sessions.
+- ~~13~~ `ruff format --check` passes.
+- ~~14~~ Not reproducible: the virtualenv runs Python 3.14.4.
+
+Open:
+
 2. `tests/conftest.py` runs `alembic upgrade head` and `Base.metadata.create_all` on the same database, and `asyncio.run()` shares the application's `AsyncEngine` across event loops. [Phase 0]
-3. `/metrics/` scans Redis with `KEYS rt:` (no wildcard), so `active_refresh_tokens` is always 0 and the scan is O(N). [Phase 3]
 4. `MetricsMiddleware` skips `/metrics` but the router is mounted at `/metrics/`, so scrapes are counted as requests. [Phase 3]
-5. Password reset and password change do not revoke existing sessions; `documentation/authentication.md` claims they do. [Phase 1]
 6. `PATCH /user/me` with a new email creates a `CHANGE_EMAIL` token but no endpoint consumes it, and the verification email template is reused. [Phase 1]
 7. The password-reset email link is relative (`/auth/reset-password?token=`) and lacks `FRONTEND_URL`. [Phase 1]
 8. Refresh cookie is set without `Secure`. [Phase 1]
 9. `pytest` `--cov-fail-under=80` and `[tool.coverage.report] fail_under = 85` conflict. [Phase 0]
-10. `BCRYPT_ROUNDS` and `CACHE_KEY_PREFIX` are configured but unused; `REDIS_URL` is set by tests but unused. [Phase 0]
-11. `alembic/env.py` loads `.env.local` with `override=True`, which can override injected variables inside containers if the file is present. [Phase 4]
+10. Partly fixed: `BCRYPT_ROUNDS` is removed. Still unused settings: `CACHE_KEY_PREFIX` (only in the `.env` template), `REDIS_URL` (set by tests), `TASKIQ_RETRY_*`, `TASKIQ_METRICS_PORT`, `ROUTE_CACHE_TIME_CONDITION` and `DEBUG`. `MAIL_*` values are read through `os.getenv` rather than `Settings`. [Phase 0]
+11. Partly fixed: `alembic/env.py` no longer overrides injected variables, but it still loads `.env.local` in dev. [Phase 4]
 12. `Dockerfile` healthcheck targets `/metrics/health` and fails when `METRICS_ENABLED=false`. [Phase 2]
-13. `ruff format --check` fails on `src/admin.py`. [Phase 0]
-14. The project virtualenv on the development machine is broken (`uv trampoline failed to spawn Python`); run `uv sync --reinstall`. [Phase 0]
 
 ---
 

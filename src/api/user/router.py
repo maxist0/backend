@@ -4,17 +4,20 @@
 User profile routes: GET /me, PATCH /me, PATCH /me/password.
 """
 
+import uuid
 from datetime import datetime
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request, status
 from fastapi.responses import JSONResponse
 
-from src.api.user.dependencies import get_current_user
+from src.api.auth.schemas import TokenData
+from src.api.user.dependencies import get_current_token_data, get_current_user
 from src.api.user.schemas import ChangePasswordRequest, UpdateProfileRequest
 from src.api.user.models import User
 from src.api.user.service import change_password, update_profile, user_to_response
 from src.common.dependencies import DbSession
-from src.common.logging import get_logger
+from src.common.logging import get_logger, log_unexpected_error
 from src.common.schemas import ErrorCode
 from src.common.responses import error_response, ok_response
 
@@ -67,7 +70,7 @@ async def update_me(
             start_time=start_time,
         )
     except Exception as e:
-        logger.error("user.profile_update_failed", error=str(e), exc_info=True)
+        log_unexpected_error(logger, "user.profile_update_failed", e)
         return error_response(
             message="Profile update failed",
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -82,9 +85,13 @@ async def change_my_password(
     body: ChangePasswordRequest,
     request: Request,
     db: DbSession,
+    token_data: Annotated[TokenData, Depends(get_current_token_data)],
     current_user: User = Depends(get_current_user),
 ) -> JSONResponse:
-    """Change the current user's password (requires current password)."""
+    """
+    Change the current user's password (requires current password).
+    Every other session of the user is logged out; the calling session stays.
+    """
     start_time = datetime.now()
     try:
         ok, err = await change_password(
@@ -93,6 +100,9 @@ async def change_my_password(
             current_password=body.current_password,
             new_password=body.new_password,
             request=request,
+            keep_session_family=(
+                uuid.UUID(token_data.session_id) if token_data.session_id else None
+            ),
         )
         if not ok:
             return error_response(
@@ -108,7 +118,7 @@ async def change_my_password(
             start_time=start_time,
         )
     except Exception as e:
-        logger.error("user.password_change_failed", error=str(e), exc_info=True)
+        log_unexpected_error(logger, "user.password_change_failed", e)
         return error_response(
             message="Password change failed",
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

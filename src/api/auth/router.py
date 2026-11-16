@@ -2,13 +2,14 @@
 
 """
 Authentication routes:
-  POST /register, /login, /refresh, /logout
+  POST /register, /login, /refresh, /logout, /logout-all
   POST /password/forgot, /password/reset
   POST /email/verify, /email/verify/resend
   POST /2fa/enable, /2fa/disable, /2fa/verify  (stubs)
 """
 
 from datetime import datetime
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request, status
 from fastapi.responses import JSONResponse
@@ -30,6 +31,7 @@ from src.api.auth.service import (
     create_session_tokens,
     delete_refresh_token_cookie,
     forgot_password,
+    logout_all_sessions,
     logout_session,
     refresh_session,
     register_user,
@@ -39,8 +41,8 @@ from src.api.auth.service import (
     verify_email,
 )
 from src.common.dependencies import DbSession
-from src.common.logging import get_logger
-from src.common.schemas import ErrorCode
+from src.common.logging import get_logger, log_unexpected_error
+from src.common.schemas import ErrorCode, Response200, Response401, Response500
 from src.common.responses import (
     created_response,
     error_response,
@@ -83,11 +85,7 @@ async def register(
                 start_time=start_time,
             )
 
-        logger.info(
-            "auth.user_registered",
-            user_id=str(user.id),
-            username=user.username,
-        )
+        logger.info("auth.user_registered", user_id=str(user.id))
         return created_response(
             data={
                 "message": "User registered successfully. Please check your email to verify your account.",
@@ -97,7 +95,7 @@ async def register(
             start_time=start_time,
         )
     except Exception as e:
-        logger.error("auth.register_failed", error=str(e), exc_info=True)
+        log_unexpected_error(logger, "auth.register_failed", e)
         return error_response(
             message="Registration failed",
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -125,10 +123,7 @@ async def login(
     """
     start_time = datetime.now()
     try:
-        redis_client = request.app.state.cache
-        access_token, raw_refresh = await create_session_tokens(
-            db, user, redis_client, request
-        )
+        access_token, raw_refresh = await create_session_tokens(db, user, request)
         user_resp = user_to_response(user)
 
         response = success_response(
@@ -152,7 +147,7 @@ async def login(
         return add_refresh_token_to_cookie(response, raw_refresh)
 
     except Exception as e:
-        logger.error("auth.login_failed", error=str(e), exc_info=True)
+        log_unexpected_error(logger, "auth.login_failed", e)
         return error_response(
             message="Login failed",
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -176,8 +171,7 @@ async def logout(
     """Revoke the current refresh token (read from cookie), logging the user out."""
     start_time = datetime.now()
     try:
-        redis_client = request.app.state.cache
-        ok, err = await logout_session(db, raw_token, redis_client, request)
+        ok, err = await logout_session(db, raw_token, request)
         if not ok:
             return error_response(
                 message=err or "Logout failed",
@@ -196,7 +190,47 @@ async def logout(
         return delete_refresh_token_cookie(response)
 
     except Exception as e:
-        logger.error("auth.logout_failed", error=str(e), exc_info=True)
+        log_unexpected_error(logger, "auth.logout_failed", e)
+        return error_response(
+            message="Logout failed",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            error_code=ErrorCode.INTERNAL_ERROR,
+            request=request,
+            start_time=start_time,
+        )
+
+
+@router.post(
+    "/logout-all",
+    status_code=status.HTTP_200_OK,
+    summary="Log out on all devices",
+    responses={
+        200: {"model": Response200, "description": "All sessions revoked"},
+        401: {"model": Response401, "description": "Missing or invalid token"},
+        500: {"model": Response500, "description": "Unexpected error"},
+    },
+)
+async def logout_all(
+    request: Request,
+    db: DbSession,
+    current_user: Annotated[User, Depends(get_current_user)],
+) -> JSONResponse:
+    """
+    Revoke every refresh-token session of the authenticated user (all devices)
+    and clear the refresh-token cookie. Access tokens already issued stay valid
+    until they expire (`ACCESS_TOKEN_EXPIRE_MINUTES`).
+    """
+    start_time = datetime.now()
+    try:
+        await logout_all_sessions(db, current_user.id, request)
+        response = success_response(
+            data={"message": "Logged out from all sessions"},
+            request=request,
+            start_time=start_time,
+        )
+        return delete_refresh_token_cookie(response)
+    except Exception as e:
+        log_unexpected_error(logger, "auth.logout_all_failed", e)
         return error_response(
             message="Logout failed",
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -223,9 +257,8 @@ async def refresh_tokens(
     """
     start_time = datetime.now()
     try:
-        redis_client = request.app.state.cache
         access_token, new_raw_refresh, err = await refresh_session(
-            db, raw_token, redis_client, request
+            db, raw_token, request
         )
         if access_token is None or new_raw_refresh is None:
             return error_response(
@@ -253,7 +286,7 @@ async def refresh_tokens(
         return add_refresh_token_to_cookie(response, new_raw_refresh)
 
     except Exception as e:
-        logger.error("auth.refresh_failed", error=str(e), exc_info=True)
+        log_unexpected_error(logger, "auth.refresh_failed", e)
         return error_response(
             message="Token refresh failed",
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -287,7 +320,7 @@ async def password_forgot(
             start_time=start_time,
         )
     except Exception as e:
-        logger.error("auth.password_forgot_failed", error=str(e), exc_info=True)
+        log_unexpected_error(logger, "auth.password_forgot_failed", e)
         return error_response(
             message="Failed to process password reset request",
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -322,7 +355,7 @@ async def password_reset(
             start_time=start_time,
         )
     except Exception as e:
-        logger.error("auth.password_reset_failed", error=str(e), exc_info=True)
+        log_unexpected_error(logger, "auth.password_reset_failed", e)
         return error_response(
             message="Password reset failed",
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -362,7 +395,7 @@ async def email_verify(
             start_time=start_time,
         )
     except Exception as e:
-        logger.error("auth.email_verify_failed", error=str(e), exc_info=True)
+        log_unexpected_error(logger, "auth.email_verify_failed", e)
         return error_response(
             message="Email verification failed",
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -397,7 +430,7 @@ async def email_verify_resend(
             start_time=start_time,
         )
     except Exception as e:
-        logger.error("auth.resend_verification_failed", error=str(e), exc_info=True)
+        log_unexpected_error(logger, "auth.resend_verification_failed", e)
         return error_response(
             message="Failed to resend verification email",
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

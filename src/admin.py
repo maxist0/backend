@@ -1,14 +1,16 @@
 # src/admin.py
 
+import hmac
 import uuid
 
 from fastapi import FastAPI
-from sqlalchemy import update
+from sqlalchemy import and_, update
 from sqladmin import Admin, ModelView, action
 from sqladmin.authentication import AuthenticationBackend
 from starlette.requests import Request
 from starlette.responses import RedirectResponse, Response
 
+from src.api.auth.crud import revoke_user_sessions
 from src.api.auth.models import (
     AuthAuditLog,
     EmailToken,
@@ -19,6 +21,40 @@ from src.api.auth.models import (
 )
 from src.common.config import settings
 from src.common.database import AsyncSessionFactory, engine
+from src.common.logging import get_logger
+
+logger = get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Action helpers
+# ---------------------------------------------------------------------------
+
+
+def _selected_ids(request: Request) -> list[uuid.UUID]:
+    """Primary keys selected in the admin UI.
+
+    sqladmin calls custom actions with ``GET ...?pks=<id>,<id>``. Values that
+    are not UUIDs are skipped, so malformed input cannot cause a server error.
+    """
+    raw = request.query_params.get("pks", "")
+    ids: list[uuid.UUID] = []
+    for value in raw.split(","):
+        try:
+            ids.append(uuid.UUID(value.strip()))
+        except ValueError:
+            continue
+    return ids
+
+
+def _back_to_list(request: Request, identity: str) -> RedirectResponse:
+    """Redirect to the model's list view: a fixed admin path.
+
+    Never to the client-supplied ``Referer`` header (open redirect). Only the
+    path is used, so a forged ``Host`` header cannot change the target either.
+    """
+    path = request.url_for("admin:list", identity=identity).path
+    return RedirectResponse(path, status_code=303)
 
 
 # ---------------------------------------------------------------------------
@@ -30,7 +66,16 @@ class AdminAuth(AuthenticationBackend):
     async def login(self, request: Request) -> bool:
         form = await request.form()
         username, password = form.get("username"), form.get("password")
-        if username == settings.ADMIN_USERNAME and password == settings.ADMIN_PASSWORD:
+        if not isinstance(username, str) or not isinstance(password, str):
+            return False
+        # Constant-time comparison of both values (no timing side channel).
+        username_ok = hmac.compare_digest(
+            username.encode(), settings.ADMIN_USERNAME.encode()
+        )
+        password_ok = hmac.compare_digest(
+            password.encode(), settings.ADMIN_PASSWORD.get_secret_value().encode()
+        )
+        if username_ok and password_ok:
             request.session.update({"admin": True})
             return True
         return False
@@ -86,14 +131,20 @@ class UserAdmin(ModelView, model=User):
         add_in_list=True,
     )
     async def lock_users(self, request: Request) -> Response:
-        form = await request.form()
-        ids = [uuid.UUID(pk) for pk in form.getlist("pk")]
-        async with AsyncSessionFactory() as session:
-            await session.execute(
-                update(User).where(User.id.in_(ids)).values(is_locked=True)
-            )
-            await session.commit()
-        return RedirectResponse(request.headers.get("referer", "/admin"), status_code=303)
+        """Lock indefinitely (locked_until NULL) and end all sessions."""
+        ids = _selected_ids(request)
+        if ids:
+            async with AsyncSessionFactory() as session:
+                await session.execute(
+                    update(User)
+                    .where(User.id.in_(ids))
+                    .values(is_locked=True, locked_until=None, updated_at=utcnow())
+                )
+                await session.commit()
+                for user_id in ids:
+                    await revoke_user_sessions(session, user_id, reason="admin_lock")
+            logger.info("admin.users_locked", user_ids=[str(i) for i in ids])
+        return _back_to_list(request, self.identity)
 
     @action(
         name="unlock_users",
@@ -103,16 +154,22 @@ class UserAdmin(ModelView, model=User):
         add_in_list=True,
     )
     async def unlock_users(self, request: Request) -> Response:
-        form = await request.form()
-        ids = [uuid.UUID(pk) for pk in form.getlist("pk")]
-        async with AsyncSessionFactory() as session:
-            await session.execute(
-                update(User)
-                .where(User.id.in_(ids))
-                .values(is_locked=False, failed_login_attempts=0, locked_until=None)
-            )
-            await session.commit()
-        return RedirectResponse(request.headers.get("referer", "/admin"), status_code=303)
+        ids = _selected_ids(request)
+        if ids:
+            async with AsyncSessionFactory() as session:
+                await session.execute(
+                    update(User)
+                    .where(User.id.in_(ids))
+                    .values(
+                        is_locked=False,
+                        failed_login_attempts=0,
+                        locked_until=None,
+                        updated_at=utcnow(),
+                    )
+                )
+                await session.commit()
+            logger.info("admin.users_unlocked", user_ids=[str(i) for i in ids])
+        return _back_to_list(request, self.identity)
 
     @action(
         name="force_password_change",
@@ -122,16 +179,19 @@ class UserAdmin(ModelView, model=User):
         add_in_list=True,
     )
     async def force_password_change(self, request: Request) -> Response:
-        form = await request.form()
-        ids = [uuid.UUID(pk) for pk in form.getlist("pk")]
-        async with AsyncSessionFactory() as session:
-            await session.execute(
-                update(PasswordCredential)
-                .where(PasswordCredential.user_id.in_(ids))
-                .values(must_change=True)
-            )
-            await session.commit()
-        return RedirectResponse(request.headers.get("referer", "/admin"), status_code=303)
+        # Only sets the flag. Enforcing must_change needs a new error code in
+        # the API contract and is planned for Roadmap Phase 3.
+        ids = _selected_ids(request)
+        if ids:
+            async with AsyncSessionFactory() as session:
+                await session.execute(
+                    update(PasswordCredential)
+                    .where(PasswordCredential.user_id.in_(ids))
+                    .values(must_change=True, updated_at=utcnow())
+                )
+                await session.commit()
+            logger.info("admin.password_change_forced", user_ids=[str(i) for i in ids])
+        return _back_to_list(request, self.identity)
 
     @action(
         name="deactivate_users",
@@ -141,14 +201,22 @@ class UserAdmin(ModelView, model=User):
         add_in_list=True,
     )
     async def deactivate_users(self, request: Request) -> Response:
-        form = await request.form()
-        ids = [uuid.UUID(pk) for pk in form.getlist("pk")]
-        async with AsyncSessionFactory() as session:
-            await session.execute(
-                update(User).where(User.id.in_(ids)).values(is_active=False)
-            )
-            await session.commit()
-        return RedirectResponse(request.headers.get("referer", "/admin"), status_code=303)
+        """Deactivate and end all sessions."""
+        ids = _selected_ids(request)
+        if ids:
+            async with AsyncSessionFactory() as session:
+                await session.execute(
+                    update(User)
+                    .where(User.id.in_(ids))
+                    .values(is_active=False, updated_at=utcnow())
+                )
+                await session.commit()
+                for user_id in ids:
+                    await revoke_user_sessions(
+                        session, user_id, reason="admin_deactivate"
+                    )
+            logger.info("admin.users_deactivated", user_ids=[str(i) for i in ids])
+        return _back_to_list(request, self.identity)
 
 
 class PasswordCredentialAdmin(ModelView, model=PasswordCredential):
@@ -239,16 +307,22 @@ class EmailTokenAdmin(ModelView, model=EmailToken):
         add_in_list=True,
     )
     async def invalidate_tokens(self, request: Request) -> Response:
-        form = await request.form()
-        ids = [uuid.UUID(pk) for pk in form.getlist("pk")]
-        async with AsyncSessionFactory() as session:
-            await session.execute(
-                update(EmailToken)
-                .where(EmailToken.id.in_(ids))
-                .values(invalidated_at=utcnow())
+        ids = _selected_ids(request)
+        if ids:
+            async with AsyncSessionFactory() as session:
+                await session.execute(
+                    update(EmailToken)
+                    .where(
+                        EmailToken.id.in_(ids),
+                        EmailToken.invalidated_at.is_(None),
+                    )
+                    .values(invalidated_at=utcnow())
+                )
+                await session.commit()
+            logger.info(
+                "admin.email_tokens_invalidated", token_ids=[str(i) for i in ids]
             )
-            await session.commit()
-        return RedirectResponse(request.headers.get("referer", "/admin"), status_code=303)
+        return _back_to_list(request, self.identity)
 
 
 class SessionAdmin(ModelView, model=Session):
@@ -268,7 +342,11 @@ class SessionAdmin(ModelView, model=Session):
         Session.revoked_at,
     ]
     # Detail view also shows token_hash, family_id, user_agent — useful for debugging
-    column_searchable_list = [Session.ip_address, Session.device_name, Session.device_id]
+    column_searchable_list = [
+        Session.ip_address,
+        Session.device_name,
+        Session.device_id,
+    ]
     column_sortable_list = [
         Session.is_revoked,
         Session.expires_at,
@@ -287,16 +365,17 @@ class SessionAdmin(ModelView, model=Session):
         add_in_list=True,
     )
     async def revoke_sessions(self, request: Request) -> Response:
-        form = await request.form()
-        ids = [uuid.UUID(pk) for pk in form.getlist("pk")]
-        async with AsyncSessionFactory() as session:
-            await session.execute(
-                update(Session)
-                .where(Session.id.in_(ids))
-                .values(is_revoked=True, revoke_reason="admin", revoked_at=utcnow())
-            )
-            await session.commit()
-        return RedirectResponse(request.headers.get("referer", "/admin"), status_code=303)
+        ids = _selected_ids(request)
+        if ids:
+            async with AsyncSessionFactory() as session:
+                await session.execute(
+                    update(Session)
+                    .where(Session.id.in_(ids), Session.is_revoked.is_(False))
+                    .values(is_revoked=True, revoke_reason="admin", revoked_at=utcnow())
+                )
+                await session.commit()
+            logger.info("admin.sessions_revoked", session_ids=[str(i) for i in ids])
+        return _back_to_list(request, self.identity)
 
     @action(
         name="revoke_all_expired",
@@ -305,7 +384,6 @@ class SessionAdmin(ModelView, model=Session):
         add_in_list=True,
     )
     async def revoke_all_expired(self, request: Request) -> Response:
-        from sqlalchemy import and_
         now = utcnow()
         async with AsyncSessionFactory() as session:
             await session.execute(
@@ -314,7 +392,7 @@ class SessionAdmin(ModelView, model=Session):
                 .values(is_revoked=True, revoke_reason="expired", revoked_at=now)
             )
             await session.commit()
-        return RedirectResponse(request.headers.get("referer", "/admin"), status_code=303)
+        return _back_to_list(request, self.identity)
 
 
 # ---------------------------------------------------------------------------
@@ -323,7 +401,7 @@ class SessionAdmin(ModelView, model=Session):
 
 
 def create_admin(app: FastAPI) -> Admin:
-    auth = AdminAuth(secret_key=settings.ADMIN_SECRET_KEY)
+    auth = AdminAuth(secret_key=settings.ADMIN_SECRET_KEY.get_secret_value())
     admin = Admin(
         app,
         engine,

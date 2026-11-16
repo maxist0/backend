@@ -4,15 +4,16 @@ Integration tests for /auth endpoints.
 
 Infrastructure:
   - Real PostgreSQL via testcontainers (Alembic migrations applied once per session)
-  - Real Redis via testcontainers
+  - Real Redis via testcontainers (flushed before every test)
   - No service-layer mocking — every test exercises the full stack
-    - `captured_emails` fixture intercepts email task `.delay(...)` calls to retrieve tokens
-    without an SMTP server
+    - `captured_emails` fixture intercepts email task `.kiq(...)` calls and records
+    every mail (recipient, kind, token) without an SMTP server
 
 Fixtures (all defined in conftest.py):
   client          - function-scoped TestClient (fresh cookie jar per test)
   clean_db        - autouse; truncates all auth tables after each test
-    captured_emails - patches email task dispatch; returns {email: last_token} dict
+    captured_emails - patches email task dispatch; ordered list of CapturedEmail
+                      (`captured_emails[addr]` still returns the latest token)
 """
 
 from src.common.constants import MAXIMUM_LOGIN_ATTEMPTS
@@ -188,10 +189,13 @@ class TestLogin:
         r = login(client, username="alice")
         assert r.status_code == 200
 
-    def test_inactive_account_returns_401(self, client, deactivate_user):
+    def test_inactive_account_returns_401(
+        self, client, deactivate_user, captured_emails
+    ):
         import asyncio
 
-        register(client, username="alice")
+        r = register(client, username="alice")
+        assert r.status_code == 201
         asyncio.run(deactivate_user("alice"))
         r = login(client, username="alice")
         assert r.status_code == 401
@@ -270,18 +274,25 @@ class TestRefresh:
 
         old_refresh = client.cookies.get("refresh_token")
 
-        # Legitimate rotation
-        client.post("/auth/refresh")
+        # Legitimate rotation; the response puts the newest token in the jar.
+        assert client.post("/auth/refresh").status_code == 200
+        newest_refresh = client.cookies.get("refresh_token")
+        assert newest_refresh and newest_refresh != old_refresh
 
-        # Attempt to use the already-rotated token
-        client.cookies.set("refresh_token", old_refresh)
-        r = client.post("/auth/refresh")
+        # Attempt to use the already-rotated token (explicit Cookie header so the
+        # jar content cannot influence which token is sent).
+        client.cookies.clear()
+        r = client.post(
+            "/auth/refresh", headers={"Cookie": f"refresh_token={old_refresh}"}
+        )
         assert r.status_code == 401
 
-        # Reuse detection should have revoked the whole family; a fresh attempt
-        # with the legitimately rotated token (now in the cookie jar via the
-        # previous response) must also fail
-        r2 = client.post("/auth/refresh")
+        # Reuse detection must have revoked the whole family: the NEWEST token,
+        # sent in isolation, must be dead too. (The previous version of this test
+        # re-sent the replayed OLD token and therefore proved nothing.)
+        r2 = client.post(
+            "/auth/refresh", headers={"Cookie": f"refresh_token={newest_refresh}"}
+        )
         assert r2.status_code == 401
 
     def test_without_cookie_returns_401(self, client):

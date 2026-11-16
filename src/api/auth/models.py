@@ -37,6 +37,21 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def lock_is_active(
+    is_locked: bool, locked_until: Optional[datetime], now: Optional[datetime] = None
+) -> bool:
+    """Lock rule shared by ``User.is_lock_active`` and fresh column reads.
+
+    ``is_locked`` with ``locked_until IS NULL`` is an indefinite (admin) lock;
+    a timed lock ends once ``locked_until`` lies in the past.
+    """
+    if not is_locked:
+        return False
+    if locked_until is None:
+        return True
+    return locked_until > (now or utcnow())
+
+
 def hash_token(raw_token: str) -> str:
     """SHA-256 hash a raw token for secure storage."""
     return hashlib.sha256(raw_token.encode()).hexdigest()
@@ -81,6 +96,23 @@ class User(Base):
 
     def __str__(self) -> str:
         return f"{self.username} ({self.email})"
+
+    def is_lock_active(self, now: Optional[datetime] = None) -> bool:
+        """Return True while the account is locked.
+
+        ``is_locked`` with ``locked_until IS NULL`` is an indefinite (admin)
+        lock. A timed lock ends once ``locked_until`` lies in the past.
+        """
+        return lock_is_active(self.is_locked, self.locked_until, now)
+
+    def is_admin_locked(self) -> bool:
+        """Return True for the indefinite (admin) lock: ``locked_until IS NULL``.
+
+        Only this lock ends existing sessions: access tokens and refresh are
+        rejected. A timed lock from failed logins blocks the password login
+        only (``is_lock_active``), so guessing cannot log the real user out.
+        """
+        return self.is_locked and self.locked_until is None
 
     # relationships
     password_credential: Mapped[Optional["PasswordCredential"]] = relationship(

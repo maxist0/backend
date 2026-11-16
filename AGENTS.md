@@ -4,7 +4,7 @@ Guidance for coding agents (Claude Code, Codex, Cursor, Copilot) and humans work
 
 ## Project in one paragraph
 
-Production-grade FastAPI boilerplate: async SQLAlchemy 2 on PostgreSQL, Redis for cache and refresh tokens, taskiq for background jobs, structlog + Prometheus for observability, Docker Swarm for deployment. Python **3.14** is the target. The repository intentionally contains **no business features**; keep it generic. Current gaps and the plan are in [README.md → Roadmap](README.md#roadmap) and [Known issues](README.md#known-issues). Decisions not yet taken are in [Open decisions](README.md#open-decisions); do not pre-empt them in code.
+Production-grade FastAPI boilerplate: async SQLAlchemy 2 on PostgreSQL, Redis for the route cache, taskiq broker and results (refresh tokens live only in Postgres), taskiq for background jobs, structlog + Prometheus for observability, Docker Swarm for deployment. Python **3.14** is the target. The repository intentionally contains **no business features**; keep it generic. Current gaps and the plan are in [README.md → Roadmap](README.md#roadmap) and [Known issues](README.md#known-issues). Decisions not yet taken are in [Open decisions](README.md#open-decisions); do not pre-empt them in code.
 
 ## Golden rules
 
@@ -25,7 +25,7 @@ uv run python app.py dev                    # API on :8000 + taskiq worker, read
 uvx ruff@0.15.0 check src tests             # lint   (strict config is Roadmap Phase 0)
 uvx ruff@0.15.0 format src tests            # format
 uv run mypy src                             # types  (strict mode is Roadmap Phase 0)
-uv run pytest                               # all tests; needs Docker + local Redis on 6379 (Known issue 1)
+uv run pytest                               # all tests; needs a running Docker daemon (Postgres and Redis Testcontainers)
 uv run pytest tests/auth/test_auth.py::TestLogin -x
 uv run pytest -k "refresh" -x -p no:cacheprovider
 uv run alembic revision --autogenerate -m "describe_change"   # after model changes, then review the file
@@ -45,7 +45,8 @@ Use `uv run ...`; never `pip install` or activate a virtualenv by hand. If `.ven
 | JWT encode/decode | `src/utils/jwt_utils.py` |
 | Response envelope helpers | `src/common/responses.py`, models in `src/common/schemas.py` |
 | Global exception handlers | `src/common/exceptions.py` |
-| Logging | `src/common/logging.py` (`get_logger(__name__)`) |
+| Logging | `src/common/logging.py` (`get_logger(__name__)`, `log_unexpected_error`) |
+| DB error details (constraint, SQLSTATE) | `src/common/db_errors.py` (`constraint_name`, `sqlstate`, `find_db_error`) |
 | Metrics | `src/common/metrics.py` (`DatabaseTimer`, counters) |
 | Cache (Redis + cashews) | `src/common/cache.py` |
 | Background tasks | `src/common/taskiq.py` (broker), tasks in `src/utils/*.py` |
@@ -86,12 +87,15 @@ Use `uv run ...`; never `pip install` or activate a virtualenv by hand. If `.ven
 ## Security rules
 
 - Passwords: `argon2-cffi` via `hash_password`/`verify_password` in `src/api/auth/service.py`. Never store or log a plaintext password or token; tokens at rest are SHA-256 (`hash_token`).
-- JWT via `PyJWT` with an explicit `algorithms=[...]` list. Never read the algorithm from the token.
+- JWT via `PyJWT` with an explicit `algorithms=[...]` list (HS256, pinned in `src/utils/jwt_utils.py`). Never read the algorithm from the token.
+- Refresh tokens live only in Postgres; the refresh gate is one atomic `UPDATE ... RETURNING`. Do not add a Redis mirror.
+- Secrets are `SecretStr` in `Settings`; a startup guard rejects defaults outside `dev`/`unittest`. New secrets need a guard entry and a README configuration row.
 - Auth-protected routes use `get_current_user`; do not re-implement token parsing. Do not change `src/api/auth/` internals unless the task is about auth.
 - Error messages must not reveal whether an account exists (see Roadmap Phase 1 for the current gaps).
 - Validate and bound every input (`max_length`, ranges, enums). Reject unknown fields.
 - CORS, cookies and headers are configured centrally in `src/main.py`; do not set them per route.
 - Do not log request bodies, query strings, `Authorization`, cookies, emails or usernames. User context in logs is `user_id` only.
+- Log unexpected exceptions with `log_unexpected_error(logger, event, exc)` or `error_type=type(exc).__name__`, never `error=str(e)`: database error text can contain user data.
 
 ## Database and migrations
 

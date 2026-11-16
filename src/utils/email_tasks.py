@@ -29,9 +29,10 @@ async def send_verification_email_task(to: str, username: str, token: str) -> No
             template_name="auth/verify_email.html",
             context=context,
         )
-        logger.info("email.verification_sent", to=to, username=username)
+        logger.info("email.verification_sent")
     except Exception as exc:
-        logger.error("email.verification_failed", to=to, error=str(exc))
+        # Only the exception type: SMTP errors can echo the recipient address.
+        logger.error("email.verification_failed", error_type=type(exc).__name__)
         raise
 
 
@@ -54,7 +55,8 @@ async def send_password_reset_email_task(to: str, username: str, token: str) -> 
             template_name="auth/reset_password.html",
             context=context,
         )
-        logger.info("email.password_reset_sent", to=to, username=username)
+        logger.info("email.password_reset_sent")
     except Exception as exc:
-        logger.error("email.password_reset_failed", to=to, error=str(exc))
+        # Only the exception type: SMTP errors can echo the recipient address.
+        logger.error("email.password_reset_failed", error_type=type(exc).__name__)
         raise

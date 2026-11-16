@@ -1,5 +1,7 @@
 # Redis Caching
 
+> **Status (2026-11-16):** this page is partly stale (it describes `fastapi-cache2`, which the project does not use; the route cache is `cashews`, see [README.md → Caching and background work](../README.md#caching-and-background-work)). One correction applies throughout: **refresh tokens and sessions are no longer stored in Redis.** They live only in Postgres. Redis serves the route cache and the taskiq broker (db 1) and result backend (db 2).
+
 ## Overview
 
 Redis is used for **distributed caching** and **session storage** in this application. The project uses:
@@ -10,7 +12,7 @@ Redis is used for **distributed caching** and **session storage** in this applic
 
 Redis enables:
 - Fast data retrieval without database queries
-- Session token storage and invalidation
+- ~~Session token storage and invalidation~~ (not used; sessions are in Postgres)
 - Rate limiting and throttling
 - Real-time counters and analytics
 
@@ -377,7 +379,7 @@ await redis.persist("key")
 | User profile | 1 hour | Changes infrequently |
 | User settings | 24 hours | Rarely change |
 | API responses | 5-15 min | Need freshness |
-| Session data | Until logout | Session length |
+| Session data | Not stored in Redis (Postgres only) | n/a |
 | Rate limit counters | 1 minute | Per-minute limits |
 | Feature flags | No expiration | Rarely change |
 | Temporary data | 5 minutes | Clean up quickly |

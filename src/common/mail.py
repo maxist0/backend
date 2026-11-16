@@ -42,8 +42,6 @@ def setup_mail() -> Optional[FastMail]:
         "Mail configuration set up successfully.",
         server=os.getenv("MAIL_SERVER"),
         port=os.getenv("MAIL_PORT", 587),
-        username=os.getenv("MAIL_USERNAME"),
-        from_email=os.getenv("MAIL_FROM"),
         starttls=True,
         ssl_tls=mail_config.MAIL_SSL_TLS,
         use_credentials=mail_config.USE_CREDENTIALS,
@@ -62,9 +60,7 @@ async def send_templated_email(
 ) -> None:
     """Render *template_name* with *context* via fastapi-mail's Jinja2 integration and send it."""
     if fm is None:
-        logger.warning(
-            "FastMail not configured; skipping email.", to=to, subject=subject
-        )
+        logger.warning("FastMail not configured; skipping email.", subject=subject)
         return
     context.setdefault("app_name", settings.APP_NAME)
     _to = NameEmail(name=context.get("username", ""), email=to)

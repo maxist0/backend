@@ -1,9 +1,16 @@
 # src/api/auth/schemas.py
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    BeforeValidator,
+    EmailStr,
+    Field,
+    field_validator,
+)
 from datetime import datetime
 import re
-from typing import Optional
+from typing import Annotated, Optional
 
 # ---------------------------------------------------------------------------
 # Pydantic Request / Response Schemas
@@ -13,20 +20,35 @@ _EMAIL_RE = re.compile(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")
 _USERNAME_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 
 
+def _reject_whitespace_and_control_chars(value: object) -> object:
+    """Reject instead of silently stripping, e.g. a trailing newline.
+
+    `EmailStr` strips surrounding whitespace and accepts the
+    ``"Name <addr>"`` form; an address field must contain only the address.
+    """
+    if isinstance(value, str) and any(
+        ch.isspace() or not ch.isprintable() for ch in value
+    ):
+        raise ValueError("Email must not contain whitespace or control characters")
+    return value
+
+
+# RFC 5321-valid address (email-validator via pydantic[email]), stored lower case.
+NormalizedEmail = Annotated[
+    EmailStr,
+    BeforeValidator(_reject_whitespace_and_control_chars),
+    AfterValidator(str.lower),
+    Field(max_length=255),
+]
+
+
 class RegisterRequest(BaseModel):
     """User registration request."""
 
     username: str = Field(..., min_length=3, max_length=64)
-    email: str = Field(..., max_length=255)
+    email: NormalizedEmail
     password: str = Field(..., min_length=8, max_length=128)
     display_name: Optional[str] = Field(None, max_length=128)
-
-    @field_validator("email")
-    @classmethod
-    def validate_email(cls, v: str) -> str:
-        if not _EMAIL_RE.match(v):
-            raise ValueError("Invalid email format")
-        return v.lower()
 
     @field_validator("username")
     @classmethod
@@ -41,7 +63,7 @@ class RegisterRequest(BaseModel):
 class PasswordForgotRequest(BaseModel):
     """Request a password-reset email."""
 
-    email: str = Field(..., max_length=255)
+    email: NormalizedEmail
 
 
 class PasswordResetRequest(BaseModel):
@@ -110,18 +132,10 @@ class TokenResponse(BaseModel):
 
 
 class TokenData(BaseModel):
-    """Decoded JWT payload."""
+    """Decoded and validated JWT access-token payload."""
 
-    user_id: str
-    username: str
+    user_id: str  # canonical UUID string (claim `sub`)
+    username: Optional[str] = None
     jti: str
-
-
-class RefreshTokenCache(BaseModel):
-    """Lightweight refresh-token data stored in Redis for fast lookups."""
-
-    session_id: str
-    user_id: str
-    username: str
-    family_id: str
-    expires_at: datetime
+    # Refresh-token family id (claim `sid`); None for tokens issued before it existed.
+    session_id: Optional[str] = None

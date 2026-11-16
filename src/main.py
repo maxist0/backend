@@ -122,8 +122,9 @@ app = FastAPI(
     openapi_url=None if settings.is_production else "/openapi.json",
 )
 
-## Admin panel
-create_admin(app)
+## Admin panel (opt-in: ADMIN_ENABLED, unset means dev only)
+if settings.admin_enabled:
+    create_admin(app)
 
 ## Exception Handlers
 app.add_exception_handler(Exception, generic_exception_handler)

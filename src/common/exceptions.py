@@ -7,7 +7,7 @@ from src.common.responses import error_response
 from src.common.schemas import ErrorCode
 from src.api.auth.exceptions import AuthenticationError
 from fastapi.exceptions import RequestValidationError
-from src.common.logging import get_logger
+from src.common.logging import get_logger, log_unexpected_error
 
 
 logger = get_logger(__name__)
@@ -22,7 +22,7 @@ This will catch all Pydantic validation errors across the app and return them in
 
 async def generic_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     """Catch-all exception handler to return standardized error responses."""
-    logger.error("app.unhandled_exception", error=str(exc), exc_info=True)
+    log_unexpected_error(logger, "app.unhandled_exception", exc)
     start_time = datetime.now()
     return error_response(
         message="An unexpected error occurred",
@@ -39,9 +39,9 @@ async def validation_exception_handler(
     """Return Pydantic / request-validation errors in the standard error envelope."""
 
     if not isinstance(exc, RequestValidationError):
-        logger.exception(
+        logger.warning(
             "app.validation_exception_handler_called_with_non_validation_error",
-            error=str(exc),
+            error_type=type(exc).__name__,
         )
         return await generic_exception_handler(request, exc)
 
@@ -71,7 +71,7 @@ async def validation_exception_handler(
         details={"validation_errors": detail_list},
         request=request,
         start_time=start_time,
-        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
     )
 
 
@@ -80,9 +80,9 @@ async def authentication_exception_handler(
 ) -> JSONResponse:
     """Return authentication errors in the standard error envelope."""
     if not isinstance(exc, AuthenticationError):
-        logger.exception(
+        logger.warning(
             "app.authentication_exception_handler_called_with_non_authentication_error",
-            error=str(exc),
+            error_type=type(exc).__name__,
         )
         return await generic_exception_handler(request, exc)
 

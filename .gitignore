@@ -34,3 +34,4 @@ scripts/
 
 .coverage
 .env.local
+.claude/

@@ -57,13 +57,6 @@ APPLICATION_INFO = Info(
     "application_info", "Application information", registry=REGISTRY
 )
 
-# Auth / session metrics
-ACTIVE_REFRESH_TOKENS = Gauge(
-    "active_refresh_tokens",
-    "Number of refresh tokens currently stored in Redis",
-    registry=REGISTRY,
-)
-
 # Business logic metrics
 API_ERRORS_TOTAL = Counter(
     "api_errors_total",

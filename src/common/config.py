@@ -2,9 +2,19 @@
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Self
 
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Public code defaults. They are fine for local development and the test suite,
+# but the startup guard (Settings._refuse_insecure_defaults) refuses them in
+# every other environment.
+_DEFAULT_JWT_SECRET_KEY = "your-super-secret-jwt-key-change-in-production"
+_DEFAULT_ADMIN_PASSWORD = "admin"
+_DEFAULT_ADMIN_SECRET_KEY = "admin-secret-key-change-in-production"
+# RFC 7518 section 3.2: an HS256 key must have at least 256 bits.
+_MIN_JWT_SECRET_LENGTH = 32
 
 
 class Environment(str, Enum):
@@ -46,14 +56,21 @@ class Settings(BaseSettings):
     TASKIQ_RETRY_COUNT: int = 3
     TASKIQ_RETRY_DELAY_SECONDS: int = 60
 
-    # JWT Authentication
-    JWT_SECRET_KEY: str = "your-super-secret-jwt-key-change-in-production"
-    JWT_ALGORITHM: str = "HS256"
+    # JWT Authentication (the algorithm is pinned in code: src/utils/jwt_utils.py)
+    JWT_SECRET_KEY: SecretStr = SecretStr(_DEFAULT_JWT_SECRET_KEY)
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
     REFRESH_TOKEN_EXPIRE_DAYS: int = 30
 
-    # Password hashing
-    BCRYPT_ROUNDS: int = 12
+    # Password hashing (Argon2id). Defaults equal argon2-cffi's defaults
+    # (RFC 9106 "second recommended option"), so existing hashes stay valid.
+    # Lower bounds = OWASP Password Storage Cheat Sheet minimum for Argon2id
+    # (m=19 MiB, t=2, p=1); enforced in every environment.
+    ARGON2_TIME_COST: int = Field(default=3, ge=2)
+    ARGON2_MEMORY_KIB: int = Field(default=65536, ge=19456)
+    ARGON2_PARALLELISM: int = Field(default=4, ge=1)
+    # Max. concurrent hash/verify operations per process (each needs
+    # ARGON2_MEMORY_KIB of RAM); further requests wait for a free slot.
+    PASSWORD_HASH_CONCURRENCY: int = Field(default=4, ge=1)
 
     # Logging
     LOG_LEVEL: str = "INFO"
@@ -75,10 +92,11 @@ class Settings(BaseSettings):
     MAIL_SERVER: Optional[str] = None
     MAIL_STARTTLS: bool = True
 
-    # Admin panel
+    # Admin panel. ADMIN_ENABLED unset means: enabled only in dev.
+    ADMIN_ENABLED: bool | None = None
     ADMIN_USERNAME: str = "admin"
-    ADMIN_PASSWORD: str = "admin"
-    ADMIN_SECRET_KEY: str = "admin-secret-key-change-in-production"
+    ADMIN_PASSWORD: SecretStr = SecretStr(_DEFAULT_ADMIN_PASSWORD)
+    ADMIN_SECRET_KEY: SecretStr = SecretStr(_DEFAULT_ADMIN_SECRET_KEY)
 
     # Metrics
     METRICS_ENABLED: bool = True
@@ -106,10 +124,51 @@ class Settings(BaseSettings):
         """Check if the application is running in production mode."""
         return self.ENVIRONMENT == Environment.PROD
 
+    @property
+    def admin_enabled(self) -> bool:
+        """Whether the admin panel is mounted (opt-in outside dev)."""
+        if self.ADMIN_ENABLED is None:
+            return self.is_development
+        return self.ADMIN_ENABLED
+
+    @model_validator(mode="after")
+    def _refuse_insecure_defaults(self) -> Self:
+        """Startup guard: no public default secrets outside dev and unittest.
+
+        Admin secrets are only checked when the admin panel is enabled, because
+        they are not used otherwise.
+        """
+        if self.ENVIRONMENT in (Environment.DEV, Environment.UNITTEST):
+            return self
+
+        problems: list[str] = []
+        jwt_secret = self.JWT_SECRET_KEY.get_secret_value()
+        if jwt_secret == _DEFAULT_JWT_SECRET_KEY:
+            problems.append("JWT_SECRET_KEY is the public default")
+        elif len(jwt_secret) < _MIN_JWT_SECRET_LENGTH:
+            problems.append(
+                f"JWT_SECRET_KEY is shorter than {_MIN_JWT_SECRET_LENGTH} characters"
+            )
+        if self.admin_enabled:
+            if self.ADMIN_PASSWORD.get_secret_value() == _DEFAULT_ADMIN_PASSWORD:
+                problems.append("ADMIN_PASSWORD is the public default")
+            if self.ADMIN_SECRET_KEY.get_secret_value() == _DEFAULT_ADMIN_SECRET_KEY:
+                problems.append("ADMIN_SECRET_KEY is the public default")
+
+        if problems:
+            raise ValueError(
+                f"Refusing to start with ENVIRONMENT={self.ENVIRONMENT.value}: "
+                + "; ".join(problems)
+                + ". Set strong values via environment variables."
+            )
+        return self
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
+        # Validation errors must not echo input values: they contain secrets.
+        hide_input_in_errors=True,
     )
 
 
@@ -141,6 +200,7 @@ def get_settings(env: str | None = None) -> Settings:
             env_file=tuple(env_files),
             env_file_encoding="utf-8",
             extra="ignore",
+            hide_input_in_errors=True,
         )
 
     if env is None:

@@ -10,6 +10,17 @@ from starlette.responses import Response
 
 from src.common.logging import get_access_logger
 
+# The request method is client-controlled; as a metric label it must come from
+# a fixed set, or invented methods create unbounded time series.
+_METRIC_METHODS = frozenset(
+    {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
+)
+
+
+def _metric_method(method: str) -> str:
+    """Map the request method onto the bounded label set (else ``other``)."""
+    return method if method in _METRIC_METHODS else "other"
+
 
 def _get_client_ip(request: Request) -> str:
     """
@@ -42,10 +53,12 @@ class AccessLogMiddleware(BaseHTTPMiddleware):
     """
     Middleware to log HTTP access information as structured JSON events:
     - Client IP address
-    - HTTP method and path
+    - HTTP method and path (without query string: it can carry tokens)
     - User agent
     - Response status code and size
     - Processing duration (ms)
+
+    The Referer header is not logged either (it can carry tokens and PII).
     """
 
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
@@ -55,10 +68,7 @@ class AccessLogMiddleware(BaseHTTPMiddleware):
         client_ip = _get_client_ip(request)
         method = request.method
         path = request.url.path
-        query_string = request.url.query
-        full_path = f"{path}?{query_string}" if query_string else path
         user_agent = request.headers.get("user-agent", "-")
-        referer = request.headers.get("referer", "-")
 
         # Process the request and measure duration
         start = __import__("time").perf_counter()
@@ -74,12 +84,11 @@ class AccessLogMiddleware(BaseHTTPMiddleware):
             "http.access",
             client_ip=client_ip,
             method=method,
-            path=full_path,
+            path=path,
             status_code=status_code,
             content_length=content_length,
             duration_ms=duration_ms,
             user_agent=user_agent,
-            referer=referer,
         )
         return response
 
@@ -115,9 +124,10 @@ class MetricsMiddleware(BaseHTTPMiddleware):
         # Increment active connections
         ACTIVE_CONNECTIONS.inc()
 
+        method = _metric_method(request.method)
         try:
-            # Get request information
-            method = request.method
+            # Process the request; routing sets scope["route"] on a match.
+            response: Response = await call_next(request)
             path_template = self._get_path_template(request)
 
             # Measure request size
@@ -125,9 +135,6 @@ class MetricsMiddleware(BaseHTTPMiddleware):
             HTTP_REQUEST_SIZE_BYTES.labels(
                 method=method, endpoint=path_template
             ).observe(request_size)
-
-            # Process the request
-            response: Response = await call_next(request)
 
             # Calculate processing time
             duration = time.perf_counter() - start_time
@@ -168,27 +175,16 @@ class MetricsMiddleware(BaseHTTPMiddleware):
 
     def _get_path_template(self, request: Request) -> str:
         """
-        Get the path template for the request, falling back to the raw path.
-        This helps group similar paths together (e.g., /users/{id}).
+        Return the route template (e.g. ``/users/{id}``) of the matched route.
+
+        Read after ``call_next``: the router stores the matched route in
+        ``scope["route"]``. Unmatched requests (404 scans) all share the label
+        ``unmatched``, so arbitrary paths cannot create new label values
+        (bounded cardinality).
         """
-        try:
-            # Try to get the route pattern if available
-            if hasattr(request, "route") and hasattr(request.route, "path"):
-                return request.route.path
-        except AttributeError:
-            pass
-
-        # Fallback to raw path
-        path = request.url.path
-
-        # Simple path normalization for common patterns
-        # Convert paths like /users/123 to /users/{id}
-        import re
-
-        path = re.sub(r"/\d+", "/{id}", path)
-        path = re.sub(r"/[a-f0-9-]{36}", "/{uuid}", path)  # UUID pattern
-
-        return path
+        route = request.scope.get("route")
+        path = getattr(route, "path", None)
+        return path if isinstance(path, str) and path else "unmatched"
 
 
 class CORSMiddleware(BaseHTTPMiddleware):
