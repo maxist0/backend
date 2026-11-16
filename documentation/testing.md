@@ -4,9 +4,9 @@
 
 The project uses **pytest** for unit and integration testing with the following structure:
 
-- **Unit tests**: Test individual functions/components in isolation
-- **Integration tests**: Test API endpoints and database operations
-- **End-to-end tests**: Test complete workflows
+- **Unit tests** (`tests/unit/`): Pure logic, no Docker, run in seconds
+- **Integration tests** (`tests/integration/`): API endpoints and database operations against Postgres and Redis Testcontainers
+- **No backend end-to-end folder**: End-to-end journeys are covered by frontend Playwright ([ADR 0007](adr/0007-test-split-unit-integration.md))
 - **Test database**: Isolated PostgreSQL instance
 - **Test Redis**: Isolated Redis instance for cache testing
 - **Fixtures**: Reusable test setup (users, sessions, etc.)
@@ -17,17 +17,18 @@ Testing is configured in `pytest.ini` to automatically use the **test environmen
 
 ```
 tests/
-├── __init__.py
-├── test_api.py           # Basic API tests
-├── conftest.py           # Shared fixtures
-├── unit/                 # Unit tests (if applicable)
-│   └── test_auth.py
-├── integration/          # Integration tests
-│   ├── test_auth_endpoints.py
-│   ├── test_user_endpoints.py
-│   └── test_cache.py
-└── e2e/                  # End-to-end tests
-    └── test_auth_flow.py
+├── conftest.py           # Environment setup and the unit/integration markers only
+├── helpers.py            # Shared helper functions
+├── unit/                 # No Docker
+│   ├── conftest.py       # settings_factory, fresh_settings
+│   ├── core/
+│   └── modules/auth/
+└── integration/          # Needs Docker (Testcontainers)
+    ├── conftest.py       # containers, client, db, captured_emails
+    ├── core/
+    ├── contract/
+    ├── modules/auth/
+    └── admin/
 ```
 
 ## Running Tests
@@ -35,25 +36,21 @@ tests/
 ### All Tests
 
 ```bash
-pytest
-
-# Output:
-# tests/test_api.py::test_health_check PASSED
-# tests/integration/test_auth_endpoints.py::test_register PASSED
-# tests/integration/test_user_endpoints.py::test_get_profile PASSED
-# ======================== 3 passed in 0.42s ========================
+uv run pytest                          # unit + integration, coverage gate; needs Docker
+uv run pytest tests/unit --no-cov      # unit only, no Docker; --no-cov skips the gate
+uv run pytest tests/integration -x     # integration only
 ```
 
 ### Specific Test File
 
 ```bash
-pytest tests/integration/test_auth_endpoints.py
+uv run pytest tests/integration/modules/auth/test_auth.py
 ```
 
 ### Specific Test Function
 
 ```bash
-pytest tests/integration/test_auth_endpoints.py::test_register
+uv run pytest tests/integration/modules/auth/test_auth.py::TestRegister
 ```
 
 ### With Coverage Report

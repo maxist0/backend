@@ -124,7 +124,8 @@ addopts = "-v -ra --tb=short --cov=app --cov-report=term-missing"
 markers = [
     "auth: tests related to authentication and authorization",
     "users: tests for user management",
-    "unit: isolated logic tests",
+    "unit: pure logic, no Docker (tests/unit)",
+    "integration: HTTP against Postgres and Redis Testcontainers (tests/integration)",
     "root: test root endpoint and basic app functionality",
 ]
 # Later entries take precedence over earlier ones, so the targeted ignores sit
@@ -142,7 +143,7 @@ filterwarnings = [
     # cashews 7.6.0 (latest on 2026-11-16) still calls the deprecated redis-py
     # Redis.close() in backends/redis/backend.py when the route cache shuts
     # down. Upstream; the app's own redis client uses aclose(). Remove together
-    # with tests/common/test_upgrade_libraries.py::TestRedisPy8::
+    # with tests/integration/core/test_upgrade_libraries.py::TestRedisPy8::
     # test_cashews_still_calls_the_deprecated_redis_close once that test fails.
     "ignore:Call to deprecated close:DeprecationWarning:cashews",
 ]

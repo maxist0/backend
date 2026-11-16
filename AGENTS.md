@@ -34,14 +34,14 @@ uv run python run.py dev                    # API on :8000 + taskiq worker, read
 uvx ruff@0.15.0 check src tests             # lint (S3 switches to `uv run ruff`, lint group)
 uvx ruff@0.15.0 format src tests            # format
 uv run mypy src                             # types (strict mode arrives in S3)
-uv run pytest tests/unit                    # fast, no Docker (target); the coverage gate applies only to the full run
-uv run pytest                               # full suite; needs a running Docker daemon
+uv run pytest tests/unit --no-cov           # fast loop, no Docker; the coverage gate applies only to the full run
+uv run pytest                               # full suite (unit + integration, coverage gate); needs a running Docker daemon
 uv run pytest tests/integration -k "refresh" -x
 uv run alembic revision --autogenerate -m "describe_change"   # after model changes, then review the file
 docker build -t api:latest .                # image
 ```
 
-`pytest` adds `--cov` through `addopts` (`pyproject.toml`). For a quick unit run without the coverage gate, pass `--no-cov`. Use `uv run ...`; never `pip install` or activate a virtualenv by hand. If `.venv` is broken, `uv sync --reinstall`.
+`pytest` adds `--cov` through `addopts` (`pyproject.toml`). A unit-only run cannot reach the coverage threshold, so pass `--no-cov` for it. Use `uv run ...`; never `pip install` or activate a virtualenv by hand. If `.venv` is broken, `uv sync --reinstall`.
 
 ## Where things are *(target)*
 
