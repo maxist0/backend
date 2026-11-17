@@ -17,9 +17,11 @@ class TestMetricsCardinality:
 
     def test_matched_route_uses_its_path_template(self, client):
         """GUARD: real routes keep a bounded, meaningful label."""
-        client.post("/auth/login", data={"username": "ghost", "password": "x" * 10})
+        client.post(
+            "/api/v1/auth/login", data={"username": "ghost", "password": "x" * 10}
+        )
         body = client.get("/metrics").text
-        assert 'endpoint="/auth/login"' in body
+        assert 'endpoint="/api/v1/auth/login"' in body
 
     def test_unknown_http_method_collapses_into_the_other_label(self, client):
         """The method label comes from the client, so it must be bounded."""
@@ -34,7 +36,9 @@ class TestMetricsCardinality:
     def test_standard_methods_keep_their_label(self, client):
         """GUARD: the bounded set still distinguishes the real methods."""
         client.get("/")
-        client.post("/auth/login", data={"username": "ghost", "password": "x" * 10})
+        client.post(
+            "/api/v1/auth/login", data={"username": "ghost", "password": "x" * 10}
+        )
         body = client.get("/metrics").text
         assert 'method="GET"' in body
         assert 'method="POST"' in body

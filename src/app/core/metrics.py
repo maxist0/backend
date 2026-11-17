@@ -8,6 +8,7 @@ import time
 from datetime import datetime
 
 from fastapi import APIRouter, Request, Response
+from pydantic import BaseModel
 from prometheus_client import (
     Counter,
     Histogram,
@@ -19,7 +20,6 @@ from prometheus_client import (
 from prometheus_client.core import CollectorRegistry
 
 from app.core.config import SettingsDep
-from app.core.responses import SuccessResponse, ok_response
 
 
 # Create a custom registry for this application
@@ -171,28 +171,32 @@ async def metrics(request: Request):
     return Response(content=metrics_data, media_type=get_metrics_content_type())
 
 
-@router.get("/health", response_model=SuccessResponse)
-async def health_check(request: Request, settings: SettingsDep):
-    """
-    Health check endpoint with standardized response.
+class MetricsHealthResponse(BaseModel):
+    """Liveness payload of `GET /metrics/health`."""
 
-    Simple endpoint to verify the API is running.
-    """
+    status: str
+    service: str
+    metrics_available: bool
+    pod_name: str | None
+    node_name: str | None
+    uptime_seconds: float
+
+
+@router.get("/health", summary="Liveness check")
+async def health_check(
+    request: Request, settings: SettingsDep
+) -> MetricsHealthResponse:
+    """Report that the API process is running."""
     start_time = (
         request.app.state.start_time
         if hasattr(request.app.state, "start_time")
         else datetime.now()
     )
-
-    health_data = {
-        "status": "healthy",
-        "service": settings.APP_NAME,
-        "metrics_available": True,
-        "pod_name": os.getenv("MY_POD_NAME"),
-        "node_name": os.getenv("MY_NODE_NAME"),
-        "uptime_seconds": datetime.now().timestamp() - start_time.timestamp()
-        if start_time
-        else None,
-    }
-
-    return ok_response(data=health_data, request=request, start_time=start_time)
+    return MetricsHealthResponse(
+        status="healthy",
+        service=settings.APP_NAME,
+        metrics_available=True,
+        pod_name=os.getenv("MY_POD_NAME"),
+        node_name=os.getenv("MY_NODE_NAME"),
+        uptime_seconds=datetime.now().timestamp() - start_time.timestamp(),
+    )

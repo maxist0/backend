@@ -1,6 +1,9 @@
-"""Errors: exception types, envelope handlers and database error inspection.
+"""Errors: the `AppError` family, RFC 9457 handlers and database error inspection.
 
-The handlers still render the response envelope; RFC 9457 replaces them.
+Services raise `AppError` subclasses; `register_error_handlers` turns them,
+request validation errors, Starlette `HTTPException`s and unexpected
+exceptions into `application/problem+json` responses (RFC 9457) with a
+stable machine-readable `code` and the request id.
 
 PostgreSQL error text can contain row values (`DETAIL: Key (email)=(...)`),
 which are personal data. Code that reacts to a database error or logs one
@@ -9,30 +12,315 @@ and the constraint name. They come from psycopg 3's diagnostics
 (`exc.orig.diag`), the only supported driver.
 """
 
-from datetime import datetime
+import re
+from collections.abc import Mapping, Sequence
+from http import HTTPStatus
+from typing import Any
 
 import structlog
-from fastapi import HTTPException, Request, status
+from fastapi import FastAPI, Request, Response
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.exc import DBAPIError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.core.logging import get_logger
-from app.core.responses import error_response
-from app.core.schemas import ErrorCode
 
 logger = get_logger(__name__)
 
+PROBLEM_JSON = "application/problem+json"
+_INTERNAL_ERROR_DETAIL = "An unexpected error occurred."
 
-class AuthenticationError(HTTPException):
-    """Missing or invalid credentials: 401 with `WWW-Authenticate: Bearer`."""
 
-    def __init__(self, detail: str = "Authentication failed"):
+class AppError(Exception):
+    """Base of every error a service raises on purpose.
+
+    Subclasses set `status`, `code` and a default `detail`; `title` defaults
+    to the HTTP reason phrase of `status`.
+
+    Args:
+        detail: Human-readable explanation of this occurrence; defaults to
+            the class's `detail`.
+        headers: Extra response headers, for example `Retry-After`.
+        **extensions: Extra top-level members of the problem object.
+    """
+
+    status: int = 500
+    code: str = "internal_error"
+    title: str | None = None
+    detail: str = _INTERNAL_ERROR_DETAIL
+
+    def __init__(
+        self,
+        detail: str | None = None,
+        *,
+        headers: dict[str, str] | None = None,
+        **extensions: Any,
+    ) -> None:
+        if detail is not None:
+            self.detail = detail
+        self.headers = dict(headers or {})
+        self.extensions = extensions
+        super().__init__(self.detail)
+
+
+class BadRequest(AppError):
+    """400: the request is syntactically valid but cannot be processed."""
+
+    status = 400
+    code = "bad_request"
+    detail = "The request cannot be processed."
+
+
+class Unauthorized(AppError):
+    """401: missing or invalid credentials; always sends `WWW-Authenticate`."""
+
+    status = 401
+    code = "unauthorized"
+    detail = "Authentication required."
+
+    def __init__(
+        self,
+        detail: str | None = None,
+        *,
+        headers: dict[str, str] | None = None,
+        **extensions: Any,
+    ) -> None:
         super().__init__(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=detail,
-            headers={"WWW-Authenticate": "Bearer"},
+            detail,
+            headers={"WWW-Authenticate": "Bearer", **(headers or {})},
+            **extensions,
         )
+
+
+class Forbidden(AppError):
+    """403: authenticated, but not allowed to do this."""
+
+    status = 403
+    code = "forbidden"
+    detail = "You are not allowed to perform this action."
+
+
+class NotFound(AppError):
+    """404: the resource does not exist (or is not visible to the caller)."""
+
+    status = 404
+    code = "not_found"
+    detail = "The resource was not found."
+
+
+class Conflict(AppError):
+    """409: the request conflicts with the current state of a resource."""
+
+    status = 409
+    code = "conflict"
+    detail = "The request conflicts with the current state of the resource."
+
+
+class FieldError(BaseModel):
+    """One invalid input of a 422 problem."""
+
+    field: str = Field(
+        description="Body field path (`email`, `items.0.name`) or "
+        "`<source>.<name>` for other sources (`query.limit`)."
+    )
+    code: str = Field(description="Pydantic error type, e.g. `missing`.")
+    message: str
+
+
+class ProblemDetail(BaseModel):
+    """RFC 9457 problem details as returned by every error response."""
+
+    model_config = ConfigDict(extra="allow")
+
+    type: str = "about:blank"
+    title: str
+    status: int
+    detail: str
+    code: str = Field(description="Stable machine-readable error code.")
+    request_id: str | None = Field(
+        default=None, description="Same value as the `X-Request-ID` header."
+    )
+    errors: list[FieldError] | None = Field(
+        default=None, description="Only on 422 `validation_error`."
+    )
+
+
+def problem_responses(
+    *errors: int | type[AppError],
+) -> dict[int | str, dict[str, Any]]:
+    """Build a route's `responses=` entries for the errors it can produce.
+
+    Args:
+        *errors: `AppError` subclasses, or a bare status (`422` documents
+            `validation_error`).
+
+    Returns:
+        One `application/problem+json` response per status; its description
+        lists the possible `code` values.
+    """
+    codes: dict[int, list[str]] = {}
+    for error in errors:
+        if isinstance(error, int):
+            status = error
+            code = "validation_error" if error == 422 else _code_for_status(error)
+        else:
+            status, code = error.status, error.code
+        codes.setdefault(status, [])
+        if code not in codes[status]:
+            codes[status].append(code)
+    return {
+        status: {
+            "description": f"{HTTPStatus(status).phrase}: "
+            + ", ".join(f"`{code}`" for code in status_codes),
+            "content": {
+                PROBLEM_JSON: {"schema": {"$ref": "#/components/schemas/ProblemDetail"}}
+            },
+        }
+        for status, status_codes in sorted(codes.items())
+    }
+
+
+def _code_for_status(status: int) -> str:
+    """`code` for a bare status: the reason phrase in snake case."""
+    try:
+        phrase = HTTPStatus(status).phrase
+    except ValueError:
+        return "http_error"
+    return re.sub(r"[^a-z0-9]+", "_", phrase.lower()).strip("_")
+
+
+def problem_response(
+    status: int,
+    code: str,
+    detail: str,
+    *,
+    title: str | None = None,
+    headers: Mapping[str, str] | None = None,
+    extensions: dict[str, Any] | None = None,
+) -> JSONResponse:
+    """Render an RFC 9457 problem response.
+
+    `request_id` comes from the structlog context the request middleware
+    binds; it is omitted when there is none. Extensions cannot replace the
+    standard members.
+    """
+    body: dict[str, Any] = {
+        "type": "about:blank",
+        "title": title or HTTPStatus(status).phrase,
+        "status": status,
+        "detail": detail,
+        "code": code,
+    }
+    request_id = structlog.contextvars.get_contextvars().get("request_id")
+    if request_id:
+        body["request_id"] = request_id
+    for name, value in jsonable_encoder(extensions or {}).items():
+        body.setdefault(name, value)
+    return JSONResponse(
+        body, status_code=status, headers=headers, media_type=PROBLEM_JSON
+    )
+
+
+def field_errors(errors: Sequence[Any]) -> list[dict[str, str]]:
+    """Map pydantic/FastAPI validation errors onto `errors[]` entries.
+
+    Only `loc`, `type` and `msg` are used: `input` and `ctx` can echo what
+    the client sent (a password, for example).
+    """
+    result: list[dict[str, str]] = []
+    for error in errors:
+        loc = [str(part) for part in error.get("loc", ())]
+        if loc and loc[0] == "body":
+            loc = loc[1:] or ["body"]
+        result.append(
+            {
+                "field": ".".join(loc),
+                "code": str(error.get("type", "value_error")),
+                "message": str(error.get("msg", "")),
+            }
+        )
+    return result
+
+
+async def _app_error_handler(request: Request, exc: AppError) -> Response:
+    return problem_response(
+        exc.status,
+        exc.code,
+        exc.detail,
+        title=exc.title,
+        headers=exc.headers,
+        extensions=exc.extensions,
+    )
+
+
+async def _validation_error_handler(
+    request: Request, exc: RequestValidationError
+) -> Response:
+    return problem_response(
+        422,
+        "validation_error",
+        "The request contains invalid input.",
+        extensions={"errors": field_errors(exc.errors())},
+    )
+
+
+async def _http_exception_handler(
+    request: Request, exc: StarletteHTTPException
+) -> Response:
+    # Same rule as Starlette's own handler: these statuses carry no body.
+    if exc.status_code in {204, 304}:
+        return Response(status_code=exc.status_code, headers=exc.headers)
+    detail = exc.detail if isinstance(exc.detail, str) else None
+    return problem_response(
+        exc.status_code,
+        _code_for_status(exc.status_code),
+        detail or HTTPStatus(exc.status_code).phrase,
+        headers=exc.headers,
+    )
+
+
+async def _unexpected_error_handler(request: Request, exc: Exception) -> Response:
+    # Starlette runs this handler in ServerErrorMiddleware, outside the user
+    # middleware. The request middleware binds the request id in a child task
+    # (BaseHTTPMiddleware), so neither the X-Request-ID header nor `request_id`
+    # is available here; the response omits both.
+    log_unexpected_error(logger, "app.unhandled_exception", exc)
+    return problem_response(500, "internal_error", _INTERNAL_ERROR_DETAIL)
+
+
+def register_error_handlers(app: FastAPI) -> None:
+    """Install the problem-details handlers and the `ProblemDetail` schema.
+
+    Routes reference `#/components/schemas/ProblemDetail` through
+    `problem_responses`; FastAPI adds only schemas that a route uses as a
+    model, so the schema is added to the generated document here (the
+    "Extending OpenAPI" pattern of the FastAPI docs).
+    """
+    # The decorator form accepts handlers typed for their exception class.
+    app.exception_handler(AppError)(_app_error_handler)
+    app.exception_handler(RequestValidationError)(_validation_error_handler)
+    app.exception_handler(StarletteHTTPException)(_http_exception_handler)
+    app.exception_handler(Exception)(_unexpected_error_handler)
+
+    generate_openapi = app.openapi
+
+    def openapi() -> dict[str, Any]:
+        if app.openapi_schema is None:
+            schema = generate_openapi()
+            definitions = ProblemDetail.model_json_schema(
+                ref_template="#/components/schemas/{model}"
+            )
+            components = schema.setdefault("components", {}).setdefault("schemas", {})
+            components.update(definitions.pop("$defs", {}))
+            components["ProblemDetail"] = definitions
+        return app.openapi_schema or {}
+
+    # Assigning `app.openapi` is FastAPI's documented extension point; mypy
+    # treats it as a method assignment.
+    app.openapi = openapi  # type: ignore[method-assign]
 
 
 def _driver_error(exc: DBAPIError) -> object:
@@ -86,86 +374,4 @@ def log_unexpected_error(
         db_error_type=type(db_error).__name__,
         sqlstate=sqlstate(db_error),
         constraint=constraint_name(db_error),
-    )
-
-
-async def generic_exception_handler(request: Request, exc: Exception) -> JSONResponse:
-    """Answer any unhandled exception with a generic 500 envelope.
-
-    Only the exception type is logged (see `log_unexpected_error`); the
-    response carries no internals.
-    """
-    log_unexpected_error(logger, "app.unhandled_exception", exc)
-    start_time = datetime.now()
-    return error_response(
-        message="An unexpected error occurred",
-        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        error_code=ErrorCode.INTERNAL_ERROR,
-        request=request,
-        start_time=start_time,
-    )
-
-
-async def validation_exception_handler(
-    request: Request, exc: Exception
-) -> JSONResponse:
-    """Return request-validation errors in the standard error envelope."""
-
-    if not isinstance(exc, RequestValidationError):
-        logger.warning(
-            "app.validation_exception_handler_called_with_non_validation_error",
-            error_type=type(exc).__name__,
-        )
-        return await generic_exception_handler(request, exc)
-
-    start_time = datetime.now()
-    errors = exc.errors()
-
-    # Build a human-readable summary from the first error
-    first = errors[0] if errors else {}
-    loc = " -> ".join(str(loc) for loc in first.get("loc", []) if loc != "body")
-    msg = first.get("msg", "Validation error")
-    message = f"{loc}: {msg}" if loc else msg
-
-    # Include all individual errors in details
-    detail_list = [
-        {
-            "field": " -> ".join(str(loc) for loc in e.get("loc", []) if loc != "body"),
-            "message": e.get("msg", ""),
-            "type": e.get("type", ""),
-        }
-        for e in errors
-    ]
-
-    return error_response(
-        message=message,
-        error_code=ErrorCode.VALIDATION_ERROR,
-        field=loc or None,
-        details={"validation_errors": detail_list},
-        request=request,
-        start_time=start_time,
-        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-    )
-
-
-async def authentication_exception_handler(
-    request: Request, exc: Exception
-) -> JSONResponse:
-    """Return authentication errors in the standard error envelope."""
-    if not isinstance(exc, AuthenticationError):
-        logger.warning(
-            "app.authentication_exception_handler_called_with_non_authentication_error",
-            error_type=type(exc).__name__,
-        )
-        return await generic_exception_handler(request, exc)
-
-    start_time = datetime.now()
-    detail = exc.detail
-    return error_response(
-        message="Authentication failed",
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        error_code=ErrorCode.UNAUTHORIZED,
-        details={"error": detail},
-        request=request,
-        start_time=start_time,
     )

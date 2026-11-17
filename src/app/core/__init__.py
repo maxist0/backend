@@ -10,20 +10,38 @@ settings and opens no connection.
 
 from app.core.config import Settings, SettingsDep, get_settings
 from app.core.database import Base, DbSession, utcnow
-from app.core.errors import log_unexpected_error
+from app.core.errors import (
+    AppError,
+    BadRequest,
+    Conflict,
+    Forbidden,
+    NotFound,
+    ProblemDetail,
+    Unauthorized,
+    log_unexpected_error,
+    problem_responses,
+)
 from app.core.logging import get_logger
 from app.core.module import Module
 from app.core.tasks import task
 
 __all__ = [
+    "AppError",
+    "BadRequest",
     "Base",
+    "Conflict",
     "DbSession",
+    "Forbidden",
     "Module",
+    "NotFound",
+    "ProblemDetail",
     "Settings",
     "SettingsDep",
+    "Unauthorized",
     "get_logger",
     "get_settings",
     "log_unexpected_error",
+    "problem_responses",
     "task",
     "utcnow",
 ]

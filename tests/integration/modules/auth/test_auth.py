@@ -1,4 +1,4 @@
-"""Integration tests for the `/auth` endpoints.
+"""Integration tests for the `/api/v1/auth` endpoints.
 
 Real PostgreSQL and Redis come from the integration fixtures; no service layer
 is mocked, so every test exercises the full stack. The `captured_emails`
@@ -25,11 +25,13 @@ def register(
     }
     if display_name:
         payload["display_name"] = display_name
-    return client.post("/auth/register", json=payload)
+    return client.post("/api/v1/auth/register", json=payload)
 
 
 def login(client, *, username: str, password: str = "Password123!"):
-    return client.post("/auth/login", data={"username": username, "password": password})
+    return client.post(
+        "/api/v1/auth/login", data={"username": username, "password": password}
+    )
 
 
 def bearer(access_token: str) -> dict:
@@ -40,9 +42,7 @@ class TestRegister:
     def test_success_returns_201_with_user_data(self, client, captured_emails):
         r = register(client, username="alice", display_name="Alice")
         assert r.status_code == 201
-        body = r.json()
-        assert body["success"] is True
-        user = body["data"]["user"]
+        user = r.json()
         assert user["username"] == "alice"
         assert user["email"] == "alice@example.com"
         assert user["display_name"] == "Alice"
@@ -60,23 +60,23 @@ class TestRegister:
         r = register(client, username="alice", email="alice2@example.com")
         assert r.status_code == 409
         body = r.json()
-        assert body["success"] is False
-        assert "Username already taken" in body["error"]["message"]
+        assert body["code"] == "user_exists"
+        assert body["detail"] == "Username already taken"
 
     def test_duplicate_email_returns_409(self, client, captured_emails):
         register(client, username="alice", email="shared@example.com")
         r = register(client, username="alice2", email="shared@example.com")
         assert r.status_code == 409
         body = r.json()
-        assert body["success"] is False
-        assert "Email already registered" in body["error"]["message"]
+        assert body["code"] == "user_exists"
+        assert body["detail"] == "Email already registered"
 
     def test_invalid_email_format_returns_422(self, client):
         r = register(client, username="alice", email="not-an-email")
         assert r.status_code == 422
         body = r.json()
-        assert body["success"] is False
-        assert "validation_errors" in body["error"]["details"]
+        assert body["code"] == "validation_error"
+        assert [e["field"] for e in body["errors"]] == ["email"]
 
     def test_username_too_short_returns_422(self, client):
         r = register(client, username="ab")  # min_length=3
@@ -97,7 +97,7 @@ class TestRegister:
     def test_email_is_lowercased(self, client, captured_emails):
         r = register(client, username="alice", email="Alice@Example.COM")
         assert r.status_code == 201
-        assert r.json()["data"]["user"]["email"] == "alice@example.com"
+        assert r.json()["email"] == "alice@example.com"
 
 
 class TestLogin:
@@ -109,14 +109,24 @@ class TestLogin:
 
         assert r.status_code == 200
         body = r.json()
-        assert body["success"] is True
-        assert body["metadata"]["request_id"]
-        assert "access_token" in body["data"]
-        assert body["access_token"] == body["data"]["access_token"]
-        assert body["data"]["token_type"] == "bearer"
-        assert body["token_type"] == body["data"]["token_type"]
-        assert body["data"]["user"]["username"] == "alice"
+        assert set(body) == {"access_token", "token_type", "expires_in", "user"}
+        assert body["access_token"]
+        assert body["token_type"] == "bearer"
+        assert body["expires_in"] == 15 * 60
+        assert body["user"]["username"] == "alice"
         assert "refresh_token" in client.cookies
+
+    def test_refresh_cookie_is_scoped_to_the_prefixed_auth_routes(
+        self, client, captured_emails
+    ):
+        """The browser must send the cookie to `/api/v1/auth/refresh`."""
+        register(client, username="alice")
+        r = login(client, username="alice")
+
+        cookie = r.headers["set-cookie"]
+        assert "Path=/api/v1/auth" in cookie
+        assert "HttpOnly" in cookie
+        assert "SameSite=lax" in cookie
 
     def test_wrong_password_returns_401(self, client, captured_emails):
         register(client, username="alice")
@@ -145,8 +155,7 @@ class TestLogin:
         # Even correct password must now be rejected
         r = login(client, username="alice")
         assert r.status_code == 401
-        body = r.json()
-        assert body["success"] is False
+        assert r.json()["code"] == "invalid_credentials"
 
     def test_failed_attempt_counter_resets_on_successful_login(
         self, client, captured_emails
@@ -174,26 +183,37 @@ class TestLogin:
 
 
 class TestLogout:
-    def test_success_returns_200_and_revokes_session(self, client, captured_emails):
+    def test_success_returns_204_and_clears_cookie(self, client, captured_emails, db):
         register(client, username="alice")
         login(client, username="alice")
 
-        r = client.post("/auth/logout")
-        assert r.status_code == 200
-        assert r.json()["success"] is True
+        r = client.post("/api/v1/auth/logout")
+        assert r.status_code == 204
+        assert r.content == b""
+        assert 'refresh_token=""' in r.headers["set-cookie"]
+        assert "Path=/api/v1/auth" in r.headers["set-cookie"]
+        assert db.scalar("SELECT revoke_reason FROM sessions") == "logout"
 
     def test_refresh_after_logout_returns_401(self, client, captured_emails):
         register(client, username="alice")
         login(client, username="alice")
-        client.post("/auth/logout")
+        client.post("/api/v1/auth/logout")
 
         # Session is revoked in DB and cache deleted — refresh must fail
-        r = client.post("/auth/refresh")
+        r = client.post("/api/v1/auth/refresh")
         assert r.status_code == 401
 
     def test_without_cookie_returns_401(self, client):
-        r = client.post("/auth/logout")
+        r = client.post("/api/v1/auth/logout")
         assert r.status_code == 401
+        assert r.json()["code"] == "invalid_refresh_token"
+
+    def test_unknown_session_returns_400(self, client):
+        r = client.post(
+            "/api/v1/auth/logout", headers={"Cookie": "refresh_token=unknown"}
+        )
+        assert r.status_code == 400
+        assert r.json()["code"] == "session_not_found"
 
 
 class TestRefresh:
@@ -204,13 +224,13 @@ class TestRefresh:
         login(client, username="alice")
 
         old_refresh = client.cookies.get("refresh_token")
-        r = client.post("/auth/refresh")
+        r = client.post("/api/v1/auth/refresh")
 
         assert r.status_code == 200
         body = r.json()
-        assert "access_token" in body["data"]
-        assert body["access_token"] == body["data"]["access_token"]
-        assert body["token_type"] == body["data"]["token_type"]
+        assert set(body) == {"access_token", "token_type", "expires_in"}
+        assert body["token_type"] == "bearer"
+        assert body["expires_in"] == 15 * 60
 
         new_refresh = client.cookies.get("refresh_token")
         assert new_refresh is not None
@@ -222,13 +242,11 @@ class TestRefresh:
         register(client, username="alice")
         login(client, username="alice")
 
-        new_access = client.post("/auth/refresh").json()["data"]["access_token"]
+        new_access = client.post("/api/v1/auth/refresh").json()["access_token"]
 
         # Any authenticated endpoint will do; resend verification is convenient
-        r = client.post("/auth/email/verify/resend", headers=bearer(new_access))
-        # 401 would mean the token is invalid; 400 means auth passed but email
-        # is already verified or some other business-logic rejection — both fine
-        assert r.status_code != 401
+        r = client.post("/api/v1/auth/email/verify/resend", headers=bearer(new_access))
+        assert r.status_code == 202
 
     def test_old_refresh_token_triggers_reuse_detection(self, client, captured_emails):
         register(client, username="alice")
@@ -237,7 +255,7 @@ class TestRefresh:
         old_refresh = client.cookies.get("refresh_token")
 
         # Legitimate rotation; the response puts the newest token in the jar.
-        assert client.post("/auth/refresh").status_code == 200
+        assert client.post("/api/v1/auth/refresh").status_code == 200
         newest_refresh = client.cookies.get("refresh_token")
         assert newest_refresh and newest_refresh != old_refresh
 
@@ -245,71 +263,78 @@ class TestRefresh:
         # jar content cannot influence which token is sent).
         client.cookies.clear()
         r = client.post(
-            "/auth/refresh", headers={"Cookie": f"refresh_token={old_refresh}"}
+            "/api/v1/auth/refresh", headers={"Cookie": f"refresh_token={old_refresh}"}
         )
         assert r.status_code == 401
+        assert r.json()["code"] == "invalid_refresh_token"
 
         # Reuse detection must have revoked the whole family: the NEWEST token,
         # sent in isolation, must be dead too. (The previous version of this test
         # re-sent the replayed OLD token and therefore proved nothing.)
         r2 = client.post(
-            "/auth/refresh", headers={"Cookie": f"refresh_token={newest_refresh}"}
+            "/api/v1/auth/refresh",
+            headers={"Cookie": f"refresh_token={newest_refresh}"},
         )
         assert r2.status_code == 401
 
     def test_without_cookie_returns_401(self, client):
-        r = client.post("/auth/refresh")
+        r = client.post("/api/v1/auth/refresh")
         assert r.status_code == 401
+        assert r.json()["code"] == "invalid_refresh_token"
+        assert r.headers["www-authenticate"] == "Bearer"
 
     def test_garbage_token_returns_401(self, client):
         client.cookies.set("refresh_token", "not-a-real-token-at-all")
-        r = client.post("/auth/refresh")
+        r = client.post("/api/v1/auth/refresh")
         assert r.status_code == 401
 
 
 class TestPasswordForgotReset:
-    def test_forgot_existing_email_returns_200(self, client, captured_emails):
+    def test_forgot_existing_email_returns_202(self, client, captured_emails):
         register(client, username="alice")
-        r = client.post("/auth/password/forgot", json={"email": "alice@example.com"})
-        assert r.status_code == 200
-        assert r.json()["success"] is True
+        r = client.post(
+            "/api/v1/auth/password/forgot", json={"email": "alice@example.com"}
+        )
+        assert r.status_code == 202
+        assert r.content == b""
 
     def test_forgot_sends_token(self, client, captured_emails):
         register(client, username="alice")
         captured_emails.clear()  # discard the registration token
 
-        client.post("/auth/password/forgot", json={"email": "alice@example.com"})
+        client.post("/api/v1/auth/password/forgot", json={"email": "alice@example.com"})
         assert "alice@example.com" in captured_emails
         assert len(captured_emails["alice@example.com"]) > 10
 
-    def test_forgot_nonexistent_email_still_returns_200(self, client):
+    def test_forgot_nonexistent_email_still_returns_202(self, client):
         """Must not leak whether the address is registered."""
-        r = client.post("/auth/password/forgot", json={"email": "nobody@example.com"})
-        assert r.status_code == 200
-        assert r.json()["success"] is True
+        r = client.post(
+            "/api/v1/auth/password/forgot", json={"email": "nobody@example.com"}
+        )
+        assert r.status_code == 202
+        assert r.content == b""
 
     def test_forgot_missing_email_field_returns_422(self, client):
-        r = client.post("/auth/password/forgot", json={})
+        r = client.post("/api/v1/auth/password/forgot", json={})
         assert r.status_code == 422
 
-    def test_reset_with_valid_token_returns_200(self, client, captured_emails):
+    def test_reset_with_valid_token_returns_204(self, client, captured_emails):
         register(client, username="alice")
-        client.post("/auth/password/forgot", json={"email": "alice@example.com"})
+        client.post("/api/v1/auth/password/forgot", json={"email": "alice@example.com"})
         token = captured_emails["alice@example.com"]
 
         r = client.post(
-            "/auth/password/reset",
+            "/api/v1/auth/password/reset",
             json={"token": token, "new_password": "NewPassword456!"},
         )
-        assert r.status_code == 200
-        assert r.json()["success"] is True
+        assert r.status_code == 204
 
     def test_can_login_with_new_password_after_reset(self, client, captured_emails):
         register(client, username="alice")
-        client.post("/auth/password/forgot", json={"email": "alice@example.com"})
+        client.post("/api/v1/auth/password/forgot", json={"email": "alice@example.com"})
         token = captured_emails["alice@example.com"]
         client.post(
-            "/auth/password/reset",
+            "/api/v1/auth/password/reset",
             json={"token": token, "new_password": "NewPassword456!"},
         )
 
@@ -326,23 +351,23 @@ class TestPasswordForgotReset:
 
     def test_reset_with_invalid_token_returns_400(self, client):
         r = client.post(
-            "/auth/password/reset",
+            "/api/v1/auth/password/reset",
             json={"token": "totallyinvalidtoken", "new_password": "NewPassword456!"},
         )
         assert r.status_code == 400
-        assert r.json()["success"] is False
+        assert r.json()["code"] == "invalid_token"
 
     def test_reset_token_cannot_be_reused(self, client, captured_emails):
         register(client, username="alice")
-        client.post("/auth/password/forgot", json={"email": "alice@example.com"})
+        client.post("/api/v1/auth/password/forgot", json={"email": "alice@example.com"})
         token = captured_emails["alice@example.com"]
 
         client.post(
-            "/auth/password/reset",
+            "/api/v1/auth/password/reset",
             json={"token": token, "new_password": "NewPassword456!"},
         )
         r = client.post(
-            "/auth/password/reset",
+            "/api/v1/auth/password/reset",
             json={"token": token, "new_password": "AnotherPass789!"},
         )
         assert r.status_code == 400
@@ -352,74 +377,73 @@ class TestPasswordForgotReset:
     ):
         register(client, username="alice")
 
-        client.post("/auth/password/forgot", json={"email": "alice@example.com"})
+        client.post("/api/v1/auth/password/forgot", json={"email": "alice@example.com"})
         first_token = captured_emails["alice@example.com"]
 
-        client.post("/auth/password/forgot", json={"email": "alice@example.com"})
+        client.post("/api/v1/auth/password/forgot", json={"email": "alice@example.com"})
         second_token = captured_emails["alice@example.com"]
 
         assert first_token != second_token  # sanity check
 
         # First token must have been invalidated
         r = client.post(
-            "/auth/password/reset",
+            "/api/v1/auth/password/reset",
             json={"token": first_token, "new_password": "NewPassword456!"},
         )
         assert r.status_code == 400
 
         # Second token must still work
         r = client.post(
-            "/auth/password/reset",
+            "/api/v1/auth/password/reset",
             json={"token": second_token, "new_password": "NewPassword456!"},
         )
-        assert r.status_code == 200
+        assert r.status_code == 204
 
     def test_reset_new_password_too_short_returns_422(self, client, captured_emails):
         register(client, username="alice")
-        client.post("/auth/password/forgot", json={"email": "alice@example.com"})
+        client.post("/api/v1/auth/password/forgot", json={"email": "alice@example.com"})
         token = captured_emails["alice@example.com"]
 
         r = client.post(
-            "/auth/password/reset",
+            "/api/v1/auth/password/reset",
             json={"token": token, "new_password": "short"},
         )
         assert r.status_code == 422
 
 
 class TestEmailVerification:
-    def test_verify_with_valid_token_returns_200(self, client, captured_emails):
+    def test_verify_with_valid_token_returns_204(self, client, captured_emails):
         register(client, username="alice")
         token = captured_emails["alice@example.com"]
 
-        r = client.post("/auth/email/verify", json={"token": token})
-        assert r.status_code == 200
-        assert r.json()["success"] is True
+        r = client.post("/api/v1/auth/email/verify", json={"token": token})
+        assert r.status_code == 204
 
     def test_user_is_marked_verified_after_successful_verify(
         self, client, captured_emails
     ):
         register(client, username="alice")
         token = captured_emails["alice@example.com"]
-        client.post("/auth/email/verify", json={"token": token})
+        client.post("/api/v1/auth/email/verify", json={"token": token})
 
         r = login(client, username="alice")
-        assert r.json()["data"]["user"]["is_email_verified"] is True
+        assert r.json()["user"]["is_email_verified"] is True
 
     def test_verify_with_invalid_token_returns_400(self, client):
-        r = client.post("/auth/email/verify", json={"token": "notavalidtoken"})
+        r = client.post("/api/v1/auth/email/verify", json={"token": "notavalidtoken"})
         assert r.status_code == 400
-        assert r.json()["success"] is False
+        assert r.json()["code"] == "invalid_token"
 
     def test_verify_token_cannot_be_reused(self, client, captured_emails):
         register(client, username="alice")
         token = captured_emails["alice@example.com"]
 
-        client.post("/auth/email/verify", json={"token": token})
-        r = client.post("/auth/email/verify", json={"token": token})
+        client.post("/api/v1/auth/email/verify", json={"token": token})
+        r = client.post("/api/v1/auth/email/verify", json={"token": token})
         assert r.status_code == 400
 
     def test_resend_requires_authentication(self, client):
-        r = client.post("/auth/email/verify/resend")
+        r = client.post("/api/v1/auth/email/verify/resend")
         assert r.status_code == 401
 
     def test_resend_sends_new_token(self, client, captured_emails):
@@ -427,10 +451,10 @@ class TestEmailVerification:
         original_token = captured_emails["alice@example.com"]
 
         r = login(client, username="alice")
-        access_token = r.json()["data"]["access_token"]
+        access_token = r.json()["access_token"]
 
         captured_emails.clear()
-        client.post("/auth/email/verify/resend", headers=bearer(access_token))
+        client.post("/api/v1/auth/email/verify/resend", headers=bearer(access_token))
 
         assert "alice@example.com" in captured_emails
         new_token = captured_emails["alice@example.com"]
@@ -440,29 +464,35 @@ class TestEmailVerification:
         register(client, username="alice")
         old_token = captured_emails["alice@example.com"]
 
-        access_token = login(client, username="alice").json()["data"]["access_token"]
-        client.post("/auth/email/verify/resend", headers=bearer(access_token))
+        access_token = login(client, username="alice").json()["access_token"]
+        client.post("/api/v1/auth/email/verify/resend", headers=bearer(access_token))
 
-        r = client.post("/auth/email/verify", json={"token": old_token})
+        r = client.post("/api/v1/auth/email/verify", json={"token": old_token})
         assert r.status_code == 400
 
-    def test_resend_returns_200(self, client, captured_emails):
+    def test_resend_returns_202(self, client, captured_emails):
         register(client, username="alice")
-        access_token = login(client, username="alice").json()["data"]["access_token"]
+        access_token = login(client, username="alice").json()["access_token"]
 
-        r = client.post("/auth/email/verify/resend", headers=bearer(access_token))
-        assert r.status_code == 200
-        assert r.json()["success"] is True
+        r = client.post(
+            "/api/v1/auth/email/verify/resend", headers=bearer(access_token)
+        )
+        assert r.status_code == 202
+        assert r.content == b""
 
     def test_resend_fails_if_already_verified(self, client, captured_emails):
         register(client, username="alice")
         token = captured_emails["alice@example.com"]
-        client.post("/auth/email/verify", json={"token": token})
+        client.post("/api/v1/auth/email/verify", json={"token": token})
 
-        access_token = login(client, username="alice").json()["data"]["access_token"]
-        r = client.post("/auth/email/verify/resend", headers=bearer(access_token))
+        access_token = login(client, username="alice").json()["access_token"]
+        captured_emails.clear()
+        r = client.post(
+            "/api/v1/auth/email/verify/resend", headers=bearer(access_token)
+        )
         assert r.status_code == 400
-        assert r.json()["success"] is False
+        assert r.json()["code"] == "email_already_verified"
+        assert captured_emails == []
 
 
 class TestFullFlow:
@@ -473,43 +503,44 @@ class TestFullFlow:
         # 2. Verify email
         token = captured_emails["alice@example.com"]
         assert (
-            client.post("/auth/email/verify", json={"token": token}).status_code == 200
+            client.post("/api/v1/auth/email/verify", json={"token": token}).status_code
+            == 204
         )
 
         # 3. Login — user should show as verified
         r = login(client, username="alice")
         assert r.status_code == 200
-        access_token = r.json()["data"]["access_token"]
-        assert r.json()["data"]["user"]["is_email_verified"] is True
+        access_token = r.json()["access_token"]
+        assert r.json()["user"]["is_email_verified"] is True
 
         # 4. Refresh — should issue a new token pair
-        r = client.post("/auth/refresh")
+        r = client.post("/api/v1/auth/refresh")
         assert r.status_code == 200
-        new_access_token = r.json()["data"]["access_token"]
+        new_access_token = r.json()["access_token"]
         assert new_access_token != access_token
 
         # 5. Old token should still work (access tokens are JWTs and remain
         #    valid until expiry; only the refresh token rotates)
 
         # 6. Logout
-        assert client.post("/auth/logout").status_code == 200
+        assert client.post("/api/v1/auth/logout").status_code == 204
 
         # 7. Refresh after logout must fail — session is revoked
-        assert client.post("/auth/refresh").status_code == 401
+        assert client.post("/api/v1/auth/refresh").status_code == 401
 
     def test_password_reset_full_cycle(self, client, captured_emails):
         register(client, username="alice")
 
         # Request reset
-        client.post("/auth/password/forgot", json={"email": "alice@example.com"})
+        client.post("/api/v1/auth/password/forgot", json={"email": "alice@example.com"})
         reset_token = captured_emails["alice@example.com"]
 
         # Apply reset
         r = client.post(
-            "/auth/password/reset",
+            "/api/v1/auth/password/reset",
             json={"token": reset_token, "new_password": "BrandNewPass99!"},
         )
-        assert r.status_code == 200
+        assert r.status_code == 204
 
         # Old password must fail
         assert (
@@ -519,4 +550,12 @@ class TestFullFlow:
         # New password must succeed
         r = login(client, username="alice", password="BrandNewPass99!")
         assert r.status_code == 200
-        assert "access_token" in r.json()["data"]
+        assert "access_token" in r.json()
+
+
+class TestTwoFactorStubs:
+    def test_every_stub_answers_501_not_implemented(self, client):
+        for action in ("enable", "disable", "verify"):
+            r = client.post(f"/api/v1/auth/2fa/{action}")
+            assert r.status_code == 501, action
+            assert r.json()["code"] == "not_implemented"

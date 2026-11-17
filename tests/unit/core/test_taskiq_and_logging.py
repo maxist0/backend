@@ -16,6 +16,7 @@ from tests.helpers import BACKEND_DIR
 
 # Queued messages carry these names; renaming one strands messages in Redis.
 TASK_NAMES = {
+    "email.send_email_change_confirmation",
     "email.send_password_reset_email",
     "email.send_verification_email",
     "maintenance.taskiq_heartbeat",

@@ -1,8 +1,8 @@
 """Application factory and ASGI entrypoint (composition root of the API).
 
 `create_app(settings)` assembles the FastAPI app (middleware, the routers of
-every module in `MODULES`, exception handlers, optional admin) without any
-I/O. The lifespan opens the resources (logging, metrics, DB engine, Redis,
+every module in `MODULES` under `API_PREFIX`, the problem-details error
+handlers, optional admin) without any I/O. The lifespan opens the resources (logging, metrics, DB engine, Redis,
 route cache, taskiq broker) and closes them again, also when startup fails
 half-way. `app = create_app()` is the entrypoint for uvicorn, `fastapi run`
 and `run.py`; importing this module requires `ENVIRONMENT` to be set.
@@ -19,11 +19,10 @@ from cashews.contrib.fastapi import (
     CacheRequestControlMiddleware,
     cache_control_ttl,
 )
-from fastapi import FastAPI, Request
-from fastapi.exceptions import RequestValidationError
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from taskiq import async_shared_broker
 
@@ -42,12 +41,7 @@ from app.core.database import (
     ensure_supported_event_loop,
     init_db,
 )
-from app.core.errors import (
-    AuthenticationError,
-    authentication_exception_handler,
-    generic_exception_handler,
-    validation_exception_handler,
-)
+from app.core.errors import register_error_handlers
 from app.core.logging import get_logger, setup_logging
 from app.core.metrics import init_metrics
 from app.core.metrics import router as metrics_router
@@ -57,7 +51,6 @@ from app.core.middleware import (
     MetricsMiddleware,
     SecurityHeadersMiddleware,
 )
-from app.core.responses import SuccessResponse, ok_response
 from app.core.tasks import build_broker
 from app.modules import MODULES
 
@@ -135,24 +128,31 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger.info("app.shutdown_complete")
 
 
+class RootResponse(BaseModel):
+    """Entry points of the API, answered by `GET /`."""
+
+    message: str
+    docs_url: str | None
+    metrics_url: str | None
+    auth_url: str
+
+
 def _add_root_route(app: FastAPI, settings: Settings) -> None:
     """Register `GET /` (needs the settings for its cache TTL)."""
 
-    @app.get("/", response_model=SuccessResponse)
+    @app.get("/", summary="API entry points")
     @cache(
         ttl=cache_control_ttl(default=settings.ROUTE_CACHE_TTL),
         key="route:root",
     )
-    async def root(request: Request) -> JSONResponse:
-        """Root endpoint with standardized response."""
-        start_time = datetime.now()
-        response_data = {
-            "message": "Welcome to the FastAPI application with JWT authentication!",
-            "docs_url": "/docs" if not settings.is_production else None,
-            "metrics_url": "/metrics" if settings.METRICS_ENABLED else None,
-            "auth_url": "/auth",
-        }
-        return ok_response(data=response_data, request=request, start_time=start_time)
+    async def root() -> RootResponse:
+        """List the entry points of the API."""
+        return RootResponse(
+            message="Welcome to the FastAPI application with JWT authentication!",
+            docs_url="/docs" if not settings.is_production else None,
+            metrics_url="/metrics" if settings.METRICS_ENABLED else None,
+            auth_url=f"{settings.API_PREFIX}/auth",
+        )
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -164,7 +164,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             `get_settings()` (`SettingsDep`).
 
     Returns:
-        The app with every module router of `MODULES` mounted.
+        The app with every module router of `MODULES` mounted under
+        `settings.API_PREFIX`.
     """
     if settings is None:
         settings = get_settings()
@@ -195,10 +196,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         views = [view for module in MODULES for view in module.admin_views]
         create_admin(app, settings, session_factory, views)
 
-    # Exception handlers
-    app.add_exception_handler(Exception, generic_exception_handler)
-    app.add_exception_handler(RequestValidationError, validation_exception_handler)
-    app.add_exception_handler(AuthenticationError, authentication_exception_handler)
+    register_error_handlers(app)
 
     # Middleware (order unchanged: the last added runs first)
     app.add_middleware(MetaDataMiddleware)
@@ -225,7 +223,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     if settings.METRICS_ENABLED:
         app.include_router(metrics_router, prefix="/metrics", tags=["monitoring"])
     for module in MODULES:
-        app.include_router(module.router)
+        app.include_router(module.router, prefix=settings.API_PREFIX)
     _add_root_route(app, settings)
 
     return app

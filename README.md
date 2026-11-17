@@ -32,7 +32,8 @@ Contributor and AI-agent conventions live in [AGENTS.md](AGENTS.md). Read it bef
 | Framework | FastAPI 0.136 on Starlette, Pydantic v2, fully async (SQLAlchemy 2 async + asyncpg, redis asyncio) |
 | Auth | Register, login (OAuth2 password form), logout, logout-all, refresh with rotation and reuse detection (family revocation), email verification, password reset, account lockout, audit log |
 | Sessions | Opaque refresh tokens (SHA-256 hashed, stored only in Postgres), JWT access tokens (15 min, HS256, `sid` claim = session family id) |
-| Users | `GET/PATCH /user/me`, password change, email-change flow (partial, see Known issues) |
+| Users | `GET` and `PATCH /api/v1/users/me` (profile), `PUT /api/v1/users/me/password`, `PUT /api/v1/users/me/email` (pending change, completed by `POST /api/v1/auth/email/verify`) |
+| API contract | Everything under `/api/v1`, plain typed responses, RFC 9457 `application/problem+json` errors with a stable `code` ([ADR 0002](documentation/adr/0002-rfc9457-errors-plain-responses-api-v1.md), frontend view: [backend-contract.md](../frontend/documentation/backend-contract.md)) |
 | Data | PostgreSQL, Alembic migrations, UUID primary keys, timezone-aware timestamps |
 | Caching | Redis via `cashews` route cache with ETag and Cache-Control middleware |
 | Background jobs | `taskiq` with Redis broker, result backend, cron scheduler, transactional email tasks |
@@ -200,7 +201,7 @@ Middleware is applied in `src/main.py`; the last one added runs first. Effective
 6. `CORSMiddleware` (FastAPI built-in).
 7. `MetaDataMiddleware` binds a `request_id` into `structlog` context and returns it as `X-Request-ID` with `X-Process-Time`.
 8. Router → dependencies (`DbSession`, `get_current_user`) → handler → service → crud.
-9. Exception handlers translate `RequestValidationError`, `AuthenticationError` and unhandled `Exception` into the error envelope.
+9. Exception handlers translate `AppError`, `RequestValidationError`, Starlette `HTTPException` and unhandled `Exception` into RFC 9457 problem responses (see [Error handling](#error-handling)).
 
 ### Module pattern
 
@@ -238,7 +239,7 @@ login    ──▶ lock check, admission limiter (PASSWORD_HASH_CONCURRENCY), lo
              success = conditional atomic UPDATE (refused once locked) ──▶ JWT access (15 min, HS256; claims exp, iat, nbf, sub, jti, type=access, sid)
                            └▶ opaque refresh (32 B urlsafe)
                                 ├─ sha256 → sessions table (family_id, device, ip), Postgres only
-                                └─ cookie refresh_token, HttpOnly, SameSite=Lax, Path=/auth
+                                └─ cookie refresh_token, HttpOnly, SameSite=Lax, Path=<API_PREFIX>/auth (/api/v1/auth)
 refresh  ──▶ atomic UPDATE ... RETURNING on the session row (not revoked, not expired)
          ├─ success: issue new pair in the same family
          ├─ token already rotated or revoked: reuse detected → revoke the whole family
@@ -297,14 +298,24 @@ All primary keys are UUIDv4 generated in the application. Timestamps are `timest
 
 ### Error handling
 
-Responses currently use a project-specific envelope:
+Success responses are plain typed models without an envelope. Errors are RFC 9457 `application/problem+json` ([ADR 0002](documentation/adr/0002-rfc9457-errors-plain-responses-api-v1.md)):
 
 ```json
-{ "success": true,  "data": { ... }, "metadata": { "timestamp": "...", "request_id": "...", "version": "0.1.0", "execution_time": 0.012 } }
-{ "success": false, "data": null,    "error": { "code": "VALIDATION_ERROR", "message": "...", "field": "email", "details": { ... } }, "metadata": { ... } }
+{
+  "type": "about:blank",
+  "title": "Unprocessable Content",
+  "status": 422,
+  "detail": "The request contains invalid input.",
+  "code": "validation_error",
+  "request_id": "0161c42e-d89a-4892-af69-4e8934eb2fd9",
+  "errors": [{ "field": "username", "code": "string_too_short", "message": "String should have at least 3 characters" }]
+}
 ```
 
-Whether to keep this envelope or move to RFC 9457 Problem Details is an [open decision](#open-decisions).
+- `errors[]` appears only on 422. Body fields have no prefix; other sources are prefixed (`query.x`, `header.x`, `cookie.x`, `path.x`).
+- Every 401 carries `WWW-Authenticate: Bearer`. A 202 or 204 has no body and no `Content-Type`.
+- A 500 has no `request_id` yet (known limitation, fixed in S1.4).
+- Services raise `AppError` subclasses (`src/app/core/errors.py`); the codes of the auth module are in `src/app/modules/auth/errors.py`. The complete code list with the meaning for clients is in the frontend's [backend contract](../frontend/documentation/backend-contract.md#error-codes).
 
 ---
 
@@ -338,7 +349,7 @@ Whether to keep this envelope or move to RFC 9457 Problem Details is an [open de
 
 Implemented:
 
-- Argon2id password hashing (parameters from `Settings`, thread pool with concurrency limiter, rehash on login); dummy verify for unknown and inactive users to reduce timing differences
+- Argon2id password hashing (parameters from `Settings`, thread pool with concurrency limiter, rehash on login); dummy verify for unknown and inactive users to reduce timing differences. Every login refusal (unknown user, wrong password, locked or inactive account) is the same 401 `invalid_credentials`; a locked account waits a calibrated time instead of running Argon2, so the response time does not reveal the lock
 - Account lockout after 5 failed logins for 15 minutes with an atomic counter, audit-logged. This timed lock blocks only password login; existing sessions, access tokens and refresh stay valid, so nobody can log another user out by guessing. The admin lock is indefinite: it rejects access tokens at once, ends sessions on refresh, and the admin action "Lock selected" revokes all sessions
 - Login burst protection: at most `PASSWORD_HASH_CONCURRENCY` password evaluations in flight per process, lock re-checked after admission, success as a conditional atomic `UPDATE` (N processes allow N times that bound). Not a substitute for rate limiting ([D4](#open-decisions), open)
 - Atomic refresh gate in Postgres; reuse of a rotated token revokes the whole family; refresh is denied and the family revoked for inactive or admin-locked users. Refresh and bulk revocations are serialised per user by a row lock (`FOR NO KEY UPDATE` on `users`; lock order `email_tokens` → `users` → `sessions`)
@@ -392,6 +403,7 @@ All settings are environment variables read by `Settings` (`src/common/config.py
 | `MAIL_*` | unset | mail is skipped when incomplete |
 | `LOG_LEVEL` / `ACCESS_LOG_ENABLED` / `METRICS_ENABLED` | `INFO` / `true` / `true` | |
 | `OTLP_LOGS_ENABLED` / `OTLP_ENDPOINT` | `false` / `http://localhost:4318` | Grafana Alloy |
+| `API_PREFIX` | `/api/v1` | Path prefix of every module router (the API version) and of the refresh cookie path (`<API_PREFIX>/auth`). Empty, or segments of `[A-Za-z0-9._~-]` without a trailing slash. `/`, `/metrics/` and `/metrics/health` stay unprefixed |
 | `FRONTEND_URL` | `http://localhost:3000` | used in email links |
 | `HOST` / `PORT` | `0.0.0.0` / `8000` | |
 
@@ -453,34 +465,35 @@ This is the original implementation plan. The re-prioritised plan from the Novem
 - [ ] Pin the JWT algorithm allowlist in code; add `iss`, `aud`, `typ=access`; verify `type` on decode; reject tokens without `jti`. *RFC 8725 checklist satisfied.* Partly done: algorithm pinned, claims `exp`/`iat`/`nbf`/`sub`/`jti` required, `type=access` verified, `sub` must be a UUID. `iss` and `aud` are still missing.
 - [ ] Refresh cookie: `Secure=True` outside `dev`, `SameSite=Strict` where the frontend allows it, `__Host-` prefix, explicit `max_age`.
 - [x] Revoke all sessions on password reset and password change; add `POST /auth/logout-all`. (Password change keeps the caller's session.)
-- [ ] Complete the email-change flow: `POST /auth/email/confirm` consuming `CHANGE_EMAIL` tokens, dedicated template, `EMAIL_CHANGED` audit event, `FRONTEND_URL` in the reset link.
+- [x] Complete the email-change flow: `PUT /users/me/email` creates a pending change, `POST /auth/email/verify` consumes the `CHANGE_EMAIL` token (no separate confirm endpoint), dedicated template (`confirm_email_change.html`), `EMAIL_CHANGED` audit event; confirming invalidates open password-reset tokens. The `FRONTEND_URL` in the reset link is tracked in the email-links item below (Known issue 7).
 - [ ] Rate limiting with `limits` + Redis: per IP on `/auth/*`, per account on login; return `429` with `Retry-After`. Decouple lockout from DoS by lockout-by-IP-window instead of hard account locks. Partly mitigated in Phase 0b: the timed account lock blocks only password login and leaves existing sessions valid, and a per-process admission limiter bounds login bursts; both remain no substitute for rate limits.
-- [ ] Uniform credential error (`Invalid username or password`) for locked, inactive and unknown accounts; log the real reason server-side only.
+- [x] Uniform credential error (`Invalid username or password`, code `invalid_credentials`) for locked, inactive and unknown accounts; the real reason is logged and audited server-side only.
 - [ ] Security headers: add HSTS (behind TLS), `Cache-Control: no-store` on authenticated responses, `Content-Security-Policy: frame-ancestors 'none'`; drop `X-XSS-Protection`.
 - [ ] Trusted proxies: run uvicorn with `--proxy-headers --forwarded-allow-ips=<traefik>`; remove manual `X-Forwarded-For` parsing; use the same client IP source for access logs and audit logs.
 - [ ] CORS origins, methods and headers from `Settings` (`CORS_ORIGINS` list); delete the dead custom `CORSMiddleware` class.
 - [ ] Admin panel: Argon2 hash for the admin password with constant-time compare, `ADMIN_ENABLED` flag defaulting to `false` in `prod`, hide `token_hash` columns. Partly done: `ADMIN_ENABLED` (default on only in `dev`) and constant-time compare of the admin credentials exist. Still open: Argon2 hash for the admin password, and `token_hash` is still shown in the sessions detail view.
 - [ ] Protect `/metrics` (network policy or bearer token); remove the `KEYS` scan. Partly done: the `active_refresh_tokens` gauge and its `KEYS` scan are removed; `/metrics` is still unauthenticated.
 - [ ] Request limits: `max_body_size`, per-request timeout, `strict_content_type` kept on.
-- [ ] Pydantic request models with `extra="forbid"`; separate create/update/response schemas (OWASP API3).
+- [x] Pydantic request models with `extra="forbid"`; separate create/update/response schemas (OWASP API3). Every request model of the `auth` and `users` modules forbids extra fields (`schemas.py`); the login form is OAuth2 form data.
 - [ ] `SECURITY.md` with disclosure process and supported versions.
 - [ ] Email links to the frontend routes (requested by the frontend, [task 2](../frontend/documentation/backend-contract.md#backend-task-2-email-links-to-the-frontend-routes)): absolute URLs from `FRONTEND_URL` to `/user/email-bestaetigen?token=`, `/user/passwort-zuruecksetzen?token=` and `/user/einladung?token=` (`/en/user/…` when the user's locale is known); URL-encoded token; fix the `FRONTEND_URL` default (frontend dev server runs on 5173). Fixes Known issue 7.
 - [ ] `POST /auth/password/forgot`: return 200 even when the email task fails (log internally) and equalise response times for known and unknown addresses (requested by the frontend, [task 3](../frontend/documentation/backend-contract.md#backend-task-3-distinct-error-codes-and-a-consistent-forgot-password-answer); OWASP Forgot Password Cheat Sheet).
 
 ### Phase 2: API contract
 
-- [ ] API versioning: mount all routers under `/api/v1`; keep `/metrics` and health unversioned; align Traefik `stripprefix`. *Old paths return 404 after one deprecation window.*
-- [ ] Decide the error format (see Open decisions) and implement one consistent handler: validation, auth, named domain exceptions, unhandled 500 (no internals leaked).
-- [ ] Named exceptions in services instead of `(None, "message")` tuples; routers stop catching `Exception`. Feature `exceptions.py` inherit from `src/common/exceptions.py` base classes mapped to status codes.
-- [ ] `response_model` on every route; drop `top_level_fields`; let FastAPI serialise Pydantic directly (0.130+). Swagger login works through the standard `TokenResponse`.
+- [x] API versioning: all module routers are mounted under `API_PREFIX` (`/api/v1`); `/`, `/metrics/` and `/metrics/health` stay unversioned. Old paths return 404 (no deprecation window; the frontend migrates right after S1).
+- [ ] Align the Swarm stack's Traefik router with `/api/v1`: `api-prod-strip` still strips `/api`, which would hand the app `/v1/...` (see [backend task 4](../frontend/documentation/backend-contract.md#backend-task-4-refresh-cookie-path-behind-the-api-prefix)).
+- [x] Error format decided (D1, [ADR 0002](documentation/adr/0002-rfc9457-errors-plain-responses-api-v1.md)) and one consistent handler in `src/app/core/errors.py`: validation, auth, named domain errors, unhandled 500 (no internals leaked). The 500 still lacks `request_id` (S1.4).
+- [x] Named exceptions in services instead of `(None, "message")` tuples; routers do not catch `Exception`. A module's `errors.py` subclasses the `AppError` family from `app.core`, which maps each class to a status and a `code`.
+- [x] `response_model` (or a return annotation) on every module route; no `top_level_fields`; FastAPI serialises Pydantic directly. Swagger login works through `LoginResponse`, a `TokenResponse` plus the user. The Prometheus exposition at `/metrics/` is plain text.
 - [ ] Pagination helper: cursor-based for lists, bounded `limit` (default 20, max 100), stable ordering.
 - [ ] Optional `Idempotency-Key` support for POST (Redis-backed, 24 h TTL, 409 on payload mismatch) to match the frontend blueprint.
 - [ ] `ETag`/`If-Match` on mutable resources (412 on mismatch).
 - [ ] Health endpoints: `GET /health/live` (no dependencies), `GET /health/ready` (DB `SELECT 1`, Redis `PING`, 503 on failure or during shutdown), `GET /health/startup`. Update the Dockerfile `HEALTHCHECK` and Swarm probes.
-- [ ] OpenAPI: `summary`, `description`, `responses` per route; export the schema in CI and lint it (Spectral or vacuum); diff against the previous release (oasdiff).
+- [ ] OpenAPI: `summary`, `description`, `responses` per route; export the schema in CI and lint it (Spectral or vacuum); diff against the previous release (oasdiff). Partly done: every module route has a summary, a docstring description and `application/problem+json` error responses listing the possible `code` values (`tests/unit/core/test_openapi_contract.py`). Still open: response examples, the CI export, lint and diff.
 - [ ] Timezone-aware timestamps everywhere (`datetime.now(timezone.utc)`), RFC 3339 output.
 - [ ] Invitation endpoints `POST /auth/invitations/lookup` and `POST /auth/invitations/accept` (requested by the frontend, [task 1](../frontend/documentation/backend-contract.md#backend-task-1-invitation-endpoints-new); the frontend page is built against this contract): tokens only in request bodies, stored as SHA-256 hashes, single use and expiring; the email is bound to the invitation; the accepted user is created with `is_email_verified: true` and joined to the workspace in one transaction; rate limiting, no enumeration, audit events.
-- [ ] Distinct error codes for the token endpoints: `TOKEN_INVALID`, `TOKEN_EXPIRED`, `TOKEN_USED` on `password/reset` and `email/verify`, `EMAIL_ALREADY_VERIFIED` on `email/verify/resend` (requested by the frontend, [task 3](../frontend/documentation/backend-contract.md#backend-task-3-distinct-error-codes-and-a-consistent-forgot-password-answer)).
+- [ ] Distinct error codes for the token endpoints: `token_invalid`, `token_expired`, `token_used` on `password/reset` and `email/verify`, `email_already_verified` on `email/verify/resend` (requested by the frontend, [task 3](../frontend/documentation/backend-contract.md#backend-task-3-distinct-error-codes-and-a-consistent-forgot-password-answer)). Partly done: `email_already_verified` ships; all token failures are still one `invalid_token`.
 
 ### Phase 3: Reliability and observability
 
@@ -537,11 +550,14 @@ Fixed in Phase 0:
 - ~~13~~ `ruff format --check` passes.
 - ~~14~~ Not reproducible: the virtualenv runs Python 3.14.4.
 
+Fixed in the 2026-11 cleanup (S1.3):
+
+- ~~6~~ The email-change token is consumed by `POST /auth/email/verify`; `PUT /users/me/email` replaces the email part of `PATCH /user/me`, and a dedicated template is sent to the new address.
+
 Open:
 
 2. `tests/conftest.py` runs `alembic upgrade head` and `Base.metadata.create_all` on the same database, and `asyncio.run()` shares the application's `AsyncEngine` across event loops. [Phase 0]
 4. `MetricsMiddleware` skips `/metrics` but the router is mounted at `/metrics/`, so scrapes are counted as requests. [Phase 3]
-6. `PATCH /user/me` with a new email creates a `CHANGE_EMAIL` token but no endpoint consumes it, and the verification email template is reused. [Phase 1]
 7. The password-reset email link is relative (`/auth/reset-password?token=`) and lacks `FRONTEND_URL`. [Phase 1]
 8. Refresh cookie is set without `Secure`. [Phase 1]
 9. `pytest` `--cov-fail-under=80` and `[tool.coverage.report] fail_under = 85` conflict. [Phase 0]

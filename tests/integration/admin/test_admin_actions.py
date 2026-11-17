@@ -135,7 +135,7 @@ class TestUserActions:
         _action(client, "user", "lock-users", [_user_id(db, "alice")])
 
         r = client.post(
-            "/auth/login", data={"username": "alice", "password": "Password123!"}
+            "/api/v1/auth/login", data={"username": "alice", "password": "Password123!"}
         )
 
         assert r.status_code == 401
@@ -168,7 +168,7 @@ class TestSessionAndTokenActions:
         _action(client, "email-token", "invalidate-tokens", [token_id])
 
         assert db.scalar("SELECT invalidated_at FROM email_tokens") is not None
-        r = client.post("/auth/email/verify", json={"token": raw})
+        r = client.post("/api/v1/auth/email/verify", json={"token": raw})
         assert r.status_code == 400
 
 

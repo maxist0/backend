@@ -49,7 +49,7 @@ class TestCreateApp:
         # FastAPI >= 0.137 keeps included routers as a tree in app.routes;
         # iter_route_contexts() flattens it with the full (prefixed) paths.
         paths = {context.path for context in iter_route_contexts(app.routes)}
-        assert {"/", "/auth/login", "/user/me"} <= paths
+        assert {"/", "/api/v1/auth/login", "/api/v1/users/me"} <= paths
         assert "/metrics/" not in paths
         assert "/admin" not in paths
 
@@ -92,14 +92,15 @@ class TestModuleMounting:
         mounted = _paths(app.routes)
 
         for module in MODULES:
-            module_paths = _paths(module.router.routes)
+            module_paths = {f"/api/v1{path}" for path in _paths(module.router.routes)}
             assert module_paths, f"module {module.name} has no routes"
             assert module_paths <= mounted, module.name
 
     def test_a_registered_module_is_mounted_without_core_changes(
         self, monkeypatch, settings_factory
     ):
-        """A new entry in `MODULES` is all it takes; no API prefix yet."""
+        """A new entry in `MODULES` is all it takes; it is mounted under the
+        API prefix."""
         router = APIRouter(prefix="/probe-items", tags=["probe"])
 
         @router.get("/")
@@ -111,4 +112,13 @@ class TestModuleMounting:
 
         app = main.create_app(settings_factory())
 
-        assert "/probe-items/" in _paths(app.routes)
+        assert "/api/v1/probe-items/" in _paths(app.routes)
+
+    def test_module_routers_follow_the_api_prefix_setting(self, settings_factory):
+        app = main.create_app(settings_factory(API_PREFIX="/api/v2"))
+
+        paths = _paths(app.routes)
+
+        assert "/api/v2/users/me" in paths
+        assert not any(path.startswith("/api/v1") for path in paths)
+        assert {"/", "/metrics/", "/metrics/health"} <= paths

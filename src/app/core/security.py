@@ -7,7 +7,9 @@ hashed with Argon2id in worker threads, bounded per event loop. Opaque tokens
 
 import hashlib
 import secrets
+import time
 import uuid
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from functools import lru_cache
 from typing import Final
@@ -193,15 +195,51 @@ def _dummy_password_hash() -> str:
     return _password_hasher().hash(secrets.token_urlsafe(16))
 
 
-def _verify_password_sync(password: str, password_hash: str) -> bool:
+class VerifyDurationAverage:
+    """Moving average (EWMA) of real password-verify durations, in seconds.
+
+    Every real verify of this process feeds it (`verify_password` and
+    `equalize_password_timing`). The first sample replaces the cold-start
+    value; later samples move the average by `weight`, so roughly the last
+    ten verifies dominate and a single slow outlier does not.
+
+    Args:
+        cold_start_seconds: Value until the first verify was measured.
+        weight: Share of each new sample in the average (0 < weight <= 1).
+    """
+
+    def __init__(self, cold_start_seconds: float, weight: float = 0.2) -> None:
+        self.seconds = cold_start_seconds
+        self._weight = weight
+        self._measured = False
+
+    def observe(self, seconds: float) -> None:
+        """Add one measured verify duration."""
+        if not self._measured:
+            self.seconds = seconds
+            self._measured = True
+            return
+        self.seconds += self._weight * (seconds - self.seconds)
+
+
+# Cold start only (until the process has run its first verify): the order of
+# magnitude of one verify with the default parameters (t=3, 64 MiB, p=4),
+# measured at 40-60 ms on a developer machine on 2026-11-17.
+_COLD_START_VERIFY_SECONDS: Final = 0.05
+password_verify_seconds = VerifyDurationAverage(_COLD_START_VERIFY_SECONDS)
+
+
+def _timed_verify_sync(password: str, password_hash: str) -> tuple[bool, float]:
+    start = time.perf_counter()
     try:
-        return _password_hasher().verify(password_hash, password)
+        valid: bool = _password_hasher().verify(password_hash, password)
     except VerificationError, InvalidHashError:
-        return False
+        valid = False
+    return valid, time.perf_counter() - start
 
 
-def _burn_verify_sync(password: str) -> None:
-    _verify_password_sync(password, _dummy_password_hash())
+def _burn_verify_sync(password: str) -> float:
+    return _timed_verify_sync(password, _dummy_password_hash())[1]
 
 
 async def hash_password(password: str) -> str:
@@ -213,12 +251,14 @@ async def hash_password(password: str) -> str:
 
 async def verify_password(password: str, password_hash: str) -> bool:
     """Return True if *password* matches *password_hash* (worker thread)."""
-    return await anyio.to_thread.run_sync(
-        _verify_password_sync,
+    valid, seconds = await anyio.to_thread.run_sync(
+        _timed_verify_sync,
         password,
         password_hash,
         limiter=_password_hash_limiter(),
     )
+    password_verify_seconds.observe(seconds)
+    return valid
 
 
 def password_needs_rehash(password_hash: str) -> bool:
@@ -232,9 +272,26 @@ async def equalize_password_timing(password: str) -> None:
     Keeps the response time of those branches close to a wrong-password
     attempt, so timing does not reveal whether an account exists.
     """
-    await anyio.to_thread.run_sync(
+    seconds = await anyio.to_thread.run_sync(
         _burn_verify_sync, password, limiter=_password_hash_limiter()
     )
+    password_verify_seconds.observe(seconds)
+
+
+async def wait_like_password_verify(
+    sleep: Callable[[float], Awaitable[None]] = anyio.sleep,
+) -> None:
+    """Wait as long as a password verify takes, without computing one.
+
+    For refusals that must not run Argon2 (a locked account: guesses are
+    refused without an evaluation) but must not answer faster than a wrong
+    password either. Call it outside the login admission limiter, so the
+    wait holds no slot.
+
+    Args:
+        sleep: Async sleep function; tests inject a recorder.
+    """
+    await sleep(password_verify_seconds.seconds)
 
 
 def hash_token(raw_token: str) -> str:

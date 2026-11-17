@@ -86,7 +86,7 @@ class TestAccessTokenExpiry:
             access = login_tokens(client, "alice").access
 
         with _travel(start + _access_lifetime() - SECOND):
-            r = client.get("/user/me", headers=bearer(access))
+            r = client.get("/api/v1/users/me", headers=bearer(access))
 
         assert r.status_code == 200
 
@@ -97,12 +97,15 @@ class TestAccessTokenExpiry:
             access = login_tokens(client, "alice").access
 
         with _travel(start + _access_lifetime() + SECOND):
-            r = client.get("/user/me", headers=bearer(access))
-            garbage = client.get("/user/me", headers=bearer("not.a.jwt"))
+            r = client.get("/api/v1/users/me", headers=bearer(access))
+            garbage = client.get("/api/v1/users/me", headers=bearer("not.a.jwt"))
 
         assert r.status_code == 401
         # An expired token is indistinguishable from an invalid one.
-        assert r.json()["error"]["message"] == garbage.json()["error"]["message"]
+        assert (r.json()["code"], r.json()["detail"]) == (
+            garbage.json()["code"],
+            garbage.json()["detail"],
+        )
 
     def test_refresh_after_access_expiry_issues_a_working_token(
         self, client, captured_emails
@@ -116,13 +119,18 @@ class TestAccessTokenExpiry:
         later = start + _access_lifetime() + timedelta(minutes=1)
         with _travel(later):
             assert (
-                client.get("/user/me", headers=bearer(tokens.access)).status_code == 401
+                client.get(
+                    "/api/v1/users/me", headers=bearer(tokens.access)
+                ).status_code
+                == 401
             )
             r, renewed = refresh_with(client, tokens.refresh)
             assert r.status_code == 200
             assert renewed is not None
             assert (
-                client.get("/user/me", headers=bearer(renewed.access)).status_code
+                client.get(
+                    "/api/v1/users/me", headers=bearer(renewed.access)
+                ).status_code
                 == 200
             )
 
@@ -201,20 +209,20 @@ class TestRefreshSessionLifetime:
 
 
 def _request_reset(client, captured_emails) -> str:
-    r = client.post("/auth/password/forgot", json={"email": "alice@example.com"})
-    assert r.status_code == 200
+    r = client.post("/api/v1/auth/password/forgot", json={"email": "alice@example.com"})
+    assert r.status_code == 202
     return captured_emails.latest_token("alice@example.com", "reset")
 
 
 def _redeem_reset(client, token: str):
     return client.post(
-        "/auth/password/reset",
+        "/api/v1/auth/password/reset",
         json={"token": token, "new_password": "NewPassword456!"},
     )
 
 
 def _redeem_verify(client, token: str):
-    return client.post("/auth/email/verify", json={"token": token})
+    return client.post("/api/v1/auth/email/verify", json={"token": token})
 
 
 def _token_row(db, purpose: str):
@@ -248,7 +256,7 @@ class TestResetTokenLifetime:
         token = _request_reset(client, captured_emails)
         db.execute("UPDATE email_tokens SET expires_at = now() + interval '1 minute'")
 
-        assert _redeem_reset(client, token).status_code == 200
+        assert _redeem_reset(client, token).status_code == 204
 
     def test_expired_token_is_refused_and_changes_nothing(
         self, client, captured_emails, db
@@ -292,8 +300,8 @@ class TestVerifyTokenLifetime:
         start = _frozen_now()
 
         with _travel(start):
-            r = client.post("/auth/email/verify/resend", headers=bearer(access))
-        assert r.status_code == 200
+            r = client.post("/api/v1/auth/email/verify/resend", headers=bearer(access))
+        assert r.status_code == 202
 
         assert _token_row(db, "verify_email")["expires_at"] == (
             start + VERIFY_TOKEN_LIFETIME
@@ -307,7 +315,7 @@ class TestVerifyTokenLifetime:
         token = captured_emails.latest_token("alice@example.com", "verify")
         db.execute("UPDATE email_tokens SET expires_at = now() + interval '1 minute'")
 
-        assert _redeem_verify(client, token).status_code == 200
+        assert _redeem_verify(client, token).status_code == 204
 
     def test_expired_token_is_refused_and_the_account_stays_unverified(
         self, client, captured_emails, db
@@ -322,6 +330,49 @@ class TestVerifyTokenLifetime:
         assert r.status_code == 400
         assert _token_row(db, "verify_email")["used_at"] is None
         assert db.scalar("SELECT is_email_verified FROM users") is False
+
+
+class TestEmailChangeTokenLifetime:
+    def _request_change(self, client, captured_emails) -> str:
+        access = login_tokens(client, "alice").access
+        r = client.put(
+            "/api/v1/users/me/email",
+            json={"current_password": PASSWORD, "new_email": "new@example.com"},
+            headers=bearer(access),
+        )
+        assert r.status_code == 202, r.text
+        return captured_emails.latest_token("new@example.com", "change_email")
+
+    def test_token_expires_24_hours_after_the_request(
+        self, client, captured_emails, db
+    ):
+        """Python clock (time-machine): the value the service writes."""
+        _alice(client)
+        start = _frozen_now()
+
+        with _travel(start):
+            self._request_change(client, captured_emails)
+
+        assert _token_row(db, "change_email")["expires_at"] == (
+            start + VERIFY_TOKEN_LIFETIME
+        )
+
+    def test_expired_token_is_refused_and_the_address_stays(
+        self, client, captured_emails, db
+    ):
+        """Database clock (SQL rewrite): just outside the boundary."""
+        _alice(client)
+        token = self._request_change(client, captured_emails)
+        db.execute(
+            "UPDATE email_tokens SET expires_at = now() - interval '1 second' "
+            "WHERE purpose::text = 'CHANGE_EMAIL'"
+        )
+
+        r = _redeem_verify(client, token)
+
+        assert r.status_code == 400
+        assert _token_row(db, "change_email")["used_at"] is None
+        assert db.scalar("SELECT email FROM users") == "alice@example.com"
 
 
 def _lock_alice(client, db) -> datetime:
@@ -358,7 +409,10 @@ class TestTimedLockEnd:
             r = login(client, username="alice", password=PASSWORD)
 
         assert r.status_code == 401
-        assert "locked" in r.text.lower()
+        assert r.json()["code"] == "invalid_credentials"
+        assert db.scalar(
+            "SELECT detail FROM auth_audit_log ORDER BY created_at DESC LIMIT 1"
+        ).startswith("Account locked, ")
         assert db.scalar("SELECT is_locked FROM users") is True
 
     def test_login_works_again_after_the_lock_ended_and_is_audited(

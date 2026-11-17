@@ -65,7 +65,7 @@ def register(
     client, *, username: str, email: str | None = None, password: str = PASSWORD
 ):
     return client.post(
-        "/auth/register",
+        "/api/v1/auth/register",
         json={
             "username": username,
             "email": email or f"{username}@example.com",
@@ -89,7 +89,7 @@ def login(
     client, *, username: str, password: str = PASSWORD, headers: dict | None = None
 ):
     return client.post(
-        "/auth/login",
+        "/api/v1/auth/login",
         data={"username": username, "password": password},
         headers=headers or {},
     )
@@ -116,7 +116,7 @@ def login_tokens(client, username: str, password: str = PASSWORD) -> Tokens:
     refresh = client.cookies.get("refresh_token")
     assert refresh
     client.cookies.clear()
-    return Tokens(access=r.json()["data"]["access_token"], refresh=refresh)
+    return Tokens(access=r.json()["access_token"], refresh=refresh)
 
 
 def refresh_with(client, refresh_token: str):
@@ -125,13 +125,13 @@ def refresh_with(client, refresh_token: str):
     Returns (response, new_tokens_or_None). The jar is cleared afterwards.
     """
     r = client.post(
-        "/auth/refresh", headers={"Cookie": f"refresh_token={refresh_token}"}
+        "/api/v1/auth/refresh", headers={"Cookie": f"refresh_token={refresh_token}"}
     )
     new_refresh = client.cookies.get("refresh_token")
     client.cookies.clear()
     if r.status_code != 200:
         return r, None
-    return r, Tokens(access=r.json()["data"]["access_token"], refresh=new_refresh)
+    return r, Tokens(access=r.json()["access_token"], refresh=new_refresh)
 
 
 def user_id_of(db, username: str) -> str:

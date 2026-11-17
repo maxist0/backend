@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+
+{% block title %}Confirm your new email address{% endblock %}
+
+{% block header %}Confirm your new email address{% endblock %}
+
+{% block content %}
+<p>Hi <strong>{{ username }}</strong>,</p>
+<p>You asked to use this address for your account. Please confirm it by clicking the button below. This link is valid for <strong>24 hours</strong>. Until you confirm, your account keeps its current address.</p>
+<a class="btn" href="{{ confirm_url }}">Confirm Email</a>
+<p style="margin-top: 24px;">Or copy this token manually:</p>
+<div class="token-box">{{ token }}</div>
+<p style="margin-top: 24px; font-size: 13px; color: #888;">If you did not ask for this change, you can safely ignore this email.</p>
+{% endblock %}

@@ -14,22 +14,23 @@ from tests.helpers import new_test_client
 
 EXPECTED_OPENAPI_PATHS = {
     "/",
-    "/auth/2fa/disable",
-    "/auth/2fa/enable",
-    "/auth/2fa/verify",
-    "/auth/email/verify",
-    "/auth/email/verify/resend",
-    "/auth/login",
-    "/auth/logout",
-    "/auth/logout-all",
-    "/auth/password/forgot",
-    "/auth/password/reset",
-    "/auth/refresh",
-    "/auth/register",
+    "/api/v1/auth/2fa/disable",
+    "/api/v1/auth/2fa/enable",
+    "/api/v1/auth/2fa/verify",
+    "/api/v1/auth/email/verify",
+    "/api/v1/auth/email/verify/resend",
+    "/api/v1/auth/login",
+    "/api/v1/auth/logout",
+    "/api/v1/auth/logout-all",
+    "/api/v1/auth/password/forgot",
+    "/api/v1/auth/password/reset",
+    "/api/v1/auth/refresh",
+    "/api/v1/auth/register",
+    "/api/v1/users/me",
+    "/api/v1/users/me/email",
+    "/api/v1/users/me/password",
     "/metrics/",
     "/metrics/health",
-    "/user/me",
-    "/user/me/password",
 }
 
 
@@ -59,15 +60,15 @@ class TestRouterTree:
         top_level = {getattr(route, "path", None) for route in app.routes}
         flattened = {context.path for context in iter_route_contexts(app.routes)}
 
-        assert "/auth/login" not in top_level
+        assert "/api/v1/auth/login" not in top_level
         assert EXPECTED_OPENAPI_PATHS <= flattened
         assert "/admin" in flattened  # the sqladmin mount (ADMIN_ENABLED=true)
 
     @pytest.mark.parametrize(
         ("method", "path", "router_local_path"),
         [
-            ("get", "/user/me", "/me"),
-            ("post", "/auth/login", "/login"),
+            ("get", "/api/v1/users/me", "/me"),
+            ("post", "/api/v1/auth/login", "/login"),
             ("get", "/metrics/health", "/health"),
             ("get", "/", None),
         ],
@@ -116,7 +117,7 @@ class TestNativeTelemetryIsOff:
         monkeypatch.setattr("opentelemetry._logs._internal._LOGGER_PROVIDER", provider)
         try:
             with new_test_client(app) as c:
-                assert c.post("/auth/login", data={}).status_code == 422
+                assert c.post("/api/v1/auth/login", data={}).status_code == 422
         finally:
             provider.shutdown()
 

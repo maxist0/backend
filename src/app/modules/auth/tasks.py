@@ -62,3 +62,34 @@ async def send_password_reset_email_task(to: str, username: str, token: str) -> 
         # Only the exception type: SMTP errors can echo the recipient address.
         logger.error("email.password_reset_failed", error_type=type(exc).__name__)
         raise
+
+
+@task(
+    task_name="email.send_email_change_confirmation",
+    retry_on_error=True,
+)
+async def send_email_change_confirmation_task(
+    to: str, username: str, token: str
+) -> None:
+    """Send the confirmation link of an email change to the new address *to*."""
+    confirm_url = f"{get_settings().FRONTEND_URL}/auth/verify-email?token={token}"
+    context = {
+        "username": username,
+        "token": token,
+        "confirm_url": confirm_url,
+    }
+    try:
+        await send_templated_email(
+            to=to,
+            subject="Confirm your new email address",
+            template_name="confirm_email_change.html",
+            context=context,
+            template_dir=TEMPLATE_DIR,
+        )
+        logger.info("email.email_change_confirmation_sent")
+    except Exception as exc:
+        # Only the exception type: SMTP errors can echo the recipient address.
+        logger.error(
+            "email.email_change_confirmation_failed", error_type=type(exc).__name__
+        )
+        raise

@@ -36,15 +36,6 @@ def test_metrics_health_endpoint(client):
     )
 
     body = resp.json()
-
-    assert body.get("success") is True, f"'success' flag was false. Full body: {body}"
-    assert "data" in body, "Response missing 'data' key"
-    assert isinstance(body["data"], dict), (
-        f"Expected 'data' to be dict, got {type(body['data'])}"
-    )
-
-    data = body["data"]
-    assert data.get("status") == "healthy", (
-        f"Expected status 'healthy', got {data.get('status')}"
-    )
-    assert "metrics_available" in data, "Health payload missing 'metrics_available'"
+    assert body["status"] == "healthy"
+    assert body["metrics_available"] is True
+    assert "success" not in body  # no envelope

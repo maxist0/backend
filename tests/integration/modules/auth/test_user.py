@@ -1,374 +1,343 @@
-"""Integration tests for the `/user` endpoints served by the auth module.
+"""Integration tests for the `/api/v1/users/me` routes served by the auth module.
 
-* `PATCH /user/me`: update display_name and/or email.
-* `PATCH /user/me/password`: change the password (requires the current one).
+* `PUT /users/me/password`: change the password (requires the current one).
+* `PUT /users/me/email`: request an email change (requires the current
+  password); `POST /auth/email/verify` with the mailed token completes it.
 
-`GET /user/me` belongs to the users module (`tests/integration/modules/users`).
+`GET` and `PATCH /users/me` belong to the users module
+(`tests/integration/modules/users`).
 
 Real PostgreSQL and Redis come from the integration fixtures; neither the
 service nor the database layer is mocked. `captured_emails` is needed for
 register and email change.
 """
 
+from tests.helpers import PASSWORD, audit_count, bearer, login, register
 
-def register(
-    client,
-    *,
-    username: str,
-    email: str | None = None,
-    password: str = "Password123!",
-    display_name: str | None = None,
-):
-    payload = {
-        "username": username,
-        "email": email or f"{username}@example.com",
-        "password": password,
-    }
-    if display_name:
-        payload["display_name"] = display_name
-    return client.post("/auth/register", json=payload)
-
-
-def login(client, *, username: str, password: str = "Password123!"):
-    return client.post("/auth/login", data={"username": username, "password": password})
-
-
-def bearer(access_token: str) -> dict:
-    return {"Authorization": f"Bearer {access_token}"}
+PASSWORD_URL = "/api/v1/users/me/password"
+EMAIL_URL = "/api/v1/users/me/email"
+VERIFY_URL = "/api/v1/auth/email/verify"
 
 
 def register_and_login(
-    client,
-    *,
-    username: str = "alice",
-    email: str | None = None,
-    password: str = "Password123!",
-    display_name: str | None = None,
+    client, *, username: str = "alice", email: str | None = None
 ) -> str:
     """Register a user, log in, and return the access token."""
-    register(
-        client,
-        username=username,
-        email=email,
-        password=password,
-        display_name=display_name,
-    )
-    r = login(client, username=username, password=password)
+    register(client, username=username, email=email)
+    r = login(client, username=username)
     assert r.status_code == 200, f"Login failed: {r.text}"
-    return r.json()["data"]["access_token"]
+    return r.json()["access_token"]
 
 
-class TestUpdateMe:
-    def test_update_display_name_succeeds(self, client, captured_emails):
-        token = register_and_login(client, username="alice")
-        r = client.patch(
-            "/user/me",
-            json={"display_name": "Alice Updated"},
-            headers=bearer(token),
-        )
+def change_password(client, token: str | None, current: str, new: str):
+    headers = bearer(token) if token else {}
+    return client.put(
+        PASSWORD_URL,
+        json={"current_password": current, "new_password": new},
+        headers=headers,
+    )
 
-        assert r.status_code == 200
-        body = r.json()
-        assert body["success"] is True
-        assert body["data"]["user"]["display_name"] == "Alice Updated"
 
-    def test_update_display_name_is_reflected_in_get_me(self, client, captured_emails):
-        token = register_and_login(client, username="alice")
-        client.patch(
-            "/user/me",
-            json={"display_name": "Persistent Name"},
-            headers=bearer(token),
-        )
-
-        r = client.get("/user/me", headers=bearer(token))
-        assert r.json()["data"]["user"]["display_name"] == "Persistent Name"
-
-    def test_update_email_sends_change_token_and_keeps_old_email(
-        self, client, captured_emails
-    ):
-        token = register_and_login(client, username="alice")
-        r = client.patch(
-            "/user/me",
-            json={"email": "newalice@example.com"},
-            headers=bearer(token),
-        )
-
-        assert r.status_code == 200
-        # Email in the DB must NOT have switched yet (pending confirmation)
-        user = r.json()["data"]["user"]
-        assert user["email"] == "alice@example.com"
-        # A confirmation email must have been dispatched to the new address
-        assert "newalice@example.com" in captured_emails
-
-    def test_update_display_name_and_email_together(self, client, captured_emails):
-        token = register_and_login(client, username="alice")
-        r = client.patch(
-            "/user/me",
-            json={"display_name": "Combined", "email": "combo@example.com"},
-            headers=bearer(token),
-        )
-
-        assert r.status_code == 200
-        user = r.json()["data"]["user"]
-        assert user["display_name"] == "Combined"
-        # Email still old until confirmed
-        assert user["email"] == "alice@example.com"
-        assert "combo@example.com" in captured_emails
-
-    def test_update_to_same_email_does_not_trigger_change_flow(
-        self, client, captured_emails
-    ):
-        token = register_and_login(client, username="alice")
-        # Clear the registration email so we can check for new ones
-        captured_emails.clear()
-
-        r = client.patch(
-            "/user/me",
-            json={"email": "alice@example.com"},
-            headers=bearer(token),
-        )
-
-        assert r.status_code == 200
-        # No change-email token should be dispatched for the same address
-        assert "alice@example.com" not in captured_emails
-
-    def test_update_email_to_already_taken_email_returns_400(
-        self, client, captured_emails
-    ):
-        register_and_login(client, username="bob", email="bob@example.com")
-        token = register_and_login(client, username="alice", email="alice@example.com")
-
-        r = client.patch(
-            "/user/me",
-            json={"email": "bob@example.com"},
-            headers=bearer(token),
-        )
-
-        assert r.status_code == 400
-        assert r.json()["success"] is False
-        assert "already in use" in r.json()["error"]["message"].lower()
-
-    def test_empty_body_returns_200_with_unchanged_profile(
-        self, client, captured_emails
-    ):
-        token = register_and_login(client, username="alice", display_name="Original")
-        r = client.patch("/user/me", json={}, headers=bearer(token))
-
-        assert r.status_code == 200
-        assert r.json()["data"]["user"]["display_name"] == "Original"
-
-    def test_null_fields_in_body_leaves_values_unchanged(self, client, captured_emails):
-        token = register_and_login(client, username="alice", display_name="Keep Me")
-        r = client.patch(
-            "/user/me",
-            json={"display_name": None, "email": None},
-            headers=bearer(token),
-        )
-
-        assert r.status_code == 200
-        assert r.json()["data"]["user"]["display_name"] == "Keep Me"
-
-    def test_display_name_too_long_returns_422(self, client, captured_emails):
-        token = register_and_login(client, username="alice")
-        r = client.patch(
-            "/user/me",
-            json={"display_name": "x" * 129},  # max_length=128
-            headers=bearer(token),
-        )
-
-        assert r.status_code == 422
-        assert r.json()["success"] is False
-
-    def test_invalid_email_format_returns_422(self, client, captured_emails):
-        token = register_and_login(client, username="alice")
-        r = client.patch(
-            "/user/me",
-            json={"email": "not-an-email"},
-            headers=bearer(token),
-        )
-
-        assert r.status_code == 422
-        assert r.json()["success"] is False
-
-    def test_returns_401_without_token(self, client, captured_emails):
-        register_and_login(client, username="alice")
-        r = client.patch("/user/me", json={"display_name": "Hacker"})
-
-        assert r.status_code == 401
-
-    def test_email_is_lowercased_on_update(self, client, captured_emails):
-        token = register_and_login(client, username="alice")
-        r = client.patch(
-            "/user/me",
-            json={"email": "NewEmail@Example.COM"},
-            headers=bearer(token),
-        )
-
-        assert r.status_code == 200
-        # Token dispatched to the lowercase-normalised address
-        assert "newemail@example.com" in captured_emails
-
-    def test_multiple_sequential_updates_are_each_persisted(
-        self, client, captured_emails
-    ):
-        token = register_and_login(client, username="alice")
-
-        client.patch("/user/me", json={"display_name": "First"}, headers=bearer(token))
-        client.patch("/user/me", json={"display_name": "Second"}, headers=bearer(token))
-
-        r = client.get("/user/me", headers=bearer(token))
-        assert r.json()["data"]["user"]["display_name"] == "Second"
+def change_email(client, token: str | None, new_email: str, password: str = PASSWORD):
+    headers = bearer(token) if token else {}
+    return client.put(
+        EMAIL_URL,
+        json={"current_password": password, "new_email": new_email},
+        headers=headers,
+    )
 
 
 class TestChangeMyPassword:
     def test_change_password_succeeds_with_correct_current_password(
         self, client, captured_emails
     ):
-        token = register_and_login(client, username="alice")
-        r = client.patch(
-            "/user/me/password",
-            json={
-                "current_password": "Password123!",
-                "new_password": "NewSecure456!",
-            },
-            headers=bearer(token),
-        )
+        token = register_and_login(client)
+        r = change_password(client, token, PASSWORD, "NewSecure456!")
 
-        assert r.status_code == 200
-        assert r.json()["success"] is True
+        assert r.status_code == 204
+        assert r.content == b""
 
     def test_can_login_with_new_password_after_change(self, client, captured_emails):
-        token = register_and_login(client, username="alice")
-        client.patch(
-            "/user/me/password",
-            json={
-                "current_password": "Password123!",
-                "new_password": "NewSecure456!",
-            },
-            headers=bearer(token),
-        )
+        token = register_and_login(client)
+        change_password(client, token, PASSWORD, "NewSecure456!")
 
-        r = login(client, username="alice", password="NewSecure456!")
-        assert r.status_code == 200
+        assert (
+            login(client, username="alice", password="NewSecure456!").status_code == 200
+        )
 
     def test_old_password_rejected_after_change(self, client, captured_emails):
-        token = register_and_login(client, username="alice")
-        client.patch(
-            "/user/me/password",
-            json={
-                "current_password": "Password123!",
-                "new_password": "NewSecure456!",
-            },
-            headers=bearer(token),
-        )
+        token = register_and_login(client)
+        change_password(client, token, PASSWORD, "NewSecure456!")
 
-        r = login(client, username="alice", password="Password123!")
-        assert r.status_code == 401
+        assert login(client, username="alice", password=PASSWORD).status_code == 401
 
     def test_wrong_current_password_returns_400(self, client, captured_emails):
-        token = register_and_login(client, username="alice")
-        r = client.patch(
-            "/user/me/password",
-            json={
-                "current_password": "WrongPassword!",
-                "new_password": "ShouldNotWork1!",
-            },
-            headers=bearer(token),
-        )
+        token = register_and_login(client)
+        r = change_password(client, token, "WrongPassword!", "ShouldNotWork1!")
 
         assert r.status_code == 400
-        assert r.json()["success"] is False
-        assert "incorrect" in r.json()["error"]["message"].lower()
+        assert r.json()["code"] == "wrong_password"
+        assert "incorrect" in r.json()["detail"].lower()
 
     def test_wrong_current_password_does_not_change_password(
         self, client, captured_emails
     ):
-        token = register_and_login(client, username="alice")
-        client.patch(
-            "/user/me/password",
-            json={
-                "current_password": "WrongPassword!",
-                "new_password": "ShouldNotWork1!",
-            },
-            headers=bearer(token),
-        )
+        token = register_and_login(client)
+        change_password(client, token, "WrongPassword!", "ShouldNotWork1!")
 
-        # Original password must still work
-        r = login(client, username="alice", password="Password123!")
-        assert r.status_code == 200
+        assert login(client, username="alice", password=PASSWORD).status_code == 200
 
     def test_new_password_too_short_returns_422(self, client, captured_emails):
-        token = register_and_login(client, username="alice")
-        r = client.patch(
-            "/user/me/password",
-            json={"current_password": "Password123!", "new_password": "short"},
-            headers=bearer(token),
-        )
+        token = register_and_login(client)
+        r = change_password(client, token, PASSWORD, "short")
 
         assert r.status_code == 422
-        assert r.json()["success"] is False
+        assert [e["field"] for e in r.json()["errors"]] == ["new_password"]
 
     def test_missing_current_password_returns_422(self, client, captured_emails):
-        token = register_and_login(client, username="alice")
-        r = client.patch(
-            "/user/me/password",
-            json={"new_password": "NewSecure456!"},
-            headers=bearer(token),
+        token = register_and_login(client)
+        r = client.put(
+            PASSWORD_URL, json={"new_password": "NewSecure456!"}, headers=bearer(token)
         )
 
         assert r.status_code == 422
 
     def test_missing_new_password_returns_422(self, client, captured_emails):
-        token = register_and_login(client, username="alice")
-        r = client.patch(
-            "/user/me/password",
-            json={"current_password": "Password123!"},
-            headers=bearer(token),
+        token = register_and_login(client)
+        r = client.put(
+            PASSWORD_URL, json={"current_password": PASSWORD}, headers=bearer(token)
         )
 
         assert r.status_code == 422
 
     def test_returns_401_without_token(self, client, captured_emails):
-        register_and_login(client, username="alice")
-        r = client.patch(
-            "/user/me/password",
-            json={
-                "current_password": "Password123!",
-                "new_password": "NewSecure456!",
-            },
-        )
+        register_and_login(client)
+        r = change_password(client, None, PASSWORD, "NewSecure456!")
 
         assert r.status_code == 401
 
     def test_returns_401_with_invalid_token(self, client, captured_emails):
-        register_and_login(client, username="alice")
-        r = client.patch(
-            "/user/me/password",
-            json={
-                "current_password": "Password123!",
-                "new_password": "NewSecure456!",
-            },
-            headers=bearer("garbage.token.here"),
-        )
+        register_and_login(client)
+        r = change_password(client, "garbage.token.here", PASSWORD, "NewSecure456!")
 
         assert r.status_code == 401
 
+    def test_patch_is_no_longer_routed(self, client, captured_emails):
+        token = register_and_login(client)
+        r = client.patch(
+            PASSWORD_URL,
+            json={"current_password": PASSWORD, "new_password": "NewSecure456!"},
+            headers=bearer(token),
+        )
+
+        assert r.status_code == 405
+        assert r.json()["code"] == "method_not_allowed"
+
     def test_password_change_is_user_specific(self, client, captured_emails):
         """Changing alice's password must not affect bob's credentials."""
-        token_alice = register_and_login(
-            client, username="alice", email="alice@example.com"
-        )
-        register_and_login(client, username="bob", email="bob@example.com")
+        token_alice = register_and_login(client, username="alice")
+        register_and_login(client, username="bob")
 
-        client.patch(
-            "/user/me/password",
-            json={
-                "current_password": "Password123!",
-                "new_password": "AliceNewPass1!",
-            },
-            headers=bearer(token_alice),
-        )
+        change_password(client, token_alice, PASSWORD, "AliceNewPass1!")
 
-        # Bob's original password must still work
-        r = login(client, username="bob", password="Password123!")
+        assert login(client, username="bob", password=PASSWORD).status_code == 200
+
+
+class TestChangeMyEmail:
+    def test_full_flow_switches_and_verifies_the_address(
+        self, client, captured_emails, db
+    ):
+        token = register_and_login(client)
+        captured_emails.clear()
+
+        r = change_email(client, token, "New.Alice@Example.com")
+
+        assert r.status_code == 202
+        assert r.content == b""
+        [mail] = captured_emails
+        assert (mail.to, mail.kind) == ("new.alice@example.com", "change_email")
+
+        r = client.post(VERIFY_URL, json={"token": mail.token})
+
+        assert r.status_code == 204
+        row = db.one("SELECT email, is_email_verified FROM users")
+        assert row["email"] == "new.alice@example.com"
+        assert row["is_email_verified"] is True
+        # Login is by username; it still works and shows the new address.
+        r = login(client, username="alice")
         assert r.status_code == 200
+        assert r.json()["user"]["email"] == "new.alice@example.com"
+        assert audit_count(db, "email_changed", "alice") == 1
+
+    def test_old_address_stays_until_confirmed(self, client, captured_emails, db):
+        token = register_and_login(client)
+
+        assert change_email(client, token, "new@example.com").status_code == 202
+
+        row = db.one("SELECT email, is_email_verified FROM users")
+        assert row["email"] == "alice@example.com"
+        assert row["is_email_verified"] is False
+        r = client.get("/api/v1/users/me", headers=bearer(token))
+        assert r.json()["email"] == "alice@example.com"
+        # Nothing went to the old address for the change.
+        assert captured_emails.of_kind("change_email")[0].to == "new@example.com"
+        assert audit_count(db, "email_changed", "alice") == 0
+
+    def test_request_is_audited_as_verification_sent(self, client, captured_emails, db):
+        token = register_and_login(client)
+        before = audit_count(db, "email_verification_sent", "alice")
+
+        change_email(client, token, "new@example.com")
+
+        assert audit_count(db, "email_verification_sent", "alice") == before + 1
+        detail = db.scalar(
+            "SELECT detail FROM auth_audit_log WHERE event_type::text = "
+            "'EMAIL_VERIFICATION_SENT' ORDER BY created_at DESC LIMIT 1"
+        )
+        assert detail == "Email change requested"
+
+    def test_token_is_single_use(self, client, captured_emails, db):
+        token = register_and_login(client)
+        change_email(client, token, "new@example.com")
+        mail_token = captured_emails.latest_token("new@example.com", "change_email")
+
+        assert client.post(VERIFY_URL, json={"token": mail_token}).status_code == 204
+        r = client.post(VERIFY_URL, json={"token": mail_token})
+
+        assert r.status_code == 400
+        assert r.json()["code"] == "invalid_token"
+        assert audit_count(db, "email_changed", "alice") == 1
+
+    def test_confirmed_change_invalidates_reset_links_sent_before(
+        self, client, captured_emails, db
+    ):
+        """A reset link mailed to the old address must not outlive the change."""
+        token = register_and_login(client)
+        client.post("/api/v1/auth/password/forgot", json={"email": "alice@example.com"})
+        reset_token = captured_emails.latest_token("alice@example.com", "reset")
+        change_email(client, token, "new@example.com")
+        mail_token = captured_emails.latest_token("new@example.com", "change_email")
+
+        assert client.post(VERIFY_URL, json={"token": mail_token}).status_code == 204
+        r = client.post(
+            "/api/v1/auth/password/reset",
+            json={"token": reset_token, "new_password": "AttackerPass789!"},
+        )
+
+        assert r.status_code == 400
+        assert r.json()["code"] == "invalid_token"
+        assert login(client, username="alice").status_code == 200
+
+    def test_unconfirmed_change_keeps_reset_links_valid(self, client, captured_emails):
+        """Only the confirmation switches the address, so only it ends them."""
+        token = register_and_login(client)
+        client.post("/api/v1/auth/password/forgot", json={"email": "alice@example.com"})
+        reset_token = captured_emails.latest_token("alice@example.com", "reset")
+        change_email(client, token, "new@example.com")
+
+        r = client.post(
+            "/api/v1/auth/password/reset",
+            json={"token": reset_token, "new_password": "NewPassword456!"},
+        )
+
+        assert r.status_code == 204
+
+    def test_a_new_request_invalidates_the_previous_link(
+        self, client, captured_emails, db
+    ):
+        token = register_and_login(client)
+        change_email(client, token, "first@example.com")
+        first = captured_emails.latest_token("first@example.com", "change_email")
+        change_email(client, token, "second@example.com")
+        second = captured_emails.latest_token("second@example.com", "change_email")
+
+        assert client.post(VERIFY_URL, json={"token": first}).status_code == 400
+        assert client.post(VERIFY_URL, json={"token": second}).status_code == 204
+        assert db.scalar("SELECT email FROM users") == "second@example.com"
+
+    def test_address_taken_between_request_and_confirm_returns_409(
+        self, client, captured_emails, db
+    ):
+        token = register_and_login(client)
+        change_email(client, token, "contested@example.com")
+        mail_token = captured_emails.latest_token(
+            "contested@example.com", "change_email"
+        )
+        register(client, username="bob", email="contested@example.com")
+
+        r = client.post(VERIFY_URL, json={"token": mail_token})
+
+        assert r.status_code == 409
+        assert r.json()["code"] == "email_taken"
+        alice = db.one("SELECT email FROM users WHERE username = 'alice'")
+        assert alice["email"] == "alice@example.com"
+        # The redemption was rolled back with the failed change.
+        assert (
+            db.scalar(
+                "SELECT used_at FROM email_tokens WHERE purpose::text = 'CHANGE_EMAIL'"
+            )
+            is None
+        )
+        assert audit_count(db, "email_changed", "alice") == 0
+
+    def test_wrong_password_returns_400(self, client, captured_emails, db):
+        token = register_and_login(client)
+        captured_emails.clear()
+
+        r = change_email(client, token, "new@example.com", password="WrongPassword!")
+
+        assert r.status_code == 400
+        assert r.json()["code"] == "wrong_password"
+        assert captured_emails == []
+        assert (
+            db.scalar(
+                "SELECT count(*) FROM email_tokens WHERE purpose::text = 'CHANGE_EMAIL'"
+            )
+            == 0
+        )
+
+    def test_wrong_password_hides_whether_the_address_is_taken(
+        self, client, captured_emails
+    ):
+        register(client, username="bob", email="bob@example.com")
+        token = register_and_login(client)
+
+        r = change_email(client, token, "bob@example.com", password="WrongPassword!")
+
+        assert r.status_code == 400
+        assert r.json()["code"] == "wrong_password"
+
+    def test_address_of_another_account_returns_409(self, client, captured_emails):
+        register(client, username="bob", email="bob@example.com")
+        token = register_and_login(client)
+        captured_emails.clear()
+
+        r = change_email(client, token, "BOB@example.com")
+
+        assert r.status_code == 409
+        assert r.json()["code"] == "email_taken"
+        assert captured_emails == []
+
+    def test_current_address_returns_400_email_unchanged(self, client, captured_emails):
+        token = register_and_login(client)
+        captured_emails.clear()
+
+        r = change_email(client, token, "alice@example.com")
+
+        assert r.status_code == 400
+        assert r.json()["code"] == "email_unchanged"
+        assert captured_emails == []
+
+    def test_invalid_address_returns_422(self, client, captured_emails):
+        token = register_and_login(client)
+        r = change_email(client, token, "not-an-email")
+
+        assert r.status_code == 422
+        assert [e["field"] for e in r.json()["errors"]] == ["new_email"]
+
+    def test_returns_401_without_token(self, client, captured_emails):
+        register_and_login(client)
+        r = change_email(client, None, "new@example.com")
+
+        assert r.status_code == 401
+        assert r.headers["www-authenticate"] == "Bearer"

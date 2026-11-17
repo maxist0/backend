@@ -11,6 +11,7 @@ from app.modules.auth.tasks import TEMPLATE_DIR
     [
         ("verify_email.html", "verify_url"),
         ("reset_password.html", "reset_url"),
+        ("confirm_email_change.html", "confirm_url"),
     ],
 )
 def test_auth_templates_extend_the_core_layout(template_name, url_key):

@@ -174,6 +174,10 @@ class Settings(BaseSettings):
     APP_NAME: str = "api"
     APP_DESCRIPTION: str = "API Description"
     APP_VERSION: str = Field(default_factory=_installed_version)
+    # Path prefix of every module router (API version). `/`, `/metrics` and
+    # the health endpoints stay unprefixed. Empty, or segments without a
+    # trailing slash.
+    API_PREFIX: str = Field(default="/api/v1", pattern=r"^(/[A-Za-z0-9._~-]+)*$")
     FRONTEND_URL: str = (
         "http://localhost:3000"  # used for email links; override in production
     )

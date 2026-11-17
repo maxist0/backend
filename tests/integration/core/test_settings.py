@@ -13,4 +13,4 @@ class TestSettingsDependency:
             client.app.dependency_overrides.clear()
 
         assert r.status_code == 200
-        assert r.json()["data"]["service"] == "overridden"
+        assert r.json()["service"] == "overridden"

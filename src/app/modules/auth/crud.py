@@ -322,14 +322,14 @@ async def create_email_token(db: AsyncSession, token: EmailToken) -> EmailToken:
 
 
 async def consume_email_token(
-    db: AsyncSession, token_hash: str, purpose: EmailTokenPurpose
-) -> tuple[uuid.UUID, str | None] | None:
-    """Atomically redeem a single-use email token.
+    db: AsyncSession, token_hash: str, *purposes: EmailTokenPurpose
+) -> tuple[uuid.UUID, EmailTokenPurpose, str | None] | None:
+    """Atomically redeem a single-use email token of one of `purposes`.
 
     `UPDATE ... SET used_at = now() WHERE <still valid> RETURNING`: of
     several concurrent redemptions exactly one gets a row. Returns
-    `(user_id, new_email)` or None if the token is unknown, used,
-    invalidated or expired.
+    `(user_id, purpose, new_email)` or None if the token is unknown, used,
+    invalidated, expired or of another purpose.
 
     Does NOT commit: the caller's next write commits it together with the
     effect of the token (a failure before that rolls the redemption back).
@@ -339,24 +339,31 @@ async def consume_email_token(
             update(EmailToken)
             .where(
                 EmailToken.token_hash == token_hash,
-                EmailToken.purpose == purpose,
+                EmailToken.purpose.in_(purposes),
                 EmailToken.used_at.is_(None),
                 EmailToken.invalidated_at.is_(None),
                 EmailToken.expires_at > func.now(),
             )
             .values(used_at=func.now())
-            .returning(EmailToken.user_id, EmailToken.new_email)
+            .returning(EmailToken.user_id, EmailToken.purpose, EmailToken.new_email)
         )
         row = result.first()
     if row is None:
         return None
-    return row[0], row[1]
+    return row[0], row[1], row[2]
 
 
 async def invalidate_tokens_for_user_purpose(
-    db: AsyncSession, user_id: uuid.UUID, purpose: EmailTokenPurpose
+    db: AsyncSession,
+    user_id: uuid.UUID,
+    purpose: EmailTokenPurpose,
+    *,
+    commit: bool = True,
 ) -> None:
-    """Soft-invalidate older tokens when a new one is issued."""
+    """Soft-invalidate the user's open tokens of `purpose`.
+
+    With `commit=False` the caller's next commit includes the invalidation.
+    """
     with DatabaseTimer("update", "email_tokens"):
         await db.execute(
             update(EmailToken)
@@ -370,7 +377,8 @@ async def invalidate_tokens_for_user_purpose(
             )
             .values(invalidated_at=utcnow())
         )
-        await db.commit()
+        if commit:
+            await db.commit()
 
 
 async def create_audit_log(db: AsyncSession, log: AuthAuditLog) -> AuthAuditLog:

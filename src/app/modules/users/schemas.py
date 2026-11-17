@@ -1,27 +1,19 @@
 """Request and response schemas of the users module."""
 
-import re
 from datetime import datetime
 
-from pydantic import BaseModel, Field, field_validator
-
-_EMAIL_RE = re.compile(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class UpdateProfileRequest(BaseModel):
-    """Update the current user's profile."""
+    """Profile fields of the current user; omitted or null fields stay unchanged.
+
+    The email address is changed through `PUT /users/me/email`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
 
     display_name: str | None = Field(None, max_length=128)
-    email: str | None = Field(None, max_length=255)
-
-    @field_validator("email")
-    @classmethod
-    def validate_email(cls, v: str | None) -> str | None:
-        if v is None:
-            return v
-        if not _EMAIL_RE.match(v):
-            raise ValueError("Invalid email format")
-        return v.lower()
 
 
 class UserResponse(BaseModel):

@@ -14,8 +14,8 @@ pin behaviour that must survive refactoring.
 
 Contract assumed by these tests:
 
-* `POST /auth/logout-all` (Bearer; 200; deletes the refresh cookie; audit row;
-  401 without a token).
+* `POST /api/v1/auth/logout-all` (Bearer; 204; deletes the refresh cookie;
+  audit row; 401 without a token).
 * The access token carries the claim `sid` equal to `sessions.family_id`,
   stable across rotation.
 * A user with `is_locked=true` and `locked_until` NULL is locked indefinitely.
@@ -52,10 +52,11 @@ def _alice(client):
 
 
 def _reset_password(client, captured_emails, new_password="NewPassword456!"):
-    client.post("/auth/password/forgot", json={"email": "alice@example.com"})
+    client.post("/api/v1/auth/password/forgot", json={"email": "alice@example.com"})
     token = captured_emails.latest_token("alice@example.com", "reset")
     return client.post(
-        "/auth/password/reset", json={"token": token, "new_password": new_password}
+        "/api/v1/auth/password/reset",
+        json={"token": token, "new_password": new_password},
     )
 
 
@@ -213,7 +214,7 @@ class TestSessionRevocation:
         b = login_tokens(client, "alice")
         assert active_session_count(db, "alice") == 2
 
-        assert _reset_password(client, captured_emails).status_code == 200
+        assert _reset_password(client, captured_emails).status_code == 204
 
         assert refresh_with(client, a.refresh)[0].status_code == 401
         assert refresh_with(client, b.refresh)[0].status_code == 401
@@ -236,12 +237,12 @@ class TestSessionRevocation:
         current = login_tokens(client, "alice")
         other = login_tokens(client, "alice")
 
-        r = client.patch(
-            "/user/me/password",
+        r = client.put(
+            "/api/v1/users/me/password",
             json={"current_password": PASSWORD, "new_password": "NewSecure456!"},
             headers=bearer(current.access),
         )
-        assert r.status_code == 200
+        assert r.status_code == 204
 
         assert refresh_with(client, other.refresh)[0].status_code == 401
         assert refresh_with(client, current.refresh)[0].status_code == 200
@@ -255,12 +256,12 @@ class TestSessionRevocation:
         other = login_tokens(client, "alice")
         _, rotated = refresh_with(client, first.refresh)
 
-        r = client.patch(
-            "/user/me/password",
+        r = client.put(
+            "/api/v1/users/me/password",
             json={"current_password": PASSWORD, "new_password": "NewSecure456!"},
             headers=bearer(rotated.access),
         )
-        assert r.status_code == 200
+        assert r.status_code == 204
         assert refresh_with(client, other.refresh)[0].status_code == 401
         assert refresh_with(client, rotated.refresh)[0].status_code == 200
 
@@ -268,17 +269,17 @@ class TestSessionRevocation:
         self, client, captured_emails
     ):
         _alice(client)
-        client.post("/auth/password/forgot", json={"email": "alice@example.com"})
+        client.post("/api/v1/auth/password/forgot", json={"email": "alice@example.com"})
         reset_token = captured_emails.latest_token("alice@example.com", "reset")
         t = login_tokens(client, "alice")
 
-        client.patch(
-            "/user/me/password",
+        client.put(
+            "/api/v1/users/me/password",
             json={"current_password": PASSWORD, "new_password": "NewSecure456!"},
             headers=bearer(t.access),
         )
         r = client.post(
-            "/auth/password/reset",
+            "/api/v1/auth/password/reset",
             json={"token": reset_token, "new_password": "AttackerPass789!"},
         )
         assert r.status_code == 400
@@ -290,13 +291,13 @@ class TestSessionRevocation:
         a = login_tokens(client, "alice")
         b = login_tokens(client, "alice")
 
-        r = client.post("/auth/logout-all", headers=bearer(a.access))
+        r = client.post("/api/v1/auth/logout-all", headers=bearer(a.access))
 
-        assert r.status_code == 200, r.text
+        assert r.status_code == 204, r.text
         set_cookie = r.headers.get("set-cookie", "")
         assert "refresh_token=" in set_cookie
         assert "max-age=0" in set_cookie.lower() or "expires=" in set_cookie.lower()
-        assert "path=/auth" in set_cookie.lower()
+        assert "path=/api/v1/auth" in set_cookie.lower()
         assert active_session_count(db, "alice") == 0
         assert refresh_with(client, a.refresh)[0].status_code == 401
         assert refresh_with(client, b.refresh)[0].status_code == 401
@@ -310,18 +311,153 @@ class TestSessionRevocation:
         a = login_tokens(client, "alice")
         b = login_tokens(client, "bob")
 
-        r = client.post("/auth/logout-all", headers=bearer(a.access))
-        assert r.status_code == 200, r.text
+        r = client.post("/api/v1/auth/logout-all", headers=bearer(a.access))
+        assert r.status_code == 204, r.text
 
         assert active_session_count(db, "bob") == 1
         assert refresh_with(client, b.refresh)[0].status_code == 200
 
     def test_logout_all_without_token_returns_401(self, client):
-        assert client.post("/auth/logout-all").status_code == 401
+        assert client.post("/api/v1/auth/logout-all").status_code == 401
 
     def test_logout_all_with_invalid_token_returns_401(self, client):
-        r = client.post("/auth/logout-all", headers=bearer("not.a.jwt"))
+        r = client.post("/api/v1/auth/logout-all", headers=bearer("not.a.jwt"))
         assert r.status_code == 401
+
+
+def _refusal(response) -> tuple:
+    """Everything a client can read from a refused login, except `request_id`."""
+    body = response.json()
+    body.pop("request_id", None)
+    return (
+        response.status_code,
+        response.headers.get("content-type"),
+        response.headers.get("www-authenticate"),
+        response.headers.get("retry-after"),
+        body,
+    )
+
+
+_INVALID_CREDENTIALS = (
+    401,
+    "application/problem+json",
+    "Bearer",
+    None,
+    {
+        "type": "about:blank",
+        "title": "Unauthorized",
+        "status": 401,
+        "detail": "Invalid username or password",
+        "code": "invalid_credentials",
+    },
+)
+
+
+class TestUniformLoginRefusal:
+    """Every refused login looks the same, so the answer reveals neither
+    whether the account exists nor whether it is locked or deactivated."""
+
+    def test_unknown_user(self, client):
+        assert _refusal(login(client, username="ghost")) == _INVALID_CREDENTIALS
+
+    def test_wrong_password(self, client, captured_emails):
+        _alice(client)
+        r = login(client, username="alice", password="WrongPass!1")
+        assert _refusal(r) == _INVALID_CREDENTIALS
+
+    def test_threshold_guess_and_every_guess_while_timed_locked(
+        self, client, captured_emails, db
+    ):
+        _alice(client)
+        for _ in range(MAXIMUM_LOGIN_ATTEMPTS):
+            r = login(client, username="alice", password="WrongPass!1")
+            assert _refusal(r) == _INVALID_CREDENTIALS  # the last one locks
+        row = db.one("SELECT is_locked, locked_until FROM users")
+        assert row["is_locked"] is True and row["locked_until"] is not None
+
+        wrong = login(client, username="alice", password="WrongPass!1")
+        correct = login(client, username="alice")
+
+        assert _refusal(wrong) == _INVALID_CREDENTIALS
+        assert _refusal(correct) == _INVALID_CREDENTIALS
+        assert "refresh_token" not in client.cookies
+
+    def test_correct_password_while_admin_locked(self, client, captured_emails, db):
+        _alice(client)
+        db.execute("UPDATE users SET is_locked = true, locked_until = NULL")
+
+        assert _refusal(login(client, username="alice")) == _INVALID_CREDENTIALS
+
+    def test_correct_password_of_inactive_account(self, client, captured_emails, db):
+        _alice(client)
+        db.execute("UPDATE users SET is_active = false")
+
+        assert _refusal(login(client, username="alice")) == _INVALID_CREDENTIALS
+
+    @pytest.mark.parametrize("path", ["first_check", "recheck_after_admission"])
+    def test_locked_refusal_waits_instead_of_running_argon2(
+        self, client, captured_emails, db, monkeypatch, path
+    ):
+        """The timing wait replaces Argon2 on locked accounts and runs outside
+        the admission limiter (it holds no slot)."""
+        import app.modules.auth.service as service
+        from app.core.security import login_admission_limiter
+
+        _alice(client)
+        if path == "first_check":
+            db.execute(
+                "UPDATE users SET is_locked = true, "
+                "locked_until = now() + interval '1 hour'"
+            )
+        else:
+            # The account looks unlocked at the first check and locked at the
+            # re-check, as when a parallel guess locked it meanwhile.
+            monkeypatch.setattr(service, "lock_is_active", lambda *_: True)
+        calls: list[tuple[str, float]] = []
+
+        async def wait() -> None:
+            calls.append(("wait", login_admission_limiter().borrowed_tokens))
+
+        async def argon2(*_args) -> bool:
+            calls.append(("argon2", 0))
+            return False
+
+        monkeypatch.setattr(service, "wait_like_password_verify", wait)
+        monkeypatch.setattr(service, "verify_password", argon2)
+        monkeypatch.setattr(service, "equalize_password_timing", argon2)
+
+        r = login(client, username="alice")
+
+        assert _refusal(r) == _INVALID_CREDENTIALS
+        assert calls == [("wait", 0)]
+
+    def test_lockout_audit_rows_are_unchanged(self, client, captured_emails, db):
+        """Four failures, the locking fifth, then two refused logins on the
+        locked account (wrong and correct password) are audited as before."""
+        _alice(client)
+        for _ in range(MAXIMUM_LOGIN_ATTEMPTS):
+            login(client, username="alice", password="WrongPass!1")
+        login(client, username="alice", password="WrongPass!1")
+        login(client, username="alice")
+
+        rows = db.rows(
+            "SELECT event_type::text AS event, detail FROM auth_audit_log "
+            "WHERE event_type::text IN ('LOGIN_FAILED', 'ACCOUNT_LOCKED') "
+            "ORDER BY created_at"
+        )
+        events = [r["event"] for r in rows]
+        assert (
+            events == ["LOGIN_FAILED"] * 4 + ["ACCOUNT_LOCKED"] + ["LOGIN_FAILED"] * 2
+        )
+        assert (
+            rows[4]["detail"]
+            == f"Locked after {MAXIMUM_LOGIN_ATTEMPTS} failed attempts"
+        )
+        assert all(r["detail"].startswith("Account locked, ") for r in rows[5:])
+        row = db.one("SELECT failed_login_attempts, is_locked FROM users")
+        # Guesses on a locked account are refused before they are counted.
+        assert row["failed_login_attempts"] == MAXIMUM_LOGIN_ATTEMPTS
+        assert row["is_locked"] is True
 
 
 class TestLockout:
@@ -387,14 +523,18 @@ class TestLockout:
     ):
         _alice(client)
         t = login_tokens(client, "alice")
-        assert client.get("/user/me", headers=bearer(t.access)).status_code == 200
+        assert (
+            client.get("/api/v1/users/me", headers=bearer(t.access)).status_code == 200
+        )
 
         db.execute(
             "UPDATE users SET is_locked = true, locked_until = NULL "
             "WHERE username = 'alice'"
         )
 
-        assert client.get("/user/me", headers=bearer(t.access)).status_code == 401
+        assert (
+            client.get("/api/v1/users/me", headers=bearer(t.access)).status_code == 401
+        )
 
     def test_access_token_under_timed_lock_is_still_accepted(
         self, client, captured_emails, db
@@ -406,7 +546,9 @@ class TestLockout:
             "UPDATE users SET is_locked = true, "
             "locked_until = now() + interval '1 hour' WHERE username = 'alice'"
         )
-        assert client.get("/user/me", headers=bearer(t.access)).status_code == 200
+        assert (
+            client.get("/api/v1/users/me", headers=bearer(t.access)).status_code == 200
+        )
 
     def test_failed_logins_lock_only_the_password_login(
         self, client, captured_emails, db
@@ -428,10 +570,14 @@ class TestLockout:
 
         assert login(client, username="alice").status_code == 401  # new login: locked
         client.cookies.clear()
-        assert client.get("/user/me", headers=bearer(t.access)).status_code == 200
+        assert (
+            client.get("/api/v1/users/me", headers=bearer(t.access)).status_code == 200
+        )
         r, t1 = refresh_with(client, t.refresh)
         assert r.status_code == 200, r.text
-        assert client.get("/user/me", headers=bearer(t1.access)).status_code == 200
+        assert (
+            client.get("/api/v1/users/me", headers=bearer(t1.access)).status_code == 200
+        )
         assert active_session_count(db, "alice") == 1
 
     def test_admin_lock_invalidates_sessions_that_were_valid_before(
@@ -444,7 +590,9 @@ class TestLockout:
             "UPDATE users SET is_locked = true, locked_until = NULL "
             "WHERE username = 'alice'"
         )
-        assert client.get("/user/me", headers=bearer(t.access)).status_code == 401
+        assert (
+            client.get("/api/v1/users/me", headers=bearer(t.access)).status_code == 401
+        )
         assert refresh_with(client, t.refresh)[0].status_code == 401
         assert login(client, username="alice").status_code == 401
         client.cookies.clear()
@@ -456,7 +604,9 @@ class TestLockout:
         _alice(client)
         t = login_tokens(client, "alice")
         db.execute("UPDATE users SET is_active = false WHERE username = 'alice'")
-        assert client.get("/user/me", headers=bearer(t.access)).status_code == 401
+        assert (
+            client.get("/api/v1/users/me", headers=bearer(t.access)).status_code == 401
+        )
 
 
 class TestEmailTokensSingleUse:
@@ -465,19 +615,21 @@ class TestEmailTokensSingleUse:
     ):
         _alice(client)
         for round_no in range(ROUNDS):
-            client.post("/auth/password/forgot", json={"email": "alice@example.com"})
+            client.post(
+                "/api/v1/auth/password/forgot", json={"email": "alice@example.com"}
+            )
             token = captured_emails.latest_token("alice@example.com", "reset")
 
             results = run_parallel(
                 8,
                 lambda i: client.post(
-                    "/auth/password/reset",
+                    "/api/v1/auth/password/reset",
                     json={"token": token, "new_password": f"ParallelPass{i}!"},
                 ),
             )
 
             statuses = sorted(r.status_code for r in results)
-            assert statuses.count(200) == 1, (round_no, statuses)
+            assert statuses.count(204) == 1, (round_no, statuses)
             assert statuses.count(400) == 7, (round_no, statuses)
         assert audit_count(db, "password_reset_completed", "alice") == ROUNDS
 
@@ -490,13 +642,44 @@ class TestEmailTokensSingleUse:
             token = captured_emails.latest_token(f"{name}@example.com", "verify")
 
             results = run_parallel(
-                8, lambda _i: client.post("/auth/email/verify", json={"token": token})
+                8,
+                lambda _i: client.post(
+                    "/api/v1/auth/email/verify", json={"token": token}
+                ),
             )
 
             statuses = sorted(r.status_code for r in results)
-            assert statuses.count(200) == 1, (round_no, statuses)
+            assert statuses.count(204) == 1, (round_no, statuses)
             assert statuses.count(400) == 7, (round_no, statuses)
         assert audit_count(db, "email_verified") == ROUNDS
+
+    def test_parallel_redemption_of_email_change_token_succeeds_exactly_once(
+        self, client, captured_emails, db
+    ):
+        _alice(client)
+        t = login_tokens(client, "alice")
+        for round_no in range(ROUNDS):
+            new_email = f"alice{round_no}@example.org"
+            r = client.put(
+                "/api/v1/users/me/email",
+                json={"current_password": PASSWORD, "new_email": new_email},
+                headers=bearer(t.access),
+            )
+            assert r.status_code == 202, r.text
+            token = captured_emails.latest_token(new_email, "change_email")
+
+            results = run_parallel(
+                8,
+                lambda _i: client.post(
+                    "/api/v1/auth/email/verify", json={"token": token}
+                ),
+            )
+
+            statuses = sorted(r.status_code for r in results)
+            assert statuses.count(204) == 1, (round_no, statuses)
+            assert statuses.count(400) == 7, (round_no, statuses)
+            assert db.scalar("SELECT email FROM users") == new_email
+        assert audit_count(db, "email_changed", "alice") == ROUNDS
 
 
 def _secret() -> str:
@@ -506,9 +689,9 @@ def _secret() -> str:
 
 
 def _call_me(client, token: str):
-    """GET /user/me; a server-side exception counts as a failure of the contract."""
+    """GET /api/v1/users/me; a server-side exception counts as a failure of the contract."""
     try:
-        return client.get("/user/me", headers=bearer(token))
+        return client.get("/api/v1/users/me", headers=bearer(token))
     except Exception as exc:  # noqa: BLE001 - TestClient re-raises app exceptions
         pytest.fail(f"server raised {type(exc).__name__} instead of answering 401")
 
@@ -610,7 +793,7 @@ class TestInputBounds:
         _alice(client)
         t = login_tokens(client, "alice")
         r = client.post(
-            "/auth/refresh",
+            "/api/v1/auth/refresh",
             headers={
                 "Cookie": f"refresh_token={t.refresh}",
                 "User-Agent": "A" * 2000,
@@ -625,14 +808,14 @@ class TestInputBounds:
     )
     def test_register_with_malformed_email_returns_422(self, client, email):
         r = client.post(
-            "/auth/register",
+            "/api/v1/auth/register",
             json={"username": "alice", "email": email, "password": PASSWORD},
         )
         assert r.status_code == 422
 
     def test_register_with_trailing_newline_creates_no_user(self, client, db):
         client.post(
-            "/auth/register",
+            "/api/v1/auth/register",
             json={
                 "username": "alice",
                 "email": "alice@example.com\n",
@@ -643,24 +826,28 @@ class TestInputBounds:
 
     @pytest.mark.parametrize("email", ["not-an-email", "a@b.com\n"], ids=repr)
     def test_forgot_password_with_malformed_email_returns_422(self, client, email):
-        r = client.post("/auth/password/forgot", json={"email": email})
+        r = client.post("/api/v1/auth/password/forgot", json={"email": email})
         assert r.status_code == 422
 
     def test_reset_mail_is_sent_to_the_stored_address(self, client, captured_emails):
         register(client, username="alice", email="alice@example.com")
         captured_emails.clear()
 
-        r = client.post("/auth/password/forgot", json={"email": "ALICE@Example.COM"})
+        r = client.post(
+            "/api/v1/auth/password/forgot", json={"email": "ALICE@Example.COM"}
+        )
 
-        assert r.status_code == 200
+        assert r.status_code == 202
         resets = captured_emails.of_kind("reset")
         assert len(resets) == 1
         assert resets[0].to == "alice@example.com"
 
     def test_forgot_for_unknown_address_sends_no_mail(self, client, captured_emails):
-        """GUARD: no mail and still 200 (no enumeration)."""
-        r = client.post("/auth/password/forgot", json={"email": "ghost@example.com"})
-        assert r.status_code == 200
+        """GUARD: no mail and still 202 (no enumeration)."""
+        r = client.post(
+            "/api/v1/auth/password/forgot", json={"email": "ghost@example.com"}
+        )
+        assert r.status_code == 202
         assert captured_emails == []
 
     def test_registration_sends_exactly_one_verification_mail(
@@ -691,8 +878,8 @@ class TestLoggingHygiene:
         login(client, username=PII_USER, password="WrongPass!1")  # failed login
         login(client, username="ghost_" + PII_USER)  # unknown user
         t = login_tokens(client, PII_USER)
-        client.get("/user/me", headers=bearer(t.access))
-        client.post("/auth/password/forgot", json={"email": PII_MAIL})
+        client.get("/api/v1/users/me", headers=bearer(t.access))
+        client.post("/api/v1/auth/password/forgot", json={"email": PII_MAIL})
         refresh_with(client, t.refresh)
         for _ in range(MAXIMUM_LOGIN_ATTEMPTS):  # also exercises the lock log
             login(client, username=PII_USER, password="WrongPass!1")
@@ -707,7 +894,7 @@ class TestLoggingHygiene:
         caplog.set_level(logging.DEBUG)
         _alice(client)
         t = login_tokens(client, "alice")
-        client.get("/user/me", headers=bearer(t.access))
+        client.get("/api/v1/users/me", headers=bearer(t.access))
         refresh_with(client, t.refresh)
         text = _log_text(caplog)
         assert t.refresh[:8] not in text

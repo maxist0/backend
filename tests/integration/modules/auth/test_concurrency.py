@@ -113,7 +113,7 @@ def _refresh_raw(client, refresh_token: str):
     jar: during the race another response could modify the jar.
     """
     r = client.post(
-        "/auth/refresh", headers={"Cookie": f"refresh_token={refresh_token}"}
+        "/api/v1/auth/refresh", headers={"Cookie": f"refresh_token={refresh_token}"}
     )
     return r, r.cookies.get("refresh_token") if r.status_code == 200 else None
 
@@ -161,11 +161,11 @@ class TestRevocationVersusRotation:
             db,
             rotation_gate,
             t0.refresh,
-            lambda: client.post("/auth/logout-all", headers=bearer(t0.access)),
+            lambda: client.post("/api/v1/auth/logout-all", headers=bearer(t0.access)),
         )
 
         assert refresh_r.status_code == 200 and successor, refresh_r.text
-        assert revoke_r.status_code == 200, revoke_r.text
+        assert revoke_r.status_code == 204, revoke_r.text
         assert active_session_count(db, "alice") == 0
         assert _refresh_raw(client, successor)[0].status_code == 401
 
@@ -174,7 +174,7 @@ class TestRevocationVersusRotation:
     ):
         _alice(client)
         t0 = login_tokens(client, "alice")
-        client.post("/auth/password/forgot", json={"email": "alice@example.com"})
+        client.post("/api/v1/auth/password/forgot", json={"email": "alice@example.com"})
         reset_token = captured_emails.latest_token("alice@example.com", "reset")
 
         refresh_r, successor, revoke_r = _race_revocation_against_rotation(
@@ -183,13 +183,13 @@ class TestRevocationVersusRotation:
             rotation_gate,
             t0.refresh,
             lambda: client.post(
-                "/auth/password/reset",
+                "/api/v1/auth/password/reset",
                 json={"token": reset_token, "new_password": "NewPassword456!"},
             ),
         )
 
         assert refresh_r.status_code == 200 and successor, refresh_r.text
-        assert revoke_r.status_code == 200, revoke_r.text
+        assert revoke_r.status_code == 204, revoke_r.text
         assert active_session_count(db, "alice") == 0
         assert _refresh_raw(client, successor)[0].status_code == 401
 
@@ -205,15 +205,15 @@ class TestRevocationVersusRotation:
             db,
             rotation_gate,
             rotating.refresh,
-            lambda: client.patch(
-                "/user/me/password",
+            lambda: client.put(
+                "/api/v1/users/me/password",
                 json={"current_password": PASSWORD, "new_password": "NewSecure456!"},
                 headers=bearer(caller.access),
             ),
         )
 
         assert refresh_r.status_code == 200 and successor, refresh_r.text
-        assert revoke_r.status_code == 200, revoke_r.text
+        assert revoke_r.status_code == 204, revoke_r.text
         assert _refresh_raw(client, successor)[0].status_code == 401
         # only the calling session survives
         assert active_session_count(db, "alice") == 1
@@ -415,7 +415,8 @@ class TestConcurrentRegistration:
                 if duplicate == "email"
                 else "Username already taken"
             )
-            assert expected in loser["error"]["message"]
+            assert loser["code"] == "user_exists"
+            assert loser["detail"] == expected
             if duplicate == "email":
                 assert (
                     db.scalar(
@@ -438,29 +439,37 @@ class TestConcurrentRegistration:
         assert "racer0x" not in text
         assert "DETAIL" not in text, "raw database error text reached the logs"
 
-    def test_profile_email_update_racing_a_registration_never_fails_with_500(
+    def test_email_change_confirmation_racing_a_registration_never_fails_with_500(
         self, client, captured_emails, db, caplog
     ):
-        """GUARD: PATCH /user/me only stores a change-email token today (no unique
-        constraint is hit), so the race must stay free of 500s and of the address
-        in the logs when the change-email confirmation is implemented."""
+        """Confirming an email change while the address is being registered:
+        exactly one account gets it; the loser gets 409 (pre-check or unique
+        constraint), never a 500, and the address never reaches the logs."""
         caplog.set_level(logging.DEBUG)
         _alice(client)
         token = login_tokens(client, "alice").access
         shared = "contested.mail@example.com"
+        r = client.put(
+            "/api/v1/users/me/email",
+            json={"current_password": PASSWORD, "new_email": shared},
+            headers=bearer(token),
+        )
+        assert r.status_code == 202, r.text
+        change_token = captured_emails.latest_token(shared, "change_email")
 
         def _act(i: int):
             if i == 0:
                 return register(client, username="bob", email=shared)
-            return client.patch(
-                "/user/me", json={"email": shared}, headers=bearer(token)
+            return client.post(
+                "/api/v1/auth/email/verify", json={"token": change_token}
             )
 
-        results = run_parallel(5, _act)
+        results = run_parallel(2, _act)
         client.cookies.clear()
 
-        statuses = [r.status_code for r in results]
-        assert 500 not in statuses, statuses
+        statuses = sorted(r.status_code for r in results)
+        assert statuses in ([201, 409], [204, 409]), statuses
+        assert db.scalar("SELECT count(*) FROM users WHERE email = :e", e=shared) == 1
         assert shared not in _log_text(caplog)
 
 

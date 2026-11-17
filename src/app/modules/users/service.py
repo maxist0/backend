@@ -1,5 +1,8 @@
-"""Business logic of the users module: the public user representation."""
+"""Business logic of the users module: profile and public representation."""
 
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.modules.users import crud
 from app.modules.users.models import User
 from app.modules.users.schemas import UserResponse
 
@@ -24,3 +27,22 @@ def user_to_response(user: User) -> UserResponse:
             "timezone": "UTC",
         },
     )
+
+
+async def update_profile(
+    db: AsyncSession, user: User, *, display_name: str | None
+) -> User:
+    """Update the profile fields of `user` and commit.
+
+    Args:
+        db: The request's session; `user` belongs to it.
+        user: The current user.
+        display_name: New display name; None keeps the current one.
+
+    Returns:
+        The updated user.
+    """
+    if display_name is not None:
+        user.display_name = display_name
+    await crud.update_user(db, user)
+    return user

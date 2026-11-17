@@ -180,7 +180,7 @@ def client(app, clean_db, flush_redis):
 @dataclass(frozen=True)
 class CapturedEmail:
     to: str  # exactly as passed to the task (not normalised)
-    kind: str  # "verify" | "reset"
+    kind: str  # "verify" | "reset" | "change_email"
     token: str
     username: str | None = None
 
@@ -246,6 +246,10 @@ def captured_emails(monkeypatch) -> CapturedEmails:
     )
     monkeypatch.setattr(
         "app.modules.auth.tasks.send_password_reset_email_task.kiq", _make("reset")
+    )
+    monkeypatch.setattr(
+        "app.modules.auth.tasks.send_email_change_confirmation_task.kiq",
+        _make("change_email"),
     )
     return emails
 

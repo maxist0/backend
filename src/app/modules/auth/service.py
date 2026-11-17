@@ -1,17 +1,17 @@
 """Business logic of the auth module.
 
 Registration, login with lockout, refresh-token sessions, password reset and
-change, email verification and the profile update that can change the email.
-Orchestrates crud, password hashing, token creation, audit logging and the
-email tasks.
+change, email verification and the email change. Orchestrates crud, password
+hashing, token creation, audit logging and the email tasks. Failures are
+raised as the module's `AppError` subclasses (`app.modules.auth.errors`).
 """
 
 import secrets
 import uuid
 from datetime import datetime, timedelta
+from typing import NoReturn
 
 from fastapi import Request
-from fastapi.responses import JSONResponse
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import set_committed_value
@@ -26,8 +26,20 @@ from app.core.security import (
     login_admission_limiter,
     password_needs_rehash,
     verify_password,
+    wait_like_password_verify,
 )
 from app.modules.auth import crud
+from app.modules.auth.errors import (
+    EmailAlreadyVerifiedError,
+    EmailTakenError,
+    EmailUnchangedError,
+    InvalidCredentialsError,
+    InvalidRefreshTokenError,
+    InvalidTokenError,
+    SessionNotFoundError,
+    UserExistsError,
+    WrongPasswordError,
+)
 from app.modules.auth.models import (
     AuditEventType,
     AuthAuditLog,
@@ -37,6 +49,7 @@ from app.modules.auth.models import (
     Session,
 )
 from app.modules.auth.tasks import (
+    send_email_change_confirmation_task,
     send_password_reset_email_task,
     send_verification_email_task,
 )
@@ -57,30 +70,11 @@ _DEVICE_HEADER_MAX_LENGTH = 255
 
 # Unique constraints of `users` (PostgreSQL default names for the unnamed
 # constraints in the initial migration) -> the 409 message of the pre-check.
+_USERS_EMAIL_KEY = "users_email_key"
 _REGISTER_CONFLICT_MESSAGES = {
     "users_username_key": "Username already taken",
-    "users_email_key": "Email already registered",
+    _USERS_EMAIL_KEY: "Email already registered",
 }
-
-
-def add_refresh_token_to_cookie(
-    response: JSONResponse, refresh_token: str
-) -> JSONResponse:
-    """Set the refresh token as an httpOnly cookie."""
-    response.set_cookie(
-        key="refresh_token",
-        value=refresh_token,
-        httponly=True,
-        samesite="lax",
-        path="/auth",
-    )
-    return response
-
-
-def delete_refresh_token_cookie(response: JSONResponse) -> JSONResponse:
-    """Clear the refresh token cookie."""
-    response.delete_cookie(key="refresh_token", path="/auth")
-    return response
 
 
 def _bounded_header(request: Request | None, name: str, max_length: int) -> str | None:
@@ -116,19 +110,22 @@ async def register_user(
     password: str,
     display_name: str | None = None,
     request: Request | None = None,
-) -> tuple[User | None, str | None]:
-    """
-    Register a new user.
-    Returns (User, None) on success or (None, error_message) on failure.
+) -> User:
+    """Register a new user and send the verification email.
 
     The pre-checks answer the common case cheaply; the unique constraints
     decide parallel registrations (the loser gets the same 409).
+
+    Returns:
+        The new user.
+
+    Raises:
+        UserExistsError: The username or the email is already registered.
     """
-    # Check uniqueness
     if await users_crud.get_user_by_username(db, username):
-        return None, "Username already taken"
+        raise UserExistsError("Username already taken")
     if await users_crud.get_user_by_email(db, email):
-        return None, "Email already registered"
+        raise UserExistsError("Email already registered")
 
     password_hash = await hash_password(password)
 
@@ -149,7 +146,7 @@ async def register_user(
             raise
         # Constraint name only: the error text contains the email/username.
         logger.info("auth.register_conflict", constraint=constraint)
-        return None, message
+        raise UserExistsError(message) from None
 
     # Create password credential
     credential = PasswordCredential(
@@ -176,16 +173,16 @@ async def register_user(
     await send_verification_email_task.kiq(user.email, username, raw_token)
 
     logger.info("auth.user_registered", user_id=str(user.id))
-    return user, None
+    return user
 
 
-async def _reject_locked_login(
+async def _record_locked_login(
     db: AsyncSession,
     user_id: uuid.UUID,
     locked_until: datetime | None,
     request: Request | None,
-) -> tuple[None, str]:
-    """Audit and answer a login attempt on a locked account."""
+) -> None:
+    """Audit and log a login attempt on a locked account."""
     remaining = (
         max(int((locked_until - utcnow()).total_seconds()), 0)
         if locked_until is not None
@@ -205,9 +202,16 @@ async def _reject_locked_login(
         user_id=str(user_id),
         remaining_seconds=remaining,
     )
-    if remaining is None:
-        return None, "Account is locked"
-    return None, f"Account is locked. Try again in {remaining} seconds"
+
+
+async def _refuse_locked_login() -> NoReturn:
+    """Refuse a guess on a locked account like a wrong password.
+
+    Same answer and, without running Argon2, about the same duration, so
+    neither reveals that the account exists or is locked.
+    """
+    await wait_like_password_verify()
+    raise InvalidCredentialsError()
 
 
 async def authenticate_user(
@@ -215,10 +219,11 @@ async def authenticate_user(
     username: str,
     password: str,
     request: Request | None = None,
-) -> tuple[User | None, str | None]:
-    """
-    Verify credentials. Handles account locking on repeated failures.
-    Returns (User, None) on success or (None, error_message) on failure.
+) -> User:
+    """Verify credentials. Handles account locking on repeated failures.
+
+    Every refusal (unknown user, wrong password, locked or inactive account)
+    raises the same `InvalidCredentialsError`.
 
     Burst safety: the credential check runs under an admission limiter, it
     re-reads the lock state after the wait, and a failure is counted before
@@ -231,13 +236,14 @@ async def authenticate_user(
     if user is None:
         await equalize_password_timing(password)
         logger.warning("auth.login_attempt_unknown_user")
-        return None, "Invalid username or password"
+        raise InvalidCredentialsError()
 
     # Locked account: is_locked with locked_until NULL is indefinite (admin),
     # a timed lock ends once locked_until lies in the past.
     if user.is_locked:
         if user.is_lock_active():
-            return await _reject_locked_login(db, user.id, user.locked_until, request)
+            await _record_locked_login(db, user.id, user.locked_until, request)
+            await _refuse_locked_login()
 
         # Timed lock expired → unlock
         user.is_locked = False
@@ -256,31 +262,37 @@ async def authenticate_user(
     if not user.is_active:
         await equalize_password_timing(password)
         logger.warning("auth.login_attempt_inactive_account", user_id=str(user.id))
-        return None, "Account is deactivated"
+        raise InvalidCredentialsError()
 
+    locked_meanwhile = False
     async with login_admission_limiter():
         # Re-check after the wait: guesses evaluated meanwhile may have
         # locked the account (fresh read, not the cached User).
         lock_state = await crud.get_lock_state(db, user.id)
         if lock_state is None:
-            return None, "Invalid username or password"
+            raise InvalidCredentialsError()
         if lock_is_active(*lock_state):
-            return await _reject_locked_login(db, user.id, lock_state[1], request)
-
-        credential = await crud.get_password_credential(db, user.id)
-        if credential is None:
-            await equalize_password_timing(password)
-            valid = False
+            await _record_locked_login(db, user.id, lock_state[1], request)
+            locked_meanwhile = True
         else:
-            valid = await verify_password(password, credential.password_hash)
+            credential = await crud.get_password_credential(db, user.id)
+            if credential is None:
+                await equalize_password_timing(password)
+                valid = False
+            else:
+                valid = await verify_password(password, credential.password_hash)
 
-        failure: tuple[int, bool, datetime | None] | None = None
-        if not valid:
-            # Atomic increment + lock in the database (no lost update),
-            # committed before the admission slot is released.
-            failure = await crud.register_failed_login(
-                db, user.id, MAXIMUM_LOGIN_ATTEMPTS, LOGIN_ATTEMPT_WINDOW_SECONDS
-            ) or (0, False, None)
+            failure: tuple[int, bool, datetime | None] | None = None
+            if not valid:
+                # Atomic increment + lock in the database (no lost update),
+                # committed before the admission slot is released.
+                failure = await crud.register_failed_login(
+                    db, user.id, MAXIMUM_LOGIN_ATTEMPTS, LOGIN_ATTEMPT_WINDOW_SECONDS
+                ) or (0, False, None)
+
+    if locked_meanwhile:
+        # Outside the limiter: the timing wait must not hold an admission slot.
+        await _refuse_locked_login()
 
     if failure is not None or credential is None:
         attempts, is_locked, _locked_until = failure or (0, False, None)
@@ -300,18 +312,21 @@ async def authenticate_user(
                 )
             else:
                 await _audit(db, AuditEventType.LOGIN_FAILED, user.id, request)
-            return None, "Account has been locked due to too many failed login attempts"
+            raise InvalidCredentialsError()
         await _audit(db, AuditEventType.LOGIN_FAILED, user.id, request)
-        return None, "Invalid username or password"
+        raise InvalidCredentialsError()
 
     # Success → reset counters, unless a parallel guess locked the account
     # while this password was being verified (conditional UPDATE).
     last_login_at = await crud.record_successful_login(db, user.id)
     if last_login_at is None:
         lock_state = await crud.get_lock_state(db, user.id)
-        return await _reject_locked_login(
+        await _record_locked_login(
             db, user.id, lock_state[1] if lock_state else None, request
         )
+        # No timing wait: this request has already run a real verify, so it
+        # already takes as long as a wrong password.
+        raise InvalidCredentialsError()
     # Mirror the committed row into the cached object without marking it
     # dirty, so a later flush cannot write these values a second time.
     set_committed_value(user, "failed_login_attempts", 0)
@@ -326,7 +341,7 @@ async def authenticate_user(
 
     await _audit(db, AuditEventType.LOGIN_SUCCESS, user.id, request)
     logger.info("auth.login_success", user_id=str(user.id))
-    return user, None
+    return user
 
 
 async def create_session_tokens(
@@ -335,9 +350,10 @@ async def create_session_tokens(
     request: Request | None = None,
     family_id: uuid.UUID | None = None,
 ) -> tuple[str, str]:
-    """
-    Create an access token + refresh token (persisted as a DB session).
-    Returns (access_token, raw_refresh_token). Commits.
+    """Create an access token and a refresh token (persisted as a session).
+
+    Returns:
+        `(access_token, raw_refresh_token)`. Commits.
     """
     fam_id = family_id or uuid.uuid4()
     access_token = create_access_token(user.username, str(user.id), str(fam_id))
@@ -365,23 +381,28 @@ async def refresh_session(
     db: AsyncSession,
     raw_token: str,
     request: Request | None = None,
-) -> tuple[str | None, str | None, str | None]:
-    """
-    Rotate a refresh token. PostgreSQL is the only gate (atomic UPDATE).
+) -> tuple[str, str]:
+    """Rotate a refresh token. PostgreSQL is the only gate (atomic UPDATE).
+
     Detects token reuse and revokes the whole family.
-    Returns (access_token, raw_refresh_token, None) on success,
-    or (None, None, error_message) on failure.
 
     The rotation runs under the per-user lock (`crud.lock_user`): a
     revocation of this user (logout-all, password reset or change, admin
     lock) waits until the successor session is committed and then revokes
     it as well. Lock order: users, then sessions.
+
+    Returns:
+        `(access_token, raw_refresh_token)` of the successor session.
+
+    Raises:
+        InvalidRefreshTokenError: The token is unknown, expired, revoked or
+            reused, or the account is inactive or admin-locked.
     """
     token_hash_val = hash_token(raw_token)
 
     owner = await crud.get_session_owner(db, token_hash_val)
     if owner is None:
-        return None, None, "Invalid or expired refresh token"
+        raise InvalidRefreshTokenError()
     owner_id, family_id = owner
 
     user = await crud.lock_and_get_user(db, owner_id)
@@ -408,7 +429,7 @@ async def refresh_session(
                 f"Refresh denied: account inactive or locked, revoked {revoked} "
                 "session(s)",
             )
-        return None, None, "Invalid or expired refresh token"
+        raise InvalidRefreshTokenError()
 
     rotated = await crud.rotate_session(db, token_hash_val)
     if rotated is None:
@@ -432,36 +453,35 @@ async def refresh_session(
                 f"Token reuse detected, revoked {revoked} session(s) "
                 f"in family {sess.family_id}",
             )
-            return None, None, "Token reuse detected – all sessions revoked"
+            raise InvalidRefreshTokenError(
+                "Token reuse detected – all sessions revoked"
+            )
         await db.rollback()  # end the transaction: releases the user lock
-        return None, None, "Invalid or expired refresh token"
+        raise InvalidRefreshTokenError()
 
     # Same transaction as the rotation: one commit for old + new session.
-    access_token, new_raw_refresh = await create_session_tokens(
-        db, user, request, family_id=family_id
-    )
-    return access_token, new_raw_refresh, None
+    tokens = await create_session_tokens(db, user, request, family_id=family_id)
+    logger.info("auth.token_refreshed")
+    return tokens
 
 
 async def logout_session(
     db: AsyncSession,
     raw_token: str,
     request: Request | None = None,
-) -> tuple[bool, str | None]:
-    """
-    Revoke the refresh token (logout).
-    Returns (True, None) on success or (False, error_message) on failure.
+) -> None:
+    """Revoke the session of a refresh token (logout).
+
+    Raises:
+        SessionNotFoundError: No session has this token.
     """
     token_hash_val = hash_token(raw_token)
     sess = await crud.get_session_by_token_hash(db, token_hash_val)
-    if sess:
-        await crud.revoke_session(db, sess.id, reason="logout")
-        await _audit(
-            db, AuditEventType.SESSION_REVOKED, sess.user_id, request, "Logout"
-        )
-        return True, None
-
-    return False, "Session not found"
+    if sess is None:
+        raise SessionNotFoundError()
+    await crud.revoke_session(db, sess.id, reason="logout")
+    await _audit(db, AuditEventType.SESSION_REVOKED, sess.user_id, request, "Logout")
+    logger.info("auth.user_logged_out")
 
 
 async def logout_all_sessions(
@@ -469,7 +489,11 @@ async def logout_all_sessions(
     user_id: uuid.UUID,
     request: Request | None = None,
 ) -> int:
-    """Revoke every session of the user (all devices). Returns the count."""
+    """Revoke every session of the user (all devices).
+
+    Returns:
+        The number of revoked sessions.
+    """
     revoked = await crud.revoke_user_sessions(db, user_id, reason="logout_all")
     await _audit(
         db,
@@ -487,9 +511,10 @@ async def forgot_password(
     email: str,
     request: Request | None = None,
 ) -> None:
-    """
-    Initiate a password reset.
-    Always returns successfully to avoid email enumeration.
+    """Initiate a password reset.
+
+    Always returns normally, so the caller cannot tell whether the address
+    belongs to an account.
     """
     user = await users_crud.get_user_by_email(db, email.lower())
     if user is None:
@@ -519,18 +544,20 @@ async def reset_password(
     raw_token: str,
     new_password: str,
     request: Request | None = None,
-) -> tuple[bool, str | None]:
-    """
-    Complete the password-reset flow.
+) -> None:
+    """Complete the password-reset flow.
+
     Revokes every session of the user and all other open reset tokens.
-    Returns (True, None) on success or (False, error_message) on failure.
+
+    Raises:
+        InvalidTokenError: The token is unknown, used, invalidated or expired.
     """
     consumed = await crud.consume_email_token(
         db, hash_token(raw_token), EmailTokenPurpose.RESET_PASSWORD
     )
     if consumed is None:
-        return False, "Invalid or expired reset token"
-    user_id, _new_email = consumed
+        raise InvalidTokenError("Invalid or expired reset token")
+    user_id, _purpose, _new_email = consumed
 
     # Fail closed: end sessions first (this also commits the token redemption),
     # then change the password.
@@ -551,47 +578,98 @@ async def reset_password(
         user_id=str(user_id),
         revoked_sessions=revoked,
     )
-    return True, None
 
 
 async def verify_email(
     db: AsyncSession,
     raw_token: str,
     request: Request | None = None,
-) -> tuple[bool, str | None]:
-    """
-    Verify the user's email address.
-    Returns (True, None) on success or (False, error_message).
+) -> None:
+    """Redeem a verification or email-change token.
+
+    A verification token marks the address verified. An email-change token
+    replaces the address with the confirmed new one, which this step also
+    verifies. The redemption commits together with its effect.
+
+    Raises:
+        InvalidTokenError: The token is unknown, used, invalidated or expired.
+        EmailTakenError: Another account took the new address meanwhile.
     """
     consumed = await crud.consume_email_token(
-        db, hash_token(raw_token), EmailTokenPurpose.VERIFY_EMAIL
+        db,
+        hash_token(raw_token),
+        EmailTokenPurpose.VERIFY_EMAIL,
+        EmailTokenPurpose.CHANGE_EMAIL,
     )
     if consumed is None:
-        return False, "Invalid or expired verification token"
-    user_id, _new_email = consumed
+        raise InvalidTokenError("Invalid or expired verification token")
+    user_id, purpose, new_email = consumed
 
     user = await users_crud.get_user_by_id(db, user_id)
     if user is None:
-        return False, "User not found"
+        await db.rollback()
+        raise InvalidTokenError("Invalid or expired verification token")
+
+    if purpose is EmailTokenPurpose.CHANGE_EMAIL:
+        if not new_email:
+            await db.rollback()
+            raise InvalidTokenError("Invalid or expired verification token")
+        await _apply_email_change(db, user, new_email, request)
+        return
 
     user.is_email_verified = True
     await users_crud.update_user(db, user)  # commits the token redemption as well
     await _audit(db, AuditEventType.EMAIL_VERIFIED, user.id, request)
     logger.info("auth.email_verified", user_id=str(user.id))
-    return True, None
+
+
+async def _apply_email_change(
+    db: AsyncSession, user: User, new_email: str, request: Request | None
+) -> None:
+    """Switch `user` to the confirmed `new_email`; commits the redemption.
+
+    Uniqueness is checked again because the address may have been taken
+    since the change was requested; the unique constraint decides a race.
+    Reset links mailed to the old address stop working in the same commit.
+    A conflict rolls everything back.
+    """
+    existing = await users_crud.get_user_by_email(db, new_email)
+    if existing is not None and existing.id != user.id:
+        await db.rollback()
+        raise EmailTakenError()
+
+    # email_tokens before users (lock order); committed by update_user.
+    await crud.invalidate_tokens_for_user_purpose(
+        db, user.id, EmailTokenPurpose.RESET_PASSWORD, commit=False
+    )
+    user.email = new_email
+    user.is_email_verified = True
+    try:
+        await users_crud.update_user(db, user)
+    except IntegrityError as exc:
+        await db.rollback()
+        constraint = constraint_name(exc)
+        if constraint != _USERS_EMAIL_KEY:
+            raise
+        # Constraint name only: the error text contains the email.
+        logger.info("auth.email_change_conflict", constraint=constraint)
+        raise EmailTakenError() from None
+    await _audit(db, AuditEventType.EMAIL_CHANGED, user.id, request)
+    logger.info("auth.email_changed", user_id=str(user.id))
 
 
 async def resend_verification_email(
     db: AsyncSession,
-    user_id: uuid.UUID,
+    user: User,
     request: Request | None = None,
-) -> tuple[bool, str | None]:
-    """Resend the email verification token."""
-    user = await users_crud.get_user_by_id(db, user_id)
-    if user is None:
-        return False, "User not found"
+) -> None:
+    """Send a new verification token; older ones stop working.
+
+    Raises:
+        EmailAlreadyVerifiedError: The address is verified already.
+    """
     if user.is_email_verified:
-        return False, "Email is already verified"
+        raise EmailAlreadyVerifiedError()
 
     # Invalidate old verification tokens
     await crud.invalidate_tokens_for_user_purpose(
@@ -608,7 +686,7 @@ async def resend_verification_email(
     await crud.create_email_token(db, email_token)
     await _audit(db, AuditEventType.EMAIL_VERIFICATION_SENT, user.id, request)
     await send_verification_email_task.kiq(user.email, user.username, raw_token)
-    return True, None
+    logger.info("auth.verification_email_resent", user_id=str(user.id))
 
 
 async def change_password(
@@ -618,20 +696,24 @@ async def change_password(
     new_password: str,
     request: Request | None = None,
     keep_session_family: uuid.UUID | None = None,
-) -> tuple[bool, str | None]:
+) -> None:
     """Change password for an authenticated user.
 
     Revokes every session except the caller's family (`keep_session_family`,
     the access token's `sid`) and invalidates open password-reset tokens.
     Without a `sid` (token issued before the claim existed) all sessions
     are revoked.
+
+    Raises:
+        WrongPasswordError: `current_password` is wrong, or the user has no
+            password credential.
     """
     credential = await crud.get_password_credential(db, user_id)
     if credential is None:
-        return False, "No password credential found"
+        raise WrongPasswordError()
 
     if not await verify_password(current_password, credential.password_hash):
-        return False, "Current password is incorrect"
+        raise WrongPasswordError()
 
     new_hash = await hash_password(new_password)
     # Fail closed: end the other sessions before the password changes.
@@ -651,50 +733,55 @@ async def change_password(
     )
 
     logger.info("auth.password_changed", user_id=str(user_id), revoked_sessions=revoked)
-    return True, None
 
 
-async def update_profile(
+async def request_email_change(
     db: AsyncSession,
-    user_id: uuid.UUID,
-    display_name: str | None = None,
-    new_email: str | None = None,
+    user: User,
+    current_password: str,
+    new_email: str,
     request: Request | None = None,
-) -> tuple[User | None, str | None]:
+) -> None:
+    """Start an email change: mail a confirmation link to the new address.
+
+    The account keeps its current address until the link is redeemed
+    (`verify_email`). A new request invalidates the previous link. The
+    password is checked first, so only the account holder learns whether an
+    address is registered.
+
+    Raises:
+        WrongPasswordError: `current_password` is wrong.
+        EmailUnchangedError: `new_email` is the current address.
+        EmailTakenError: `new_email` belongs to another account.
     """
-    Update user profile fields.
-    If email is changed, a confirmation token is created (re-verification required).
-    """
-    user = await users_crud.get_user_by_id(db, user_id)
-    if user is None:
-        return None, "User not found"
+    credential = await crud.get_password_credential(db, user.id)
+    if credential is None or not await verify_password(
+        current_password, credential.password_hash
+    ):
+        raise WrongPasswordError()
+    if new_email == user.email:
+        raise EmailUnchangedError()
+    if await users_crud.get_user_by_email(db, new_email) is not None:
+        raise EmailTakenError()
 
-    if display_name is not None:
-        user.display_name = display_name
-
-    if new_email is not None:
-        new_email = new_email.lower()
-
-    if new_email is not None and new_email != user.email:
-        # Check if new email is already taken
-        existing = await users_crud.get_user_by_email(db, new_email)
-        if existing and existing.id != user.id:
-            return None, "Email already in use"
-
-        # Create a change-email token
-        await crud.invalidate_tokens_for_user_purpose(
-            db, user.id, EmailTokenPurpose.CHANGE_EMAIL
-        )
-        raw_token = secrets.token_urlsafe(32)
-        email_token = EmailToken(
-            user_id=user.id,
-            purpose=EmailTokenPurpose.CHANGE_EMAIL,
-            token_hash=hash_token(raw_token),
-            new_email=new_email,
-            expires_at=utcnow() + timedelta(hours=24),
-        )
-        await crud.create_email_token(db, email_token)
-        await send_verification_email_task.kiq(new_email, user.username, raw_token)
-
-    await users_crud.update_user(db, user)
-    return user, None
+    await crud.invalidate_tokens_for_user_purpose(
+        db, user.id, EmailTokenPurpose.CHANGE_EMAIL
+    )
+    raw_token = secrets.token_urlsafe(32)
+    email_token = EmailToken(
+        user_id=user.id,
+        purpose=EmailTokenPurpose.CHANGE_EMAIL,
+        token_hash=hash_token(raw_token),
+        new_email=new_email,
+        expires_at=utcnow() + timedelta(hours=24),
+    )
+    await crud.create_email_token(db, email_token)
+    await _audit(
+        db,
+        AuditEventType.EMAIL_VERIFICATION_SENT,
+        user.id,
+        request,
+        "Email change requested",
+    )
+    await send_email_change_confirmation_task.kiq(new_email, user.username, raw_token)
+    logger.info("auth.email_change_requested", user_id=str(user.id))
