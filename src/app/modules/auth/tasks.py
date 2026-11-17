@@ -3,7 +3,7 @@
 from pathlib import Path
 
 from app.core import get_logger, get_settings, task
-from app.core.mail import send_templated_email
+from app.core.mail import MailDeliveryError, send_templated_email
 
 logger = get_logger(__name__)
 
@@ -32,9 +32,10 @@ async def send_verification_email_task(to: str, username: str, token: str) -> No
         )
         logger.info("email.verification_sent")
     except Exception as exc:
-        # Only the exception type: SMTP errors can echo the recipient address.
+        # Only the exception type, in the log and in what taskiq logs: SMTP
+        # errors can echo the recipient address.
         logger.error("email.verification_failed", error_type=type(exc).__name__)
-        raise
+        raise MailDeliveryError(exc) from None
 
 
 @task(
@@ -59,9 +60,10 @@ async def send_password_reset_email_task(to: str, username: str, token: str) -> 
         )
         logger.info("email.password_reset_sent")
     except Exception as exc:
-        # Only the exception type: SMTP errors can echo the recipient address.
+        # Only the exception type, in the log and in what taskiq logs: SMTP
+        # errors can echo the recipient address.
         logger.error("email.password_reset_failed", error_type=type(exc).__name__)
-        raise
+        raise MailDeliveryError(exc) from None
 
 
 @task(
@@ -88,8 +90,9 @@ async def send_email_change_confirmation_task(
         )
         logger.info("email.email_change_confirmation_sent")
     except Exception as exc:
-        # Only the exception type: SMTP errors can echo the recipient address.
+        # Only the exception type, in the log and in what taskiq logs: SMTP
+        # errors can echo the recipient address.
         logger.error(
             "email.email_change_confirmation_failed", error_type=type(exc).__name__
         )
-        raise
+        raise MailDeliveryError(exc) from None

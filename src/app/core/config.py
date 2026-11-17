@@ -28,6 +28,9 @@ _DEFAULT_ADMIN_PASSWORD = "admin"
 _DEFAULT_ADMIN_SECRET_KEY = "admin-secret-key-change-in-production"
 # RFC 7518 section 3.2: an HS256 key must have at least 256 bits.
 _MIN_JWT_SECRET_LENGTH = 32
+# The admin password guards every account; ADMIN_SECRET_KEY signs the admin
+# session (HMAC), so it gets the same floor as the JWT key.
+_MIN_ADMIN_SECRET_LENGTH = 32
 
 # [project].name in pyproject.toml; [project].version is the only version source.
 _DISTRIBUTION_NAME = "api"
@@ -256,10 +259,18 @@ class Settings(BaseSettings):
                 f"JWT_SECRET_KEY is shorter than {_MIN_JWT_SECRET_LENGTH} characters"
             )
         if self.admin_enabled:
-            if self.ADMIN_PASSWORD.get_secret_value() == _DEFAULT_ADMIN_PASSWORD:
-                problems.append("ADMIN_PASSWORD is the public default")
-            if self.ADMIN_SECRET_KEY.get_secret_value() == _DEFAULT_ADMIN_SECRET_KEY:
-                problems.append("ADMIN_SECRET_KEY is the public default")
+            admin_secrets = (
+                ("ADMIN_PASSWORD", self.ADMIN_PASSWORD, _DEFAULT_ADMIN_PASSWORD),
+                ("ADMIN_SECRET_KEY", self.ADMIN_SECRET_KEY, _DEFAULT_ADMIN_SECRET_KEY),
+            )
+            for name, secret, default in admin_secrets:
+                value = secret.get_secret_value()
+                if value == default:
+                    problems.append(f"{name} is the public default")
+                elif len(value) < _MIN_ADMIN_SECRET_LENGTH:
+                    problems.append(
+                        f"{name} is shorter than {_MIN_ADMIN_SECRET_LENGTH} characters"
+                    )
 
         if problems:
             raise ValueError(

@@ -31,6 +31,18 @@ logger = get_logger(__name__)
 CORE_TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
 
 
+class MailDeliveryError(RuntimeError):
+    """Sending a mail failed; carries only the type of the original error.
+
+    Mail tasks raise it `from None` instead of the original exception: SMTP
+    errors can echo the recipient address, and taskiq logs the exception of
+    a failed task with its message and traceback.
+    """
+
+    def __init__(self, cause: BaseException) -> None:
+        super().__init__(type(cause).__name__)
+
+
 def build_mail_config(settings: Settings) -> ConnectionConfig | None:
     """Build the fastapi-mail configuration from `settings`.
 

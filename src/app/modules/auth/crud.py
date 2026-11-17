@@ -104,6 +104,34 @@ async def record_successful_login(
     return row[0] if row is not None else None
 
 
+async def reset_failed_logins(db: AsyncSession, user_id: uuid.UUID) -> bool:
+    """Reset the failure counter after a correct password, unless locked.
+
+    The conditional `UPDATE` of `record_successful_login` without
+    `last_login_at`: a lock committed meanwhile wins, an expired timed lock
+    is cleared. Returns False when the account is locked (or gone). Commits.
+    """
+    lock_active = and_(
+        User.is_locked.is_(True),
+        or_(User.locked_until.is_(None), User.locked_until > func.now()),
+    )
+    result = await db.execute(
+        update(User)
+        .where(User.id == user_id, not_(lock_active))
+        .values(
+            failed_login_attempts=0,
+            is_locked=False,
+            locked_until=None,
+            updated_at=func.now(),
+        )
+        .returning(User.id)
+        .execution_options(synchronize_session=False)
+    )
+    found = result.first() is not None
+    await db.commit()
+    return found
+
+
 async def register_failed_login(
     db: AsyncSession, user_id: uuid.UUID, max_attempts: int, lock_seconds: int
 ) -> tuple[int, bool, datetime | None] | None:
@@ -169,6 +197,20 @@ async def update_password_hash(
     await db.commit()
 
 
+async def set_password_must_change(db: AsyncSession, user_id: uuid.UUID) -> bool:
+    """Flag the user's password for a forced change.
+
+    Does not commit. Returns False if the user has no password credential.
+    """
+    result = await db.execute(
+        update(PasswordCredential)
+        .where(PasswordCredential.user_id == user_id)
+        .values(must_change=True, updated_at=utcnow())
+        .returning(PasswordCredential.id)
+    )
+    return result.first() is not None
+
+
 async def create_session(db: AsyncSession, session: Session) -> Session:
     db.add(session)
     await db.commit()
@@ -198,17 +240,6 @@ async def get_session_by_token_hash(
 ) -> Session | None:
     result = await db.execute(select(Session).where(Session.token_hash == token_hash))
     return result.scalars().first()
-
-
-async def revoke_session(
-    db: AsyncSession, session_id: uuid.UUID, reason: str = "logout"
-) -> None:
-    await db.execute(
-        update(Session)
-        .where(Session.id == session_id)
-        .values(is_revoked=True, revoke_reason=reason, revoked_at=utcnow())
-    )
-    await db.commit()
 
 
 async def rotate_session(
@@ -246,12 +277,15 @@ async def revoke_user_sessions(
     user_id: uuid.UUID,
     reason: str,
     except_family: uuid.UUID | None = None,
+    *,
+    commit: bool = True,
 ) -> int:
     """Revoke every active session of a user, optionally keeping one family.
 
     Takes the user lock first, so a refresh rotating a session of this user
     right now finishes before, and its successor is revoked as well.
-    Returns the number of revoked sessions. Commits.
+    Returns the number of revoked sessions. Commits, unless `commit=False`:
+    then the caller's next commit includes the revocation.
     """
     await lock_user(db, user_id)
     conditions = [Session.user_id == user_id, Session.is_revoked.is_(False)]
@@ -264,8 +298,38 @@ async def revoke_user_sessions(
         .returning(Session.id)
     )
     revoked = len(result.all())
-    await db.commit()
+    if commit:
+        await db.commit()
     return revoked
+
+
+async def get_session_user_id(
+    db: AsyncSession, session_id: uuid.UUID
+) -> uuid.UUID | None:
+    """Return the owner of a session (any state) without locking.
+
+    `user_id` never changes, so reading it before the user lock is safe.
+    """
+    result = await db.execute(select(Session.user_id).where(Session.id == session_id))
+    return result.scalar_one_or_none()
+
+
+async def revoke_active_session(
+    db: AsyncSession, session_id: uuid.UUID, reason: str
+) -> bool:
+    """Revoke one session if it is still active.
+
+    A session revoked earlier keeps its original reason and time. The
+    caller holds the user lock (`lock_user`). Does not commit. Returns True
+    if the session was revoked by this call.
+    """
+    result = await db.execute(
+        update(Session)
+        .where(Session.id == session_id, Session.is_revoked.is_(False))
+        .values(is_revoked=True, revoke_reason=reason, revoked_at=func.now())
+        .returning(Session.id)
+    )
+    return result.first() is not None
 
 
 async def revoke_family(
@@ -360,7 +424,33 @@ async def invalidate_tokens_for_user_purpose(
         await db.commit()
 
 
-async def create_audit_log(db: AsyncSession, log: AuthAuditLog) -> AuthAuditLog:
+async def invalidate_open_email_tokens(
+    db: AsyncSession, user_id: uuid.UUID, *, commit: bool = True
+) -> None:
+    """Soft-invalidate every open email token of the user, of any purpose.
+
+    Ends a pending verification, email change and password reset at once.
+    `email_tokens` comes first in the lock order, so call this before the
+    user lock. With `commit=False` the caller's next commit includes it.
+    """
+    await db.execute(
+        update(EmailToken)
+        .where(
+            EmailToken.user_id == user_id,
+            EmailToken.used_at.is_(None),
+            EmailToken.invalidated_at.is_(None),
+        )
+        .values(invalidated_at=utcnow())
+    )
+    if commit:
+        await db.commit()
+
+
+async def create_audit_log(
+    db: AsyncSession, log: AuthAuditLog, *, commit: bool = True
+) -> AuthAuditLog:
+    """Add an audit entry; with `commit=False` the caller's commit writes it."""
     db.add(log)
-    await db.commit()
+    if commit:
+        await db.commit()
     return log

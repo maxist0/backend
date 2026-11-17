@@ -94,3 +94,21 @@ class TestStdlibLoggers:
         logging.getLogger("uvicorn.access").info('127.0.0.1 - "GET / HTTP/1.1" 200')
 
         assert capsys.readouterr().out == ""
+
+    @pytest.mark.parametrize(
+        ("log_level", "expected"),
+        [("DEBUG", logging.INFO), ("INFO", logging.INFO), ("WARNING", logging.WARNING)],
+    )
+    def test_taskiq_never_logs_below_info(
+        self, settings_factory, capsys, restore_logging, log_level, expected
+    ):
+        """taskiq's DEBUG lines print task arguments (recipients, raw tokens)."""
+        setup_logging(settings_factory(LOG_LEVEL=log_level))
+        capsys.readouterr()
+
+        logging.getLogger("taskiq.receiver.receiver").debug(
+            "Received message: %s", "to=alice@example.com token=raw-token"
+        )
+
+        assert logging.getLogger("taskiq.kicker").getEffectiveLevel() == expected
+        assert "raw-token" not in capsys.readouterr().out

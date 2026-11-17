@@ -59,6 +59,9 @@ class AuditEventType(PyEnum):
     PASSWORD_RESET_REQUESTED = "password_reset_requested"
     PASSWORD_RESET_COMPLETED = "password_reset_completed"
     SESSION_REVOKED = "session_revoked"
+    ACCOUNT_DEACTIVATED = "account_deactivated"
+    ACCOUNT_REACTIVATED = "account_reactivated"
+    PASSWORD_CHANGE_FORCED = "password_change_forced"
 
 
 class AuthAuditLog(Base):

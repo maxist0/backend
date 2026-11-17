@@ -38,7 +38,7 @@ Contributor and AI-agent conventions live in [AGENTS.md](AGENTS.md). Read it bef
 | Caching | `@cached(ttl, key)` and `invalidate(pattern)` on Redis (`cashews`, JSON values), `RedisDep` for direct Redis access |
 | Background jobs | `taskiq` with Redis broker, result backend, cron scheduler, transactional email tasks |
 | Observability | `structlog` JSON logs on stdout with request IDs, Prometheus metrics at `/metrics`, `/health` and `/health/ready`, Grafana/Loki/Tempo/Alloy stack |
-| Admin | `sqladmin` panel at `/admin` (users, credentials, sessions, tokens, audit log); opt-in outside `dev` via `ADMIN_ENABLED` |
+| Admin | `sqladmin` panel at `/admin`: read-only users, sessions and audit log; every change is an audited action through the auth services; opt-in outside `dev` via `ADMIN_ENABLED` |
 | Testing | pytest integration suite against real Postgres and Redis via Testcontainers |
 | Packaging | `uv` lockfile, multi-stage Dockerfile, non-root container, Docker Swarm stack with Traefik |
 
@@ -242,11 +242,16 @@ refresh  ──▶ atomic UPDATE ... RETURNING on the session row (not revoked, 
          │   (strict: two concurrent refreshes of the same token count as reuse)
          └─ user inactive or admin-locked: refresh denied, family revoked
             (a timed lock does not affect refresh)
-logout       ──▶ mark the session revoked
+logout       ──▶ revoke the session if it is active (an already rotated token is reuse:
+                 family revoked, 401, cookie cleared)
 logout-all   ──▶ revoke all sessions of the user, clear the cookie (bearer required)
-password reset  ──▶ revoke all sessions
-password change ──▶ revoke all sessions except the caller's (`sid`)
+password reset  ──▶ revoke all sessions, invalidate every open email token
+password change ──▶ revoke all sessions except the caller's (`sid`), invalidate every open email token
 ```
+
+**Pending email tokens.** A pending email change or verification ends with every event that should end an intruder's hold on the account: password change, password reset, admin lock and admin deactivation invalidate all open email tokens of the user, in the same commit as the session revocation. `POST /auth/email/verify` refuses a token of an inactive or admin-locked account with the same 400 `invalid_token` as an unknown one, and spends it, so lifting the block later does not revive a link that may be in the wrong hands.
+
+**Password confirmation counts like a login.** A wrong current password on `PUT /users/me/password` or `PUT /users/me/email` increments the same failure counter (`LOGIN_MAX_ATTEMPTS`) and sets the same timed lock as failed logins, with `LOGIN_FAILED` and `ACCOUNT_LOCKED` audit rows (detail "Password confirmation"). As after a login lockout, sessions stay valid; while the lock lasts, both endpoints answer 400 `wrong_password` even for the correct password, and the password login answers 401. A correct password resets the counter, as a successful login does.
 
 Access tokens are stateless and remain valid until expiry (up to 15 minutes), with one exception: requests with an access token of an admin-locked user get 401. Revoking a session therefore ends refresh, not already issued access tokens. Every auth event is written to `auth_audit_log`.
 
@@ -265,7 +270,9 @@ A timed lock blocks only password login. Anyone who knows a username could other
 
 **Login burst protection.** Each process admits at most `PASSWORD_HASH_CONCURRENCY` password evaluations at a time. A login re-reads the lock state after it is admitted, so guesses queued behind the one that locked the account are refused without an Argon2 evaluation. A successful login is one conditional atomic `UPDATE`: no login succeeds once a lock is committed. With N worker processes the bound is N × `PASSWORD_HASH_CONCURRENCY`. Rate limiting ([D4](#open-decisions)) is still the main control and is still open.
 
-**Serialisation.** Refresh and the bulk revocations (`revoke_user_sessions`: logout-all, password reset and change, admin lock; `revoke_family`: reuse detection, denied refresh) first take a row lock on the user (`SELECT ... FOR NO KEY UPDATE` on `users`, `lock_user` in `src/api/auth/crud.py`). They queue per user, so a revocation always sees the successor session of a parallel refresh. The global lock order is `email_tokens` → `users` → `sessions`.
+**Serialisation.** Refresh and the bulk revocations (`revoke_user_sessions`: logout-all, password reset and change, admin lock and deactivation; `revoke_family`: reuse detection, denied refresh) first take a row lock on the user (`SELECT ... FOR NO KEY UPDATE` on `users`, `lock_user` in `src/api/auth/crud.py`). They queue per user, so a revocation always sees the successor session of a parallel refresh. The global lock order is `email_tokens` → `users` → `sessions`.
+
+**Admin panel.** The views (users, sessions, audit log) are read-only: sqladmin answers create, edit and delete with 403. Changes are actions that call auth service functions (`admin_*` in `modules/auth/service.py`): lock (indefinite, ends all sessions), unlock (also resets failed logins), deactivate (ends all sessions), reactivate, force password change (sets `must_change`, not enforced yet, Known issue 16) and revoke selected sessions. Each user or session is one transaction in the lock order above, and each writes an audit row whose `detail` names the admin (`... by admin <ADMIN_USERNAME>`). A user or session that no longer exists is skipped. There is no create or delete; account deletion is a later GDPR flow.
 
 **Duplicate registrations.** Two parallel registrations with the same username or email are decided by the unique constraints. The loser gets 409 with the same message as the pre-check, never 500.
 
@@ -274,7 +281,7 @@ A timed lock blocks only password login. Anyone who knows a username could other
 | Table | Purpose | Notable columns |
 |---|---|---|
 | `users` | identity | `username`, `email` (unique), `is_active`, `is_email_verified`, `is_locked`, `failed_login_attempts`, `locked_until` |
-| `password_credentials` | one row per user | `password_hash` (argon2id), `must_change` |
+| `password_credentials` | one row per user | `password_hash` (argon2id), `must_change` (set by the admin, not enforced yet) |
 | `sessions` | refresh tokens | `token_hash` (unique), `family_id`, `is_revoked`, `revoke_reason`, `expires_at`, device and IP metadata |
 | `email_tokens` | verification, change, reset | `purpose`, `token_hash`, `new_email`, `expires_at`, `used_at`, `invalidated_at` |
 | `auth_audit_log` | append-only security log | `event_type`, `ip_address`, `user_agent`, `detail` |
@@ -359,7 +366,7 @@ Implemented:
 - Email-enumeration-safe `password/forgot`
 - `EmailStr`-based email validation that rejects whitespace and control characters; `User-Agent` truncated to 512 and `X-Device-*` headers to 255 characters
 - Startup guard outside `dev` and `unittest`: `JWT_SECRET_KEY` must not be the default and must be at least 32 characters; admin secrets are checked only when the admin panel is enabled
-- Admin panel opt-in (`ADMIN_ENABLED`, default on only in `dev`), actions use `?pks=`, fixed redirect, constant-time credential comparison
+- Admin panel opt-in (`ADMIN_ENABLED`, default on only in `dev`), read-only views, actions only through audited service functions (one transaction per row, admin name and client IP in the audit row), actions use `?pks=`, fixed redirect, constant-time credential comparison, `admin.login_succeeded`/`admin.login_failed` logs with the client IP (never the typed username); CSRF: `SameSite=Strict` session cookie (8 h, `Secure` outside `dev`/`unittest`) plus a fail-safe `Sec-Fetch-Site` check: state-changing admin requests (unsafe methods and actions) without `Sec-Fetch-Site: same-origin` get 403 ([OWASP CSRF cheat sheet, Fetch Metadata headers](https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html))
 - Logs without usernames, emails, query strings, `Referer` or token prefixes; database password masked in logs; SQLAlchemy engine uses `hide_parameters`
 - Security headers on every response, the 500 included (`X-Content-Type-Options`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, `Permissions-Policy`), `Cache-Control: no-store` under `API_PREFIX`; validated request id; client IP only from the ASGI scope, with uvicorn's proxy headers trusted only from `FORWARDED_ALLOW_IPS`
 - CORS origins from `CORS_ORIGINS`; `*` is refused because credentials are allowed
@@ -393,7 +400,7 @@ All settings are environment variables read by `Settings` (`src/common/config.py
 | `JWT_SECRET_KEY` | placeholder | **Secret.** Startup guard outside `dev`/`unittest`: must not be the default and must be at least 32 characters. Use a 256-bit random value. The JWT algorithm is HS256, pinned in code |
 | `ACCESS_TOKEN_EXPIRE_MINUTES` / `REFRESH_TOKEN_EXPIRE_DAYS` | `15` / `30` | |
 | `ADMIN_ENABLED` | unset | Unset means enabled only in `dev`. Set `true` to mount the admin panel elsewhere; the Swarm stack sets `false` |
-| `ADMIN_USERNAME` / `ADMIN_PASSWORD` / `ADMIN_SECRET_KEY` | `admin` / `admin` / placeholder | **Secrets** (`ADMIN_PASSWORD`, `ADMIN_SECRET_KEY`). The startup guard rejects the defaults outside `dev`/`unittest`, but only when the admin panel is enabled |
+| `ADMIN_USERNAME` / `ADMIN_PASSWORD` / `ADMIN_SECRET_KEY` | `admin` / `admin` / placeholder | **Secrets** (`ADMIN_PASSWORD`, `ADMIN_SECRET_KEY`). The startup guard rejects the defaults and values shorter than 32 characters outside `dev`/`unittest`, but only when the admin panel is enabled |
 | `ARGON2_TIME_COST` / `ARGON2_MEMORY_KIB` / `ARGON2_PARALLELISM` | `3` / `65536` / `4` | Argon2id parameters. Minimums `≥2` / `≥19456` / `≥1` (OWASP minimum), validated in every environment; lower values stop startup |
 | `LOGIN_MAX_ATTEMPTS` / `LOGIN_LOCKOUT_SECONDS` | `5` / `900` | Consecutive failed password logins that set a timed lock, and its length. Bounds `1..100` (NIST SP 800-63B-4 3.2.2) / `1..86400` |
 | `PASSWORD_HASH_CONCURRENCY` | `4` | `≥1`, validated in every environment. Maximum concurrent Argon2 operations and concurrent login credential checks per process (the bound is N × this value with N processes); each Argon2 operation needs `ARGON2_MEMORY_KIB` of RAM |
@@ -460,7 +467,7 @@ This is the original implementation plan. The re-prioritised plan from the Novem
 
 ### Phase 1: Security hardening
 
-- [x] Startup guard: refuse to boot outside `dev`/`unittest` when `JWT_SECRET_KEY` (or, with the admin panel enabled, `ADMIN_PASSWORD`/`ADMIN_SECRET_KEY`) carries a default; require `len(JWT_SECRET_KEY) >= 32`. Partly: `DATABASE_URL` defaults are not checked.
+- [x] Startup guard: refuse to boot outside `dev`/`unittest` when `JWT_SECRET_KEY` (or, with the admin panel enabled, `ADMIN_PASSWORD`/`ADMIN_SECRET_KEY`) carries a default; require `len(JWT_SECRET_KEY) >= 32` (and, with the admin panel enabled, 32 characters for both admin secrets). Partly: `DATABASE_URL` defaults are not checked.
 - [ ] Pin the JWT algorithm allowlist in code; add `iss`, `aud`, `typ=access`; verify `type` on decode; reject tokens without `jti`. *RFC 8725 checklist satisfied.* Partly done: algorithm pinned, claims `exp`/`iat`/`nbf`/`sub`/`jti` required, `type=access` verified, `sub` must be a UUID. `iss` and `aud` are still missing.
 - [ ] Refresh cookie: `Secure=True` outside `dev`, `SameSite=Strict` where the frontend allows it, `__Host-` prefix, explicit `max_age`.
 - [x] Revoke all sessions on password reset and password change; add `POST /auth/logout-all`. (Password change keeps the caller's session.)
@@ -549,11 +556,12 @@ Fixed in Phase 0:
 - ~~13~~ `ruff format --check` passes.
 - ~~14~~ Not reproducible: the virtualenv runs Python 3.14.4.
 
-Fixed in the 2026-11 cleanup (S1.3, S1.4):
+Fixed in the 2026-11 cleanup (S1.3, S1.4, S1.5):
 
 - ~~6~~ The email-change token is consumed by `POST /auth/email/verify`; `PUT /users/me/email` replaces the email part of `PATCH /user/me`, and a dedicated template is sent to the new address.
 - ~~4~~ `/metrics` is served at the exact path and never counted as a request.
 - ~~12~~ The `Dockerfile` healthcheck targets `/health`, which works with `METRICS_ENABLED=false`.
+- ~~15~~ Admin CSRF: sqladmin runs custom actions as `GET` requests. The admin session cookie is now `SameSite=Strict`, `HttpOnly`, `Secure` outside `dev`/`unittest`, and expires 8 hours after login. A fail-safe Fetch Metadata guard answers 403 to every state-changing admin request (unsafe methods and actions) that does not carry `Sec-Fetch-Site: same-origin`, a missing header included ([OWASP CSRF cheat sheet, Fetch Metadata headers](https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html)). Browsers without the header (before the March 2023 baseline) cannot log in to the admin or run actions.
 
 Open:
 
@@ -563,6 +571,10 @@ Open:
 9. `pytest` `--cov-fail-under=80` and `[tool.coverage.report] fail_under = 85` conflict. [Phase 0]
 10. Partly fixed: `BCRYPT_ROUNDS`, `CACHE_KEY_PREFIX`, `ROUTE_CACHE_*`, `DEBUG` and `OTLP_*` are removed. Still unused settings: `REDIS_URL` (set by tests), `TASKIQ_RETRY_*` and `TASKIQ_METRICS_PORT` (used from S2). `MAIL_*` values are read through `os.getenv` rather than `Settings`. [Phase 0]
 11. Partly fixed: `alembic/env.py` no longer overrides injected variables, but it still loads `.env.local` in dev. [Phase 4]
+16. The admin action "Force password change" sets `password_credentials.must_change`, but neither login, refresh nor access tokens check it, and a password change or reset does not clear it. [Phase 3]
+17. A locked account can be told apart by response time while the Argon2 queue is loaded: a refusal on a locked account waits like an average verify, but does not queue behind other password evaluations. The real control is rate limiting ([D4](#open-decisions)). [Phase 3]
+18. **Accepted risk:** `PUT /users/me/email` answers 409 `email_taken` when the new address belongs to another account, so a signed-in user who knows their password can test whether an address is registered. The owner accepted this: `POST /auth/register` reveals the same with its 409, and only the account holder (after the password check) can ask.
+19. `/health/ready` is routed publicly by the Swarm stack; it should be reachable only from the orchestrator and monitoring. [deploy round]
 
 ---
 

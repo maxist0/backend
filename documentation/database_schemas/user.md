@@ -256,6 +256,9 @@ PASSWORD_CHANGED           -- User changed password
 PASSWORD_RESET_REQUESTED   -- Password reset requested
 PASSWORD_RESET_COMPLETED   -- Password reset completed
 SESSION_REVOKED            -- Session explicitly revoked
+ACCOUNT_DEACTIVATED        -- Account deactivated by an admin
+ACCOUNT_REACTIVATED        -- Account reactivated by an admin
+PASSWORD_CHANGE_FORCED     -- Admin flagged the password for a change
 ```
 
 ### Detail Field Examples

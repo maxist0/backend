@@ -93,6 +93,10 @@ def setup_logging(settings: Settings) -> None:
     logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
     for name in ("sqlalchemy", "python_multipart"):
         logging.getLogger(name).setLevel(logging.WARNING)
+    # taskiq logs whole task messages (arguments: recipients, usernames, raw
+    # tokens) at DEBUG (taskiq/receiver/receiver.py, taskiq/kicker.py), so
+    # its loggers never go below INFO, whatever LOG_LEVEL says.
+    logging.getLogger("taskiq").setLevel(max(level, logging.INFO))
 
     # Everything that depends on `settings` lives in the handler's formatter.
     # Loggers cached on first use keep this chain, which is the same on

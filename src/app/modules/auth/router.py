@@ -161,9 +161,18 @@ async def logout(
 ) -> None:
     """Revoke the session of the refresh cookie and clear the cookie.
 
-    No access token is needed.
+    No access token is needed. A refresh token that was already rotated is
+    treated like reuse on refresh: all sessions of its family are revoked,
+    the answer is 401 and the cookie is cleared.
     """
-    await service.logout_session(db, raw_token, request)
+    try:
+        await service.logout_session(db, raw_token, request)
+    except InvalidRefreshTokenError as exc:
+        # The error response replaces `response`, so it carries the deletion.
+        cleared = Response()
+        _delete_refresh_cookie(cleared, settings)
+        exc.headers["Set-Cookie"] = cleared.headers["set-cookie"]
+        raise
     _delete_refresh_cookie(response, settings)
 
 

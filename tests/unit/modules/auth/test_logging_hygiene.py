@@ -44,3 +44,44 @@ class TestLoggingHygiene:
         assert PII_MAIL not in text
         assert PII_USER not in text
         assert "tok-123" not in text
+
+
+class TestMailTaskErrors:
+    """A failed mail task raises an error that carries no SMTP text.
+
+    taskiq logs the exception of a failed task with message and traceback,
+    and SMTP errors can echo the recipient address.
+    """
+
+    @pytest.mark.parametrize(
+        "task_name",
+        [
+            "send_verification_email_task",
+            "send_password_reset_email_task",
+            "send_email_change_confirmation_task",
+        ],
+    )
+    def test_raised_error_has_only_the_original_type(self, monkeypatch, task_name):
+        import asyncio
+        import traceback
+
+        from app.core.mail import MailDeliveryError
+        from app.modules.auth import tasks as email_tasks
+
+        class SMTPRecipientsRefused(Exception):
+            pass
+
+        async def _send(**_kwargs):
+            raise SMTPRecipientsRefused(f"550 <{PII_MAIL}> unknown user")
+
+        monkeypatch.setattr(email_tasks, "send_templated_email", _send)
+        task = getattr(email_tasks, task_name)
+        token = "tok-123"
+
+        with pytest.raises(MailDeliveryError) as raised:
+            asyncio.run(task.original_func(PII_MAIL, PII_USER, token))
+
+        rendered = "".join(traceback.format_exception(raised.value))
+        assert str(raised.value) == "SMTPRecipientsRefused"
+        assert PII_MAIL not in rendered
+        assert "tok-123" not in rendered

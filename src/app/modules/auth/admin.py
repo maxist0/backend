@@ -1,32 +1,57 @@
 """Admin panel views of the auth module, registered via `Module.admin_views`.
 
-The `User` view lives here, not in the users module: its actions (lock,
-unlock, deactivate, force password change) end sessions and touch
-credentials, which belong to auth, and users must not import auth.
+The views are read-only. Every change goes through an action that calls an
+auth service function, so it is audited and follows the lock order. The
+`User` view lives here, not in the users module: its actions end sessions
+and touch credentials, which belong to auth, and users must not import auth.
 """
 
-from sqlalchemy import and_, update
+import uuid
+from typing import Protocol
+
 from sqladmin import ModelView, action
+from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.requests import Request
 from starlette.responses import Response
 
-from app.core import get_logger, utcnow
-from app.core.admin import _back_to_list, _selected_ids, _session_factory
-from app.modules.auth.crud import revoke_user_sessions
-from app.modules.auth.models import (
-    AuthAuditLog,
-    EmailToken,
-    PasswordCredential,
-    Session,
-)
+from app.core import get_settings
+from app.core.admin import back_to_list, selected_ids, session_factory
+from app.modules.auth import service
+from app.modules.auth.models import AuthAuditLog, Session
 from app.modules.users import User
 
-logger = get_logger(__name__)
+
+class _AdminOperation(Protocol):
+    async def __call__(
+        self,
+        db: AsyncSession,
+        pk: uuid.UUID,
+        /,
+        *,
+        actor: str,
+        ip_address: str | None = None,
+    ) -> bool: ...
+
+
+async def _run_for_selected(
+    view: ModelView, request: Request, operation: _AdminOperation
+) -> Response:
+    """Apply `operation` to every selected row; it commits once per row."""
+    actor = get_settings().ADMIN_USERNAME
+    ip_address = request.client.host if request.client else None
+    async with session_factory(view)() as db:
+        for pk in selected_ids(request):
+            await operation(db, pk, actor=actor, ip_address=ip_address)
+    return back_to_list(request, view.identity)
 
 
 class UserAdmin(ModelView, model=User):
     name_plural = "Users"
     icon = "fa-solid fa-users"
+
+    can_create = False
+    can_edit = False
+    can_delete = False
 
     column_list = [
         User.id,
@@ -57,122 +82,44 @@ class UserAdmin(ModelView, model=User):
     @action(
         name="lock_users",
         label="Lock selected",
-        confirmation_message="Lock selected users? They will not be able to log in.",
-        add_in_detail=True,
-        add_in_list=True,
+        confirmation_message="Lock the selected users and end all their sessions?",
     )
     async def lock_users(self, request: Request) -> Response:
-        """Lock indefinitely (locked_until NULL) and end all sessions."""
-        ids = _selected_ids(request)
-        if ids:
-            async with _session_factory(self)() as session:
-                await session.execute(
-                    update(User)
-                    .where(User.id.in_(ids))
-                    .values(is_locked=True, locked_until=None, updated_at=utcnow())
-                )
-                await session.commit()
-                for user_id in ids:
-                    await revoke_user_sessions(session, user_id, reason="admin_lock")
-            logger.info("admin.users_locked", user_ids=[str(i) for i in ids])
-        return _back_to_list(request, self.identity)
+        return await _run_for_selected(self, request, service.admin_lock_user)
 
     @action(
         name="unlock_users",
         label="Unlock selected",
-        confirmation_message="Unlock selected users and reset failed login attempts?",
-        add_in_detail=True,
-        add_in_list=True,
+        confirmation_message="Unlock the selected users and reset failed logins?",
     )
     async def unlock_users(self, request: Request) -> Response:
-        ids = _selected_ids(request)
-        if ids:
-            async with _session_factory(self)() as session:
-                await session.execute(
-                    update(User)
-                    .where(User.id.in_(ids))
-                    .values(
-                        is_locked=False,
-                        failed_login_attempts=0,
-                        locked_until=None,
-                        updated_at=utcnow(),
-                    )
-                )
-                await session.commit()
-            logger.info("admin.users_unlocked", user_ids=[str(i) for i in ids])
-        return _back_to_list(request, self.identity)
-
-    @action(
-        name="force_password_change",
-        label="Force password change",
-        confirmation_message="Require selected users to change their password on next login?",
-        add_in_detail=True,
-        add_in_list=True,
-    )
-    async def force_password_change(self, request: Request) -> Response:
-        # Only sets the flag: enforcing must_change needs a new error code in
-        # the API contract (see README roadmap).
-        ids = _selected_ids(request)
-        if ids:
-            async with _session_factory(self)() as session:
-                await session.execute(
-                    update(PasswordCredential)
-                    .where(PasswordCredential.user_id.in_(ids))
-                    .values(must_change=True, updated_at=utcnow())
-                )
-                await session.commit()
-            logger.info("admin.password_change_forced", user_ids=[str(i) for i in ids])
-        return _back_to_list(request, self.identity)
+        return await _run_for_selected(self, request, service.admin_unlock_user)
 
     @action(
         name="deactivate_users",
         label="Deactivate selected",
-        confirmation_message="Deactivate selected users?",
-        add_in_detail=True,
-        add_in_list=True,
+        confirmation_message="Deactivate the selected users and end all their sessions?",
     )
     async def deactivate_users(self, request: Request) -> Response:
-        """Deactivate and end all sessions."""
-        ids = _selected_ids(request)
-        if ids:
-            async with _session_factory(self)() as session:
-                await session.execute(
-                    update(User)
-                    .where(User.id.in_(ids))
-                    .values(is_active=False, updated_at=utcnow())
-                )
-                await session.commit()
-                for user_id in ids:
-                    await revoke_user_sessions(
-                        session, user_id, reason="admin_deactivate"
-                    )
-            logger.info("admin.users_deactivated", user_ids=[str(i) for i in ids])
-        return _back_to_list(request, self.identity)
+        return await _run_for_selected(self, request, service.admin_deactivate_user)
 
+    @action(
+        name="reactivate_users",
+        label="Reactivate selected",
+        confirmation_message="Reactivate the selected users?",
+    )
+    async def reactivate_users(self, request: Request) -> Response:
+        return await _run_for_selected(self, request, service.admin_reactivate_user)
 
-class PasswordCredentialAdmin(ModelView, model=PasswordCredential):
-    name = "Password Credential"
-    name_plural = "Password Credentials"
-    icon = "fa-solid fa-key"
-
-    # Creating via admin is impossible without a proper hash
-    can_create = False
-    column_list = [
-        PasswordCredential.id,
-        PasswordCredential.user_id,
-        PasswordCredential.must_change,
-        PasswordCredential.created_at,
-        PasswordCredential.updated_at,
-    ]
-    # Hide hash in both form and detail — it must never leave hashed storage
-    form_excluded_columns = [PasswordCredential.password_hash]
-    column_details_exclude_list = [PasswordCredential.password_hash]
-    column_sortable_list = [
-        PasswordCredential.must_change,
-        PasswordCredential.created_at,
-        PasswordCredential.updated_at,
-    ]
-    column_default_sort = [(PasswordCredential.created_at, True)]
+    @action(
+        name="force_password_change",
+        label="Force password change",
+        confirmation_message="Flag the selected users' passwords for a change?",
+    )
+    async def force_password_change(self, request: Request) -> Response:
+        return await _run_for_selected(
+            self, request, service.admin_force_password_change
+        )
 
 
 class AuthAuditLogAdmin(ModelView, model=AuthAuditLog):
@@ -180,7 +127,6 @@ class AuthAuditLogAdmin(ModelView, model=AuthAuditLog):
     name_plural = "Audit Logs"
     icon = "fa-solid fa-clipboard-list"
 
-    # Audit logs must never be modified
     can_create = False
     can_edit = False
     can_delete = False
@@ -201,64 +147,13 @@ class AuthAuditLogAdmin(ModelView, model=AuthAuditLog):
     page_size_options = [25, 50, 100, 200]
 
 
-class EmailTokenAdmin(ModelView, model=EmailToken):
-    name = "Email Token"
-    name_plural = "Email Tokens"
-    icon = "fa-solid fa-envelope"
-
-    # Tokens are generated by the system with proper hashing — not via admin
-    can_create = False
-
-    column_list = [
-        EmailToken.id,
-        EmailToken.user_id,
-        EmailToken.purpose,
-        EmailToken.new_email,
-        EmailToken.expires_at,
-        EmailToken.used_at,
-        EmailToken.invalidated_at,
-        EmailToken.created_at,
-    ]
-    column_searchable_list = [EmailToken.new_email]
-    column_sortable_list = [
-        EmailToken.purpose,
-        EmailToken.expires_at,
-        EmailToken.used_at,
-        EmailToken.created_at,
-    ]
-    column_default_sort = [(EmailToken.created_at, True)]
-    page_size = 25
-    page_size_options = [10, 25, 50, 100]
-
-    @action(
-        name="invalidate_tokens",
-        label="Invalidate selected",
-        confirmation_message="Mark selected tokens as invalidated?",
-        add_in_detail=True,
-        add_in_list=True,
-    )
-    async def invalidate_tokens(self, request: Request) -> Response:
-        ids = _selected_ids(request)
-        if ids:
-            async with _session_factory(self)() as session:
-                await session.execute(
-                    update(EmailToken)
-                    .where(
-                        EmailToken.id.in_(ids),
-                        EmailToken.invalidated_at.is_(None),
-                    )
-                    .values(invalidated_at=utcnow())
-                )
-                await session.commit()
-            logger.info(
-                "admin.email_tokens_invalidated", token_ids=[str(i) for i in ids]
-            )
-        return _back_to_list(request, self.identity)
-
-
 class SessionAdmin(ModelView, model=Session):
     name_plural = "Sessions"
     icon = "fa-solid fa-terminal"
+
+    can_create = False
+    can_edit = False
+    can_delete = False
 
     column_list = [
         Session.id,
@@ -272,7 +167,6 @@ class SessionAdmin(ModelView, model=Session):
         Session.created_at,
         Session.revoked_at,
     ]
-    # Detail view also shows token_hash, family_id, user_agent — useful for debugging
     column_searchable_list = [
         Session.ip_address,
         Session.device_name,
@@ -291,45 +185,10 @@ class SessionAdmin(ModelView, model=Session):
     @action(
         name="revoke_sessions",
         label="Revoke selected",
-        confirmation_message="Revoke selected sessions? Users will need to log in again.",
-        add_in_detail=True,
-        add_in_list=True,
+        confirmation_message="Revoke the selected sessions? Their users must log in again.",
     )
     async def revoke_sessions(self, request: Request) -> Response:
-        ids = _selected_ids(request)
-        if ids:
-            async with _session_factory(self)() as session:
-                await session.execute(
-                    update(Session)
-                    .where(Session.id.in_(ids), Session.is_revoked.is_(False))
-                    .values(is_revoked=True, revoke_reason="admin", revoked_at=utcnow())
-                )
-                await session.commit()
-            logger.info("admin.sessions_revoked", session_ids=[str(i) for i in ids])
-        return _back_to_list(request, self.identity)
-
-    @action(
-        name="revoke_all_expired",
-        label="Revoke all expired",
-        confirmation_message="Revoke all sessions that have already expired?",
-        add_in_list=True,
-    )
-    async def revoke_all_expired(self, request: Request) -> Response:
-        now = utcnow()
-        async with _session_factory(self)() as session:
-            await session.execute(
-                update(Session)
-                .where(and_(Session.expires_at < now, Session.is_revoked.is_(False)))
-                .values(is_revoked=True, revoke_reason="expired", revoked_at=now)
-            )
-            await session.commit()
-        return _back_to_list(request, self.identity)
+        return await _run_for_selected(self, request, service.admin_revoke_session)
 
 
-VIEWS: tuple[type[ModelView], ...] = (
-    UserAdmin,
-    PasswordCredentialAdmin,
-    AuthAuditLogAdmin,
-    EmailTokenAdmin,
-    SessionAdmin,
-)
+VIEWS: tuple[type[ModelView], ...] = (UserAdmin, AuthAuditLogAdmin, SessionAdmin)

@@ -5,7 +5,8 @@ Target contract:
 * `Settings(...)` raises (`ValueError`, pydantic `ValidationError` or
   `RuntimeError`) when ENVIRONMENT is not dev/unittest and JWT_SECRET_KEY,
   ADMIN_PASSWORD or ADMIN_SECRET_KEY is still the code default, or
-  JWT_SECRET_KEY has fewer than 32 characters.
+  JWT_SECRET_KEY (or, with the admin enabled, an admin secret) has fewer
+  than 32 characters.
 * JWT_SECRET_KEY, ADMIN_PASSWORD and ADMIN_SECRET_KEY are `SecretStr`.
 * ADMIN_ENABLED=false (or unset outside dev) leaves `/admin` unmounted (404).
 """
@@ -84,6 +85,24 @@ class TestStartupGuard:
             settings_factory(
                 ENVIRONMENT="prod", **dict(STRONG, JWT_SECRET_KEY="k" * 31)
             )
+
+    @pytest.mark.parametrize("name", ["ADMIN_PASSWORD", "ADMIN_SECRET_KEY"])
+    @pytest.mark.parametrize("env", ["prod", "stage", "test"])
+    def test_short_admin_secret_with_admin_enabled_refuses_to_start(
+        self, settings_factory, env, name
+    ):
+        with pytest.raises((ValueError, RuntimeError), match=f"{name} is shorter"):
+            settings_factory(
+                ENVIRONMENT=env, ADMIN_ENABLED=True, **dict(STRONG, **{name: "x" * 31})
+            )
+
+    def test_admin_secrets_of_32_characters_start(self, settings_factory):
+        s = settings_factory(
+            ENVIRONMENT="prod",
+            ADMIN_ENABLED=True,
+            **dict(STRONG, ADMIN_PASSWORD="p" * 32, ADMIN_SECRET_KEY="s" * 32),
+        )
+        assert s.admin_enabled is True
 
     def test_prod_with_strong_secrets_starts(self, settings_factory):
         s = settings_factory(ENVIRONMENT="prod", **STRONG)
