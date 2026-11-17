@@ -86,10 +86,12 @@ cp .env .env.local
 
 ```bash
 uv run alembic upgrade head
-uv run python app.py dev
+uv run python run.py dev
 ```
 
-The dev launcher also starts a `taskiq` worker as a child process so emails and scheduled jobs run locally.
+The dev launcher also starts a `taskiq` worker and the `taskiq` scheduler as child processes, so emails, scheduled jobs and retries run locally; it stops them on exit. Failed tasks are retried only while the scheduler runs ([ADR 0009](documentation/adr/0009-taskiq-redis-stream-broker-and-delayed-retries.md)).
+
+**Windows:** psycopg cannot use Windows' default `ProactorEventLoop`. `run.py` starts uvicorn on a `SelectorEventLoop`. Instead of the `taskiq worker` CLI it runs `python -m app.worker`, one worker process on a `SelectorEventLoop`, so `TASKIQ_WORKERS` has no effect there. `fastapi run` works on Windows only with `--workers 2` or more.
 
 | URL | Purpose |
 |---|---|
@@ -221,7 +223,7 @@ The dependency arrow points inward: `router → service → crud → models`. Ro
 
 | Value | Docs | Log format | `.env.local` | Notes |
 |---|---|---|---|---|
-| `dev` | on | coloured console | read | taskiq worker auto-started by `app.py` |
+| `dev` | on | coloured console | read | taskiq worker and scheduler auto-started by `run.py` |
 | `unittest` | on | JSON | ignored | used by `tests/conftest.py` |
 | `test`, `stage` | on | JSON | ignored | runtime injects variables |
 | `prod` | off | JSON | ignored | admin panel mounted only with `ADMIN_ENABLED=true`; startup guard active |
@@ -291,12 +293,13 @@ All primary keys are UUIDv4 generated in the application. Timestamps are `timest
 ### Caching and background work
 
 - **Cache:** `@cached(ttl, key)` and `invalidate(pattern)` from `app.core` cache return values of service functions in Redis ([ADR 0003](documentation/adr/0003-caching-via-cached-decorator.md)). Values are stored as JSON, never pickled, so a value in Redis cannot run code in the app. There is no HTTP response cache.
-- **Jobs:** `taskiq` `ListQueueBroker` on Redis db 1, results in db 2. Tasks are declared with `@broker.task(...)` in `src/utils/`; the scheduler reads `schedule=[{"cron": ...}]` labels. Workers and scheduler are separate Swarm services.
+- **Jobs:** `taskiq` with taskiq-redis' `RedisStreamBroker` on Redis db 1 (stream `taskiq:tasks`, consumer group `taskiq`), results in db 2 for one hour, stored as JSON ([ADR 0009](documentation/adr/0009-taskiq-redis-stream-broker-and-delayed-retries.md)). Delivery is at least once: a worker acknowledges a message after the task and deletes the entry together with the acknowledgement, and a message unacknowledged for 10 minutes goes to another worker, so tasks must be idempotent. Tasks are declared with `@task(task_name=...)` in a module's `tasks.py`. A task labelled `retry_on_error=True` that raises `TransientTaskError` is retried `TASKIQ_RETRY_COUNT` times, `TASKIQ_RETRY_DELAY_SECONDS` apart. The retry is stored as a JSON schedule (keys `taskiq_retry:*` in db 1), and the scheduler sends it. The scheduler reads those retries and the `schedule=[{"cron": ...}]` labels. Run exactly one scheduler. Worker and scheduler are separate Swarm services. While Redis is unreachable, or the consumer group has vanished (`FLUSHALL`), the worker logs `taskiq.broker_unavailable` with the consecutive failures and the outage duration every few seconds, then `taskiq.broker_reconnected`, and resumes on its own. Wrong Redis credentials stop it.
 
 ### Observability
 
 - **Logs:** `structlog` with contextvars. Every request has `request_id`; authenticated requests add `user_id` only. Logs contain no usernames, emails, query strings, `Referer` or token prefixes, and the database password is masked. `dev` renders coloured console output, every other environment JSON lines; everything goes to stdout and a collector reads the container output ([ADR 0004](documentation/adr/0004-logging-stdout-only.md)). `http.access` carries `request_id`, method, path without query string, route template, status, duration and client IP (from the ASGI scope).
 - **Metrics:** prometheus_client's default registry (with the process and GC collectors) at `GET /metrics`: `http_requests_total{method,route,status}`, `http_request_duration_seconds{method,route}` (5 ms to 10 s buckets), `app_info{name,version,environment}`, and the auth counters `auth_login_failures_total{reason}`, `auth_lockouts_total`, `auth_refresh_token_reuse_total`. The `route` label is the route template (for example `/api/v1/users/me`) or `unmatched`, so arbitrary paths cannot create label values; `/metrics` itself is not counted. One process per container is assumed; several uvicorn workers in one container would need prometheus_client's multiprocess mode.
+- **Worker metrics:** taskiq's `PrometheusMiddleware` serves `GET /metrics` on `TASKIQ_METRICS_HOST`:`TASKIQ_METRICS_PORT` (loopback by default) in the worker only: `received_tasks_total`, `success_tasks_total`, `found_errors_total` (every failed attempt, retried ones included) and `saved_results_total`, all with a `task_name` label, plus the `execution_time` histogram. The worker processes write to prometheus_client's multiprocess directory (`PROMETHEUS_MULTIPROC_DIR`, default `<tmp>/taskiq-metrics`, set by `app.worker` before anything imports prometheus_client). The first process to bind the port serves the sum of all processes. The directory must start empty, which a fresh container does. There is no queue-length gauge; use redis_exporter's stream checks for the backlog.
 - **Health:** `GET /health` (liveness, no I/O) and `GET /health/ready` (PostgreSQL `SELECT 1` and Redis `PING`, each bounded by `READINESS_TIMEOUT_SECONDS`; 503 with the failed check, never error text).
 - **Traces:** not yet wired (Tempo is deployed, the application does not emit spans; see Roadmap Phase 3).
 
@@ -396,7 +399,10 @@ All settings are environment variables read by `Settings` (`src/common/config.py
 | `DATABASE_URL` | `postgresql+asyncpg://postgres:postgres@localhost:5432/api` | asyncpg driver required at runtime |
 | `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` | `10` / `20` | per process |
 | `CACHE_HOST` / `CACHE_PORT` / `CACHE_DB` / `CACHE_PASSWORD` | `localhost` / `6379` / `0` / empty | Redis for `RedisDep` and `@cached` (refresh tokens are not stored in Redis) |
-| `TASKIQ_BROKER_URL` / `TASKIQ_RESULT_BACKEND_URL` | Redis db 1 / db 2 | |
+| `TASKIQ_BROKER_URL` / `TASKIQ_RESULT_BACKEND_URL` | Redis db 1 / db 2 | Task stream and retry schedules / task results (1 h TTL). The broker's Redis must not evict keys (`noeviction`) |
+| `TASKIQ_WORKERS` | `2` | `1..64`. Processes of `taskiq worker` started by `run.py dev` (on Windows always one) |
+| `TASKIQ_METRICS_HOST` / `TASKIQ_METRICS_PORT` | `127.0.0.1` / `9000` | IP address or hostname / `1..65535`. Prometheus endpoint of the worker. Loopback by default; a container sets `0.0.0.0` so the scraper on the monitoring network reaches it |
+| `TASKIQ_RETRY_COUNT` / `TASKIQ_RETRY_DELAY_SECONDS` | `3` / `60` | `0..10` / `30..3600`. Retries after the first run of a task that raises `TransientTaskError`, and the wait before each (plus up to 1 s jitter and up to the scheduler's update interval) |
 | `JWT_SECRET_KEY` | placeholder | **Secret.** Startup guard outside `dev`/`unittest`: must not be the default and must be at least 32 characters. Use a 256-bit random value. The JWT algorithm is HS256, pinned in code |
 | `ACCESS_TOKEN_EXPIRE_MINUTES` / `REFRESH_TOKEN_EXPIRE_DAYS` | `15` / `30` | |
 | `ADMIN_ENABLED` | unset | Unset means enabled only in `dev`. Set `true` to mount the admin panel elsewhere; the Swarm stack sets `false` |
@@ -569,12 +575,15 @@ Open:
 7. The password-reset email link is relative (`/auth/reset-password?token=`) and lacks `FRONTEND_URL`. [Phase 1]
 8. Refresh cookie is set without `Secure`. [Phase 1]
 9. `pytest` `--cov-fail-under=80` and `[tool.coverage.report] fail_under = 85` conflict. [Phase 0]
-10. Partly fixed: `BCRYPT_ROUNDS`, `CACHE_KEY_PREFIX`, `ROUTE_CACHE_*`, `DEBUG` and `OTLP_*` are removed. Still unused settings: `REDIS_URL` (set by tests), `TASKIQ_RETRY_*` and `TASKIQ_METRICS_PORT` (used from S2). `MAIL_*` values are read through `os.getenv` rather than `Settings`. [Phase 0]
+10. Partly fixed: `BCRYPT_ROUNDS`, `CACHE_KEY_PREFIX`, `ROUTE_CACHE_*`, `DEBUG` and `OTLP_*` are removed. Still unused settings: `REDIS_URL` (set by tests). `MAIL_*` values are read through `os.getenv` rather than `Settings`. [Phase 0]
 11. Partly fixed: `alembic/env.py` no longer overrides injected variables, but it still loads `.env.local` in dev. [Phase 4]
 16. The admin action "Force password change" sets `password_credentials.must_change`, but neither login, refresh nor access tokens check it, and a password change or reset does not clear it. [Phase 3]
 17. A locked account can be told apart by response time while the Argon2 queue is loaded: a refusal on a locked account waits like an average verify, but does not queue behind other password evaluations. The real control is rate limiting ([D4](#open-decisions)). [Phase 3]
 18. **Accepted risk:** `PUT /users/me/email` answers 409 `email_taken` when the new address belongs to another account, so a signed-in user who knows their password can test whether an address is registered. The owner accepted this: `POST /auth/register` reveals the same with its 409, and only the account holder (after the password check) can ask.
 19. `/health/ready` is routed publicly by the Swarm stack; it should be reachable only from the orchestrator and monitoring. [deploy round]
+20. On a Linux host shared by several users, the worker's default `PROMETHEUS_MULTIPROC_DIR` (`/tmp/taskiq-metrics`) is a predictable path in the shared `/tmp`: another local user can create it first, plant symlinks or alter the metric files. Containers, Windows and macOS (per-user temp directories) are not affected. The deploy round sets an explicit directory on a tmpfs. [deploy round]
+21. **Accepted for now:** there is no dead-letter queue and no delivery cap. A message whose worker dies on every attempt (for example a crash after the mail was sent but before the acknowledgement) is redelivered every 10 minutes without end.
+22. **Accepted for now:** when the scheduler fails to send a due retry (a short Redis outage during the send), taskiq's scheduler does not try that retry again until the scheduler restarts.
 
 ---
 

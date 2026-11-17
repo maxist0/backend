@@ -3,10 +3,24 @@
 import asyncio
 
 import pytest
-from fastapi_mail import FastMail, MessageType
+from aiosmtplib import (
+    SMTPAuthenticationError,
+    SMTPConnectError,
+    SMTPConnectResponseError,
+    SMTPDataError,
+    SMTPReadTimeoutError,
+    SMTPRecipientRefused,
+    SMTPRecipientsRefused,
+    SMTPResponseException,
+    SMTPServerDisconnected,
+)
+from fastapi_mail import ConnectionConfig, FastMail, MessageSchema, MessageType
+from fastapi_mail.errors import ConnectionErrors
+from jinja2 import TemplateNotFound
 
 import app.core.mail as mail
 from app.core.config import get_settings
+from app.core.tasks import TransientTaskError
 
 MAIL = {
     "MAIL_USERNAME": "mailer",
@@ -148,3 +162,114 @@ class TestMailer:
         assert message.subtype is MessageType.html
         assert "Hi &lt;b&gt;zed&lt;/b&gt;" in message.body
         assert "<html" in message.body.lower()
+
+
+def _connection_error(cause: BaseException) -> Exception:
+    """Wrap like fastapi-mail: ConnectionErrors raised inside the `except`."""
+    try:
+        raise cause
+    except Exception as error:
+        try:
+            raise ConnectionErrors(f"Exception raised {error}")  # noqa: B904
+        except ConnectionErrors as wrapped:
+            return wrapped
+
+
+class TestMailDeliveryError:
+    """Only transient causes become the retried `TransientMailDeliveryError`."""
+
+    @pytest.mark.parametrize(
+        "cause",
+        [
+            pytest.param(lambda: SMTPServerDisconnected("gone"), id="disconnected"),
+            pytest.param(lambda: SMTPReadTimeoutError("slow"), id="read-timeout"),
+            pytest.param(lambda: TimeoutError(), id="timeout"),
+            pytest.param(lambda: ConnectionResetError(), id="connection-reset"),
+            pytest.param(
+                lambda: SMTPResponseException(451, "try later"), id="smtp-451"
+            ),
+            pytest.param(
+                lambda: SMTPRecipientsRefused(
+                    [SMTPRecipientRefused(452, "full", "a@example.com")]
+                ),
+                id="recipients-452",
+            ),
+            pytest.param(
+                lambda: _connection_error(SMTPConnectError("refused")),
+                id="connect-via-fastapi-mail",
+            ),
+            pytest.param(
+                lambda: _connection_error(SMTPConnectResponseError(421, "busy")),
+                id="greeting-421-via-fastapi-mail",
+            ),
+        ],
+    )
+    def test_transient_causes_are_retried(self, cause):
+        error = mail.mail_delivery_error(cause())
+
+        assert isinstance(error, mail.TransientMailDeliveryError)
+        assert isinstance(error, TransientTaskError)
+
+    @pytest.mark.parametrize(
+        "cause",
+        [
+            pytest.param(
+                lambda: SMTPRecipientsRefused(
+                    [SMTPRecipientRefused(550, "no such user", "a@example.com")]
+                ),
+                id="recipients-550",
+            ),
+            pytest.param(lambda: SMTPDataError(554, "rejected"), id="smtp-554"),
+            pytest.param(
+                lambda: _connection_error(SMTPAuthenticationError(535, "bad login")),
+                id="auth-535-via-fastapi-mail",
+            ),
+            pytest.param(
+                lambda: _connection_error(ValueError("bad config")),
+                id="non-network-via-fastapi-mail",
+            ),
+            pytest.param(lambda: TemplateNotFound("verify_email.html"), id="template"),
+            pytest.param(lambda: TypeError("bad call"), id="type-error"),
+            pytest.param(lambda: KeyError("username"), id="key-error"),
+        ],
+    )
+    def test_permanent_causes_are_not_retried(self, cause):
+        error = mail.mail_delivery_error(cause())
+
+        assert type(error) is mail.MailDeliveryError
+        assert not isinstance(error, TransientTaskError)
+
+    def test_unreachable_smtp_server_is_transient(self):
+        """The real fastapi-mail connect path: nothing listens on port 1."""
+        config = ConnectionConfig(
+            MAIL_USERNAME="mailer",
+            MAIL_PASSWORD="smtp-secret-value-7f3a",
+            MAIL_FROM="noreply@example.com",
+            MAIL_SERVER="127.0.0.1",
+            MAIL_PORT=1,
+            MAIL_STARTTLS=False,
+            MAIL_SSL_TLS=False,
+            TIMEOUT=5,
+        )
+        message = MessageSchema(
+            subject="s",
+            recipients=["a@example.com"],
+            body="b",
+            subtype=MessageType.plain,
+        )
+
+        with pytest.raises(ConnectionErrors) as raised:
+            asyncio.run(FastMail(config).send_message(message))
+
+        error = mail.mail_delivery_error(raised.value)
+        assert isinstance(error, mail.TransientMailDeliveryError)
+
+    def test_message_is_only_the_type_of_the_cause(self):
+        """SMTP replies can echo the recipient; taskiq logs the message."""
+        cause = SMTPRecipientsRefused(
+            [SMTPRecipientRefused(450, "a@example.com busy", "a@example.com")]
+        )
+
+        error = mail.mail_delivery_error(cause)
+
+        assert str(error) == "SMTPRecipientsRefused"

@@ -30,7 +30,7 @@ A **module boilerplate** on FastAPI: async SQLAlchemy 2 on PostgreSQL 18, Redis 
 ```bash
 uv python install 3.14 && uv sync          # install (creates .venv with dev group)
 uv run alembic upgrade head                 # migrate local DB (reads .env.local)
-uv run python run.py dev                    # API on :8000 + taskiq worker, reads .env.local
+uv run python run.py dev                    # API on :8000 + taskiq worker + scheduler, reads .env.local
 uvx ruff@0.15.0 check src tests             # lint (S3 switches to `uv run ruff`, lint group)
 uvx ruff@0.15.0 format src tests            # format
 uv run mypy src                             # types (strict mode arrives in S3)
@@ -48,7 +48,7 @@ docker build -t api:latest .                # image
 | Need | Location |
 |---|---|
 | App assembly (`create_app()`), module mounting | `src/app/main.py`, `src/app/modules/__init__.py` (`MODULES`) |
-| Launcher (uvicorn, dev worker) | `run.py` |
+| Launcher (uvicorn, dev worker and scheduler) | `run.py` |
 | Public core facade | `src/app/core/__init__.py` |
 | Settings and environments | `src/app/core/config.py` (`Settings`, `get_settings`, `SettingsDep`) |
 | DB engine, session, `DbSession`, `Base`, `utcnow` | `src/app/core/database.py` |
@@ -58,7 +58,7 @@ docker build -t api:latest .                # image
 | `/health`, `/health/ready`, `/metrics` | `src/app/core/health.py` |
 | Cache (`cached`, `invalidate`, `RedisDep`) | `src/app/core/cache.py` |
 | Logging setup, `get_logger` | `src/app/core/logging.py` |
-| Taskiq (`task` decorator, broker and scheduler builders), email (core layout `src/app/core/templates/base.html`) | `src/app/core/tasks.py`, `src/app/core/mail.py`; worker root `src/app/worker.py` |
+| Taskiq (`task` decorator, `TransientTaskError`, broker, retry and scheduler builders), email (core layout `src/app/core/templates/base.html`) | `src/app/core/tasks.py`, `src/app/core/mail.py`; worker and scheduler root `src/app/worker.py` |
 | Module contract (`Module`), admin (sqladmin) base | `src/app/core/module.py`, `src/app/core/admin.py` |
 | Users: `User` model, profile, `CurrentUser`, `OptionalUser` | `src/app/modules/users/` |
 | Auth: register, login, refresh, logout, sessions, password and email flows, audit log | `src/app/modules/auth/` |
@@ -71,7 +71,7 @@ docker build -t api:latest .                # image
 - `src/app/core/` is the infrastructure. `src/app/modules/` holds the modules. Two modules are built in: `users` (the `User` entity, profile, later settings) and `auth` (how a user proves identity: credentials, sessions, tokens, audit log). See [ADR 0008](documentation/adr/0008-module-layout-and-users-auth-split.md).
 - **Imports point one way: `core ← users ← auth ← app modules`.** The core never imports from `app.modules`; `users` never imports `auth`; a module never imports a module that depends on it. Modules import infrastructure from `app.core`, and `CurrentUser`, `OptionalUser`, `User` from `app.modules.users`.
 - **URLs follow the resource, code follows the responsibility.** Endpoints for the signed-in user live under `/users/me/...`; flows for signed-out users live under `/auth/...`. `PUT /users/me/password` and `PUT /users/me/email` need credentials and verification, so the `auth` module serves them (OpenAPI tag `users`).
-- `app.core` is a facade. It exports `Settings`, `DbSession`, `SettingsDep`, `get_settings`, `Base`, `utcnow`, `get_logger`, `log_unexpected_error`, the `AppError` family, `cached`, `invalidate`, `RedisDep`, `task` (taskiq's shared task decorator) and `Module`. Import from `app.core`, not from its submodules.
+- `app.core` is a facade. It exports `Settings`, `DbSession`, `SettingsDep`, `get_settings`, `Base`, `utcnow`, `get_logger`, `log_unexpected_error`, the `AppError` family, `cached`, `invalidate`, `RedisDep`, `task` (taskiq's shared task decorator), `TransientTaskError` and `Module`. Import from `app.core`, not from its submodules.
 - An app built on this boilerplate adds modules. If a task seems to need a core edit, stop and ask: either the core has a gap (a core change with an ADR) or the code belongs in a module.
 
 ## Module layout *(target)*
@@ -200,7 +200,11 @@ async def revoke_user_sessions(
 - Cache keys include every input that changes the result, `{user_id}` included for per-user data. A missing component leaks data across users.
 - Mutations call `invalidate(...)` in the service. TTLs come from `Settings`.
 - There is no ETag middleware, no client cache-control middleware and no route-cache settings.
-- All background work is a taskiq task in the module's `tasks.py`, declared with `@task(task_name=...)` from `app.core`, exported through `Module(tasks=...)` and enqueued with `await my_task.kiq(...)`. Importing a module must read no settings: the broker is built by `app.worker` (worker, scheduler) and by the API lifespan. Email templates live in the module and are passed as `send_templated_email(..., template_dir=...)`. Tasks are retry-safe (idempotent) and receive IDs and primitives, never ORM objects. Do not use FastAPI `BackgroundTasks`.
+- All background work is a taskiq task in the module's `tasks.py`, declared with `@task(task_name=...)` from `app.core`, exported through `Module(tasks=...)` and enqueued with `await my_task.kiq(...)`. Importing a module must read no settings: the broker is built by `app.worker` (worker, scheduler) and by the API lifespan. Email templates live in the module and are passed as `send_templated_email(..., template_dir=...)`. Tasks receive IDs and primitives, never ORM objects. Do not use FastAPI `BackgroundTasks`.
+- Delivery is **at least once** (Redis stream with acknowledgements, [ADR 0009](documentation/adr/0009-taskiq-redis-stream-broker-and-delayed-retries.md)): a task can run twice, so every task is idempotent.
+- Retries: a task with the label `retry_on_error=True` that raises `TransientTaskError` (from `app.core`) runs again after `TASKIQ_RETRY_DELAY_SECONDS`, at most `TASKIQ_RETRY_COUNT` times. Raise it only for errors that may pass (network, timeouts, a busy server); everything else fails at once. Its message must hold no personal data, because taskiq logs it. Mail tasks raise `mail_delivery_error(exc) from None`, which picks the transient or the permanent mail error.
+- Delayed retries are schedules that the scheduler sends: a worker without a running scheduler never retries. `run.py dev` starts both.
+- The retry and Prometheus middlewares belong to the worker (`app.worker`) only. The API's broker (`build_broker`) only enqueues; building the worker broker in an API process would put the API's `/metrics` into prometheus_client's multiprocess mode.
 
 ## Testing *(target)*
 

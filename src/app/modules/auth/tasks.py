@@ -3,7 +3,7 @@
 from pathlib import Path
 
 from app.core import get_logger, get_settings, task
-from app.core.mail import MailDeliveryError, send_templated_email
+from app.core.mail import mail_delivery_error, send_templated_email
 
 logger = get_logger(__name__)
 
@@ -35,7 +35,7 @@ async def send_verification_email_task(to: str, username: str, token: str) -> No
         # Only the exception type, in the log and in what taskiq logs: SMTP
         # errors can echo the recipient address.
         logger.error("email.verification_failed", error_type=type(exc).__name__)
-        raise MailDeliveryError(exc) from None
+        raise mail_delivery_error(exc) from None
 
 
 @task(
@@ -63,7 +63,7 @@ async def send_password_reset_email_task(to: str, username: str, token: str) -> 
         # Only the exception type, in the log and in what taskiq logs: SMTP
         # errors can echo the recipient address.
         logger.error("email.password_reset_failed", error_type=type(exc).__name__)
-        raise MailDeliveryError(exc) from None
+        raise mail_delivery_error(exc) from None
 
 
 @task(
@@ -95,4 +95,4 @@ async def send_email_change_confirmation_task(
         logger.error(
             "email.email_change_confirmation_failed", error_type=type(exc).__name__
         )
-        raise MailDeliveryError(exc) from None
+        raise mail_delivery_error(exc) from None

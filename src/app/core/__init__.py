@@ -24,7 +24,7 @@ from app.core.errors import (
 )
 from app.core.logging import get_logger
 from app.core.module import Module
-from app.core.tasks import task
+from app.core.tasks import TransientTaskError, task
 
 __all__ = [
     "AppError",
@@ -39,6 +39,7 @@ __all__ = [
     "RedisDep",
     "Settings",
     "SettingsDep",
+    "TransientTaskError",
     "Unauthorized",
     "cached",
     "get_logger",

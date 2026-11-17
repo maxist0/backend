@@ -16,5 +16,6 @@ The decisions below were taken by the owner on 2026-11-16. They are implemented 
 | [0006](0006-slim-admin-via-services.md) | Slim admin that calls services | accepted | 2026-11-16 | |
 | [0007](0007-test-split-unit-integration.md) | Test split: unit and integration | accepted | 2026-11-16 | |
 | [0008](0008-module-layout-and-users-auth-split.md) | Fixed module layout, users separate from auth, core consolidation | accepted | 2026-11-16 | |
+| [0009](0009-taskiq-redis-stream-broker-and-delayed-retries.md) | Taskiq on a Redis stream with acknowledgements and delayed retries | accepted | 2026-11-17 | |
 
 Conventions that follow from these decisions are in [AGENTS.md](../../AGENTS.md).

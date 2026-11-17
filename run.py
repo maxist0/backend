@@ -3,7 +3,7 @@
 Usage:
     python run.py           # ENVIRONMENT injected by Docker/Kubernetes
     python run.py dev       # sets ENVIRONMENT=dev (reads .env.local) and
-                            # also starts a taskiq worker
+                            # also starts a taskiq worker and scheduler
     python run.py unittest  # unit testing environment (not for serving)
 
 Settings, logging and resources are handled by the app itself
@@ -21,6 +21,63 @@ import sys
 # loop factory directly (uvicorn >= 0.36, "--loop <module>:<attr>"). Other
 # platforms keep "auto" (uvloop when installed).
 UVICORN_LOOP = "asyncio:SelectorEventLoop" if sys.platform == "win32" else "auto"
+
+# Delayed retries are schedules that the scheduler reads every update
+# interval (taskiq's default is 60 s), so this bounds how late a retry runs.
+SCHEDULER_UPDATE_INTERVAL_SECONDS = 10
+
+# How long a child process gets to shut down before it is killed.
+CHILD_STOP_TIMEOUT_SECONDS = 10
+
+
+def worker_command(workers: int, log_level: str) -> list[str]:
+    """Return the command line of the development taskiq worker.
+
+    The `taskiq worker` CLI runs its processes on `asyncio.new_event_loop()`,
+    which is the ProactorEventLoop on Windows; psycopg cannot use it. There,
+    `python -m app.worker` runs one receiver on a SelectorEventLoop instead.
+    """
+    if sys.platform == "win32":
+        return [sys.executable, "-m", "app.worker"]
+    return [
+        sys.executable,
+        "-m",
+        "taskiq",
+        "worker",
+        "app.worker:broker",
+        f"--workers={workers}",
+        f"--log-level={log_level}",
+    ]
+
+
+def scheduler_command(log_level: str) -> list[str]:
+    """Return the command line of the development taskiq scheduler."""
+    return [
+        sys.executable,
+        "-m",
+        "taskiq",
+        "scheduler",
+        "app.worker:scheduler",
+        f"--update-interval={SCHEDULER_UPDATE_INTERVAL_SECONDS}",
+        "--skip-first-run",
+        f"--log-level={log_level}",
+    ]
+
+
+def stop_process(process: subprocess.Popen[bytes]) -> None:
+    """Stop a child process: terminate, wait, then kill if it hangs.
+
+    Terminating (SIGTERM) lets the taskiq worker stop its own worker
+    processes; killing it first would orphan them.
+    """
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=CHILD_STOP_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
 
 
 def main() -> None:
@@ -73,24 +130,16 @@ def main() -> None:
     host = args.host if args.host is not None else settings.HOST
     port = args.port if args.port is not None else settings.PORT
 
-    worker_process = None
+    children: list[subprocess.Popen[bytes]] = []
 
-    # Start a taskiq worker process automatically in development mode. On
-    # Windows the taskiq CLI runs on a ProactorEventLoop; that is fine while
-    # tasks use no database (mail, heartbeat). A worker that uses psycopg
-    # needs its own entrypoint there.
+    # In development, run.py also starts the taskiq worker and the scheduler;
+    # retries of failed tasks need the scheduler.
     if settings.is_development:
-        worker_process = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "taskiq",
-                "worker",
-                "app.worker:broker",
-                f"--workers={settings.TASKIQ_WORKERS}",
-                f"--log-level={settings.LOG_LEVEL.upper()}",
-            ]
+        log_level = settings.LOG_LEVEL.upper()
+        children.append(
+            subprocess.Popen(worker_command(settings.TASKIQ_WORKERS, log_level))
         )
+        children.append(subprocess.Popen(scheduler_command(log_level)))
 
     try:
         uvicorn.run(
@@ -106,8 +155,8 @@ def main() -> None:
             forwarded_allow_ips=settings.FORWARDED_ALLOW_IPS,
         )
     finally:
-        if worker_process is not None and worker_process.poll() is None:
-            worker_process.kill()
+        for child in children:
+            stop_process(child)
 
 
 if __name__ == "__main__":

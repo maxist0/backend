@@ -78,9 +78,11 @@ def test_built_broker_registers_the_worker_logging_hook():
 def test_scheduler_finds_the_shared_heartbeat_schedule():
     """The heartbeat is a shared task; the scheduler must still schedule it."""
     broker = app_tasks.build_broker(get_settings())
-    scheduler = app_tasks.build_scheduler(broker)
-    (source,) = scheduler.sources
+    retry_source = app_tasks.build_retry_source(get_settings())
+    scheduler = app_tasks.build_scheduler(broker, retry_source)
+    source, second = scheduler.sources
     assert isinstance(source, LabelScheduleSource)
+    assert second is retry_source
 
     async def _schedules() -> list:
         await source.startup()

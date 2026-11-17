@@ -1,18 +1,15 @@
 """Library behaviour the app relies on that needs Postgres or Redis.
 
-Covers the SQLAlchemy 2.1, redis-py 8, cashews 7.6 and taskiq-redis upgrades.
+Covers the SQLAlchemy 2.1, redis-py 8 and cashews 7.6 upgrades; the taskiq
+broker is covered in `test_taskiq.py`.
 Each test names the change it covers.
 """
 
-import asyncio
 import os
-import uuid
 import warnings
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker
-from taskiq.message import BrokerMessage
-from taskiq_redis import ListQueueBroker
 
 from app.modules.auth.models import AuditEventType, AuthAuditLog
 from app.core.cache import close_redis, open_redis
@@ -96,57 +93,3 @@ class TestRedisPy8:
         messages = run_async(scenario())
 
         assert any("Call to deprecated close" in m for m in messages)
-
-
-class TestTaskiqBroker:
-    def test_idle_worker_queue_does_not_time_out(self):
-        """redis-py 8 REGRESSION GUARD (takes ~6 s).
-
-        redis-py 8 defaults to a 5 s socket read timeout; taskiq-redis waits
-        for jobs with BRPOP without a server timeout and retries only
-        ConnectionError, so an idle worker failed with
-        ``redis.exceptions.TimeoutError`` after 5 s. The app's broker sets
-        ``socket_timeout=None``; with that setting the listener keeps waiting
-        and still receives the next job.
-        """
-        from app.core.tasks import build_broker
-
-        app_broker = build_broker(get_settings())
-
-        socket_timeout = app_broker.connection_pool.connection_kwargs["socket_timeout"]
-        assert socket_timeout is None
-
-        async def scenario() -> bytes:
-            broker = ListQueueBroker(
-                os.environ["TASKIQ_BROKER_URL"],
-                queue_name=f"upgrade-{uuid.uuid4().hex}",
-                socket_timeout=socket_timeout,
-            )
-            await broker.startup()
-            try:
-
-                async def first_message() -> bytes:
-                    async for message in broker.listen():
-                        return message
-                    raise AssertionError("listen() ended")
-
-                try:
-                    await asyncio.wait_for(first_message(), timeout=6)
-                except TimeoutError:
-                    pass  # asyncio's timeout: still waiting, as intended
-                else:
-                    raise AssertionError("received a message from an empty queue")
-
-                await broker.kick(
-                    BrokerMessage(
-                        task_id="upgrade-check",
-                        task_name="upgrade-check",
-                        message=b"payload",
-                        labels={},
-                    )
-                )
-                return await asyncio.wait_for(first_message(), timeout=5)
-            finally:
-                await broker.shutdown()
-
-        assert run_async(scenario()) == b"payload"

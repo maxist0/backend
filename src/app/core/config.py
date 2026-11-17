@@ -7,6 +7,7 @@ reads `.env.local`; real environment variables always win over that file.
 Routes receive the settings through `SettingsDep`.
 """
 
+import ipaddress
 import os
 import re
 from enum import Enum
@@ -38,6 +39,11 @@ _DISTRIBUTION_NAME = "api"
 _UNKNOWN_VERSION = "0.0.0+unknown"
 # A browser `Origin` value: scheme and host with an optional port, no path.
 _ORIGIN = re.compile(r"https?://[^/\s]+")
+# RFC 1123 hostname: dot-separated labels of letters, digits and inner hyphens.
+_HOSTNAME = re.compile(
+    r"(?=.{1,253}$)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*"
+)
 
 
 def _installed_version() -> str:
@@ -122,10 +128,20 @@ class Settings(BaseSettings):
     # Taskiq (DB 1 = broker queue, DB 2 = result backend, keeps app cache on DB 0)
     TASKIQ_BROKER_URL: str = "redis://localhost:6379/1"
     TASKIQ_RESULT_BACKEND_URL: str = "redis://localhost:6379/2"
-    TASKIQ_WORKERS: int = 2
-    TASKIQ_METRICS_PORT: int = 9000
-    TASKIQ_RETRY_COUNT: int = 3
-    TASKIQ_RETRY_DELAY_SECONDS: int = 60
+    # Worker processes of `taskiq worker` (one on Windows dev, see run.py).
+    TASKIQ_WORKERS: int = Field(default=2, ge=1, le=64)
+    # Address and port of the worker's Prometheus endpoint (worker processes
+    # only). Loopback by default; a container sets 0.0.0.0 so the scraper on
+    # the monitoring network can reach it.
+    TASKIQ_METRICS_HOST: str = "127.0.0.1"
+    TASKIQ_METRICS_PORT: int = Field(default=9000, ge=1, le=65_535)
+    # Retries of a task that fails with TransientTaskError, after the first
+    # run; each waits TASKIQ_RETRY_DELAY_SECONDS (plus up to 1 s jitter and
+    # the scheduler's update interval).
+    TASKIQ_RETRY_COUNT: int = Field(default=3, ge=0, le=10)
+    # At least 30 s: a shorter delay retries into the same outage and turns
+    # a brief SMTP or network problem into a burst of failed attempts.
+    TASKIQ_RETRY_DELAY_SECONDS: int = Field(default=60, ge=30, le=3_600)
 
     # JWT Authentication (the algorithm is pinned in code: app.core.security)
     JWT_SECRET_KEY: SecretStr = SecretStr(_DEFAULT_JWT_SECRET_KEY)
@@ -218,6 +234,20 @@ class Settings(BaseSettings):
     @classmethod
     def _normalize_database_url(cls, value: str) -> str:
         return normalize_database_url(value)
+
+    @field_validator("TASKIQ_METRICS_HOST")
+    @classmethod
+    def _require_host(cls, value: str) -> str:
+        """Accept an IP address or a hostname, nothing else."""
+        try:
+            ipaddress.ip_address(value)
+        except ValueError:
+            if not _HOSTNAME.fullmatch(value):
+                raise ValueError(
+                    f"TASKIQ_METRICS_HOST {value!r} is neither an IP address "
+                    "nor a hostname."
+                ) from None
+        return value
 
     @field_validator("CORS_ORIGINS")
     @classmethod
