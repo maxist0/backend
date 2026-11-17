@@ -26,7 +26,7 @@ import logging
 import jwt
 import pytest
 
-from app.modules.auth.service import MAXIMUM_LOGIN_ATTEMPTS
+from tests.helpers import MAXIMUM_LOGIN_ATTEMPTS
 from tests.helpers import (
     PASSWORD,
     active_session_count,
@@ -901,17 +901,16 @@ class TestLoggingHygiene:
         assert t.access[:20] not in text
 
     def test_access_log_has_no_query_string_or_referer(self, client, caplog):
-        access = logging.getLogger("access")
-        access.addHandler(caplog.handler)
-        caplog.set_level(logging.DEBUG, logger="access")
-        try:
-            client.get(
-                "/?token=SUPERSECRETQUERY",
-                headers={"Referer": "https://example.org/?reset=SECRETREFERER"},
-            )
-        finally:
-            access.removeHandler(caplog.handler)
-        text = _log_text(caplog)
+        caplog.set_level(logging.INFO)
+
+        client.get(
+            "/?token=SUPERSECRETQUERY",
+            headers={"Referer": "https://example.org/?reset=SECRETREFERER"},
+        )
+
+        # Our records only: the test client logs the full URL itself.
+        app_records = [r for r in caplog.records if r.name.startswith("app.")]
+        text = "\n".join(r.getMessage() for r in app_records)
         assert "http.access" in text, "access log not observed"
         assert "SUPERSECRETQUERY" not in text
         assert "SECRETREFERER" not in text

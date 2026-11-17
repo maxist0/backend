@@ -56,3 +56,8 @@ Chosen option: "a thin `@cached(ttl, key)` and `invalidate(pattern)` wrapper ove
 ## More Information
 
 Implemented in S1 of the 2026-11 cleanup. Conventions: [AGENTS.md → Caching and background jobs](../../AGENTS.md#caching-and-background-jobs-target).
+
+Implementation notes (S1.4):
+
+* The "one Redis pool" consequence does not fully hold. cashews 7.6 always builds its own connection pool from the URL and cannot reuse the app's client, so there are two pools on the same server and database: the `RedisDep` client and the cache, which is bounded by `CACHE_MAX_CONNECTIONS`.
+* Cached values are stored as JSON (`pickle_type="json"`). The cashews default is pickle, which would turn a write to Redis into code execution in the app. Cached functions must therefore return JSON-compatible values.

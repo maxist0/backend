@@ -49,8 +49,8 @@ class TestCreateApp:
         # FastAPI >= 0.137 keeps included routers as a tree in app.routes;
         # iter_route_contexts() flattens it with the full (prefixed) paths.
         paths = {context.path for context in iter_route_contexts(app.routes)}
-        assert {"/", "/api/v1/auth/login", "/api/v1/users/me"} <= paths
-        assert "/metrics/" not in paths
+        assert {"/", "/health", "/api/v1/auth/login", "/api/v1/users/me"} <= paths
+        assert "/metrics" not in paths
         assert "/admin" not in paths
 
     def test_without_arguments_uses_get_settings(self, monkeypatch, settings_factory):
@@ -121,4 +121,4 @@ class TestModuleMounting:
 
         assert "/api/v2/users/me" in paths
         assert not any(path.startswith("/api/v1") for path in paths)
-        assert {"/", "/metrics/", "/metrics/health"} <= paths
+        assert {"/", "/metrics", "/health", "/health/ready"} <= paths

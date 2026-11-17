@@ -50,7 +50,7 @@ EXPOSE 8000
 
 # Health check to ensure the container is healthy
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/metrics/health')" || exit 1
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
 
 
 # Use ENTRYPOINT to define the executable

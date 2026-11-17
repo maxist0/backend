@@ -37,7 +37,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from app.modules.auth.service import MAXIMUM_LOGIN_ATTEMPTS
+from tests.helpers import MAXIMUM_LOGIN_ATTEMPTS
 from tests.helpers import (
     PASSWORD,
     active_session_count,

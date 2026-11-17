@@ -2,15 +2,12 @@
 
 * 0.137: included routers stay a tree (`app.routes` holds `_IncludedRouter`
   nodes; `scope["route"]` is the router's own `APIRoute` without the
-  include prefix). The metrics middleware resolves the full template.
-* 0.142/0.143: native OpenTelemetry, explicitly disabled in `create_app`.
+  include prefix). The request middleware resolves the full template.
 """
 
 import pytest
 from fastapi.routing import iter_route_contexts
-
-from app.core.metrics import REGISTRY
-from tests.helpers import new_test_client
+from prometheus_client import REGISTRY
 
 EXPECTED_OPENAPI_PATHS = {
     "/",
@@ -29,20 +26,19 @@ EXPECTED_OPENAPI_PATHS = {
     "/api/v1/users/me",
     "/api/v1/users/me/email",
     "/api/v1/users/me/password",
-    "/metrics/",
-    "/metrics/health",
+    "/health",
+    "/health/ready",
 }
 
 
-def _request_count(endpoint: str) -> float:
-    """Sum of ``http_requests_total`` over all methods/statuses for *endpoint*."""
+def _request_count(route: str) -> float:
+    """Sum of `http_requests_total` over all methods and statuses for `route`."""
     return sum(
         sample.value
         for metric in REGISTRY.collect()
         if metric.name == "http_requests"
         for sample in metric.samples
-        if sample.name == "http_requests_total"
-        and sample.labels.get("endpoint") == endpoint
+        if sample.name == "http_requests_total" and sample.labels.get("route") == route
     )
 
 
@@ -61,7 +57,7 @@ class TestRouterTree:
         flattened = {context.path for context in iter_route_contexts(app.routes)}
 
         assert "/api/v1/auth/login" not in top_level
-        assert EXPECTED_OPENAPI_PATHS <= flattened
+        assert EXPECTED_OPENAPI_PATHS | {"/metrics"} <= flattened
         assert "/admin" in flattened  # the sqladmin mount (ADMIN_ENABLED=true)
 
     @pytest.mark.parametrize(
@@ -69,7 +65,7 @@ class TestRouterTree:
         [
             ("get", "/api/v1/users/me", "/me"),
             ("post", "/api/v1/auth/login", "/login"),
-            ("get", "/metrics/health", "/health"),
+            ("get", "/health/ready", None),
             ("get", "/", None),
         ],
     )
@@ -90,35 +86,3 @@ class TestRouterTree:
 
         assert _request_count(path) == full_before + 1
         assert _request_count(router_local_path or "") == local_before
-
-
-class TestNativeTelemetryIsOff:
-    def test_no_fastapi_otel_log_records_even_with_a_configured_provider(
-        self, monkeypatch, app
-    ):
-        """0.142: FastAPI emits its own OTel records once a logger provider is set.
-
-        ``setup_logging`` installs a global provider when OTLP_LOGS_ENABLED;
-        FastAPI would then export e.g. ``fastapi.validation.failed`` and
-        unhandled exceptions with message and stack trace. ``create_app``
-        disables native telemetry, so nothing is emitted.
-        """
-        from opentelemetry.sdk._logs import LoggerProvider
-        from opentelemetry.sdk._logs.export import (
-            InMemoryLogRecordExporter,
-            SimpleLogRecordProcessor,
-        )
-
-        exporter = InMemoryLogRecordExporter()
-        provider = LoggerProvider()
-        provider.add_log_record_processor(SimpleLogRecordProcessor(exporter))
-        # What set_logger_provider() does, but undone after the test (the
-        # public setter works only once per process).
-        monkeypatch.setattr("opentelemetry._logs._internal._LOGGER_PROVIDER", provider)
-        try:
-            with new_test_client(app) as c:
-                assert c.post("/api/v1/auth/login", data={}).status_code == 422
-        finally:
-            provider.shutdown()
-
-        assert exporter.get_finished_logs() == ()

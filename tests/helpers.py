@@ -20,9 +20,16 @@ from typing import Any, Callable
 import jwt
 from fastapi.testclient import TestClient
 
+from app.core.config import Settings
+
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 
 PASSWORD = "Password123!"
+
+# The lockout defaults the suite runs with (Settings defaults; no test
+# environment overrides them).
+MAXIMUM_LOGIN_ATTEMPTS: int = Settings.model_fields["LOGIN_MAX_ATTEMPTS"].default
+LOGIN_LOCKOUT_SECONDS: int = Settings.model_fields["LOGIN_LOCKOUT_SECONDS"].default
 
 # psycopg's async mode cannot run on Windows' default ProactorEventLoop (the app
 # refuses to start on it, see app.core.database.ensure_supported_event_loop).

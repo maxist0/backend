@@ -4,7 +4,7 @@ import pytest
 
 import app.main as main
 
-_CORE_PATHS = {"/", "/metrics/", "/metrics/health"}
+_CORE_PATHS = {"/", "/health", "/health/ready"}
 _PROBLEM = {"$ref": "#/components/schemas/ProblemDetail"}
 _METHODS = {"get", "post", "put", "patch", "delete"}
 
@@ -21,6 +21,12 @@ def _module_operations(doc: dict):
         for method, operation in item.items():
             if method in _METHODS:
                 yield path, method, operation
+
+
+def test_core_paths_are_unprefixed_and_metrics_is_hidden(openapi):
+    assert _CORE_PATHS <= set(openapi["paths"])
+    assert "/metrics" not in openapi["paths"]
+    assert openapi["paths"]["/health/ready"]["get"]["tags"] == ["health"]
 
 
 def test_every_module_path_is_under_the_api_prefix(openapi):

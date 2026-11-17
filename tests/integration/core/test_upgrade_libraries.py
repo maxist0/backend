@@ -15,7 +15,7 @@ from taskiq.message import BrokerMessage
 from taskiq_redis import ListQueueBroker
 
 from app.modules.auth.models import AuditEventType, AuthAuditLog
-from app.core.cache import close_cache_pool, init_cache_pool
+from app.core.cache import close_redis, open_redis
 from app.core.config import get_settings
 from app.core.database import build_engine, create_session_factory
 from tests.helpers import run_async
@@ -62,13 +62,13 @@ class TestRedisPy8:
         """
 
         async def scenario() -> tuple[bytes | None, object]:
-            client = await init_cache_pool(get_settings())
+            client = await open_redis(get_settings())
             try:
                 await client.set("upgrade:redis8", "v", ex=60)
                 value = await client.get("upgrade:redis8")
                 timeout = client.connection_pool.connection_kwargs["socket_timeout"]
             finally:
-                await close_cache_pool(client)
+                await close_redis(client)
             return value, timeout
 
         assert run_async(scenario()) == (b"v", 5)
@@ -77,8 +77,9 @@ class TestRedisPy8:
         """Exit condition for the cashews ignore in ``[tool.pytest.ini_options]``.
 
         cashews 7.6.0 closes its redis client with ``close()`` (deprecated in
-        redis-py 5.0.1). When this test fails, cashews uses ``aclose()``:
-        delete the ignore and this test.
+        redis-py 5.0.1); the lifespan calls it through ``close_cache``. When
+        this test fails, cashews uses ``aclose()``: delete the ignore and this
+        test.
         """
         from cashews import Cache
 

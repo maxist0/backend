@@ -1,54 +1,61 @@
-"""Router labels and app construction across the FastAPI 0.136 -> 0.163 upgrade.
+"""App construction across the FastAPI 0.136 -> 0.163 upgrade.
 
-* 0.137: included routers stay a tree; the metrics middleware resolves the
-  full route template, also for one router mounted under two prefixes.
+* 0.142/0.143: native OpenTelemetry, explicitly disabled in `create_app`.
 * 0.145/0.146/0.155: removed `**extra` kwargs, deprecated `root_path`.
 """
 
 import warnings
 
 import pytest
-from fastapi import APIRouter, FastAPI, Request
+from fastapi import FastAPI
 from fastapi.exceptions import FastAPIDeprecationWarning
+from opentelemetry import _logs as otel_logs
 
-from app.core.metrics import REGISTRY
-from app.core.middleware import MetricsMiddleware
 from app.main import create_app
 from tests.helpers import new_test_client
 
 
-def _endpoint_labels() -> set[str]:
-    return {
-        sample.labels["endpoint"]
-        for metric in REGISTRY.collect()
-        if metric.name == "http_requests"
-        for sample in metric.samples
-        if "endpoint" in sample.labels
-    }
+class _RecordingLogger(otel_logs.Logger):
+    def __init__(self, records: list) -> None:
+        self.records = records
+
+    def enabled(self, *args, **kwargs) -> bool:
+        return True
+
+    def emit(self, record=None, **kwargs) -> None:
+        self.records.append(record or kwargs)
 
 
-class TestRouterTree:
-    def test_router_included_under_two_prefixes_gets_two_labels(self):
-        """0.137: one APIRoute reachable as /v1/... and /v2/... (API versioning)."""
-        router = APIRouter()
+class _RecordingLoggerProvider(otel_logs.LoggerProvider):
+    """A configured provider built on the OpenTelemetry API only (no SDK)."""
 
-        @router.get("/upgrade-items/{item_id}")
-        async def read_item(item_id: int, request: Request) -> dict:
-            return {"item_id": item_id}
+    def __init__(self) -> None:
+        self.records: list = []
 
-        tiny = FastAPI()
-        tiny.add_middleware(MetricsMiddleware)
-        tiny.include_router(router, prefix="/v1")
-        tiny.include_router(router, prefix="/v2")
+    def get_logger(self, name, version=None, schema_url=None, attributes=None):
+        return _RecordingLogger(self.records)
 
-        with new_test_client(tiny) as c:
-            assert c.get("/v1/upgrade-items/1").status_code == 200
-            assert c.get("/v2/upgrade-items/2").status_code == 200
 
-        labels = _endpoint_labels()
-        assert "/v1/upgrade-items/{item_id}" in labels
-        assert "/v2/upgrade-items/{item_id}" in labels
-        assert "/upgrade-items/{item_id}" not in labels
+class TestNativeTelemetryIsOff:
+    def test_no_fastapi_otel_log_records_even_with_a_configured_provider(
+        self, monkeypatch, settings_factory
+    ):
+        """0.142: FastAPI emits its own OTel records once a logger provider is set.
+
+        It would export e.g. `fastapi.validation.failed` and unhandled
+        exceptions with message and stack trace. `create_app` disables native
+        telemetry, so nothing is emitted.
+        """
+        provider = _RecordingLoggerProvider()
+        # What set_logger_provider() does, but undone after the test (the
+        # public setter works only once per process).
+        monkeypatch.setattr("opentelemetry._logs._internal._LOGGER_PROVIDER", provider)
+        app = create_app(settings_factory())
+
+        r = new_test_client(app).post("/api/v1/auth/login", data={})
+
+        assert r.status_code == 422
+        assert provider.records == []
 
 
 class TestAppConstruction:

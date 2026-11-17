@@ -12,7 +12,6 @@ from sqlalchemy import and_, case, func, not_, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import get_logger, utcnow
-from app.core.metrics import DatabaseTimer
 from app.modules.auth.models import (
     AuthAuditLog,
     EmailToken,
@@ -39,10 +38,9 @@ async def lock_user(db: AsyncSession, user_id: uuid.UUID) -> None:
     foreign-key checks free: inserts into sessions or auth_audit_log for
     this user do not wait. Does not commit. No-op for an unknown user.
     """
-    with DatabaseTimer("select", "users"):
-        await db.execute(
-            select(User.id).where(User.id == user_id).with_for_update(key_share=True)
-        )
+    await db.execute(
+        select(User.id).where(User.id == user_id).with_for_update(key_share=True)
+    )
 
 
 async def lock_and_get_user(db: AsyncSession, user_id: uuid.UUID) -> User | None:
@@ -51,14 +49,13 @@ async def lock_and_get_user(db: AsyncSession, user_id: uuid.UUID) -> User | None
     `populate_existing` overwrites an instance already in the session's
     identity map with the values read under the lock. Does not commit.
     """
-    with DatabaseTimer("select", "users"):
-        result = await db.execute(
-            select(User)
-            .where(User.id == user_id)
-            .with_for_update(key_share=True)
-            .execution_options(populate_existing=True)
-        )
-        return result.scalars().first()
+    result = await db.execute(
+        select(User)
+        .where(User.id == user_id)
+        .with_for_update(key_share=True)
+        .execution_options(populate_existing=True)
+    )
+    return result.scalars().first()
 
 
 async def get_lock_state(
@@ -66,11 +63,10 @@ async def get_lock_state(
 ) -> tuple[bool, datetime | None] | None:
     """Read `(is_locked, locked_until)` from the database, bypassing the
     identity map (a cached User would show the state of the first read)."""
-    with DatabaseTimer("select", "users"):
-        result = await db.execute(
-            select(User.is_locked, User.locked_until).where(User.id == user_id)
-        )
-        row = result.first()
+    result = await db.execute(
+        select(User.is_locked, User.locked_until).where(User.id == user_id)
+    )
+    row = result.first()
     if row is None:
         return None
     return row[0], row[1]
@@ -90,22 +86,21 @@ async def record_successful_login(
         User.is_locked.is_(True),
         or_(User.locked_until.is_(None), User.locked_until > func.now()),
     )
-    with DatabaseTimer("update", "users"):
-        result = await db.execute(
-            update(User)
-            .where(User.id == user_id, not_(lock_active))
-            .values(
-                failed_login_attempts=0,
-                is_locked=False,
-                locked_until=None,
-                last_login_at=func.now(),
-                updated_at=func.now(),
-            )
-            .returning(User.last_login_at)
-            .execution_options(synchronize_session=False)
+    result = await db.execute(
+        update(User)
+        .where(User.id == user_id, not_(lock_active))
+        .values(
+            failed_login_attempts=0,
+            is_locked=False,
+            locked_until=None,
+            last_login_at=func.now(),
+            updated_at=func.now(),
         )
-        row = result.first()
-        await db.commit()
+        .returning(User.last_login_at)
+        .execution_options(synchronize_session=False)
+    )
+    row = result.first()
+    await db.commit()
     return row[0] if row is not None else None
 
 
@@ -122,26 +117,25 @@ async def register_failed_login(
     the user does not exist. Commits.
     """
     reaches_threshold = User.failed_login_attempts + 1 >= max_attempts
-    with DatabaseTimer("update", "users"):
-        result = await db.execute(
-            update(User)
-            .where(User.id == user_id)
-            .values(
-                failed_login_attempts=User.failed_login_attempts + 1,
-                is_locked=case((reaches_threshold, True), else_=User.is_locked),
-                locked_until=case(
-                    (
-                        and_(reaches_threshold, User.is_locked.is_(False)),
-                        func.now() + timedelta(seconds=lock_seconds),
-                    ),
-                    else_=User.locked_until,
+    result = await db.execute(
+        update(User)
+        .where(User.id == user_id)
+        .values(
+            failed_login_attempts=User.failed_login_attempts + 1,
+            is_locked=case((reaches_threshold, True), else_=User.is_locked),
+            locked_until=case(
+                (
+                    and_(reaches_threshold, User.is_locked.is_(False)),
+                    func.now() + timedelta(seconds=lock_seconds),
                 ),
-                updated_at=func.now(),
-            )
-            .returning(User.failed_login_attempts, User.is_locked, User.locked_until)
+                else_=User.locked_until,
+            ),
+            updated_at=func.now(),
         )
-        row = result.first()
-        await db.commit()
+        .returning(User.failed_login_attempts, User.is_locked, User.locked_until)
+    )
+    row = result.first()
+    await db.commit()
     if row is None:
         return None
     return row[0], row[1], row[2]
@@ -150,38 +144,34 @@ async def register_failed_login(
 async def create_password_credential(
     db: AsyncSession, credential: PasswordCredential
 ) -> PasswordCredential:
-    with DatabaseTimer("insert", "password_credentials"):
-        db.add(credential)
-        await db.commit()
+    db.add(credential)
+    await db.commit()
     return credential
 
 
 async def get_password_credential(
     db: AsyncSession, user_id: uuid.UUID
 ) -> PasswordCredential | None:
-    with DatabaseTimer("select", "password_credentials"):
-        result = await db.execute(
-            select(PasswordCredential).where(PasswordCredential.user_id == user_id)
-        )
-        return result.scalars().first()
+    result = await db.execute(
+        select(PasswordCredential).where(PasswordCredential.user_id == user_id)
+    )
+    return result.scalars().first()
 
 
 async def update_password_hash(
     db: AsyncSession, user_id: uuid.UUID, new_hash: str
 ) -> None:
-    with DatabaseTimer("update", "password_credentials"):
-        await db.execute(
-            update(PasswordCredential)
-            .where(PasswordCredential.user_id == user_id)
-            .values(password_hash=new_hash, updated_at=utcnow())
-        )
-        await db.commit()
+    await db.execute(
+        update(PasswordCredential)
+        .where(PasswordCredential.user_id == user_id)
+        .values(password_hash=new_hash, updated_at=utcnow())
+    )
+    await db.commit()
 
 
 async def create_session(db: AsyncSession, session: Session) -> Session:
-    with DatabaseTimer("insert", "sessions"):
-        db.add(session)
-        await db.commit()
+    db.add(session)
+    await db.commit()
     return session
 
 
@@ -192,13 +182,12 @@ async def get_session_owner(
 
     Both columns never change, so reading them before the user lock is safe.
     """
-    with DatabaseTimer("select", "sessions"):
-        result = await db.execute(
-            select(Session.user_id, Session.family_id).where(
-                Session.token_hash == token_hash
-            )
+    result = await db.execute(
+        select(Session.user_id, Session.family_id).where(
+            Session.token_hash == token_hash
         )
-        row = result.first()
+    )
+    row = result.first()
     if row is None:
         return None
     return row[0], row[1]
@@ -207,23 +196,19 @@ async def get_session_owner(
 async def get_session_by_token_hash(
     db: AsyncSession, token_hash: str
 ) -> Session | None:
-    with DatabaseTimer("select", "sessions"):
-        result = await db.execute(
-            select(Session).where(Session.token_hash == token_hash)
-        )
-        return result.scalars().first()
+    result = await db.execute(select(Session).where(Session.token_hash == token_hash))
+    return result.scalars().first()
 
 
 async def revoke_session(
     db: AsyncSession, session_id: uuid.UUID, reason: str = "logout"
 ) -> None:
-    with DatabaseTimer("update", "sessions"):
-        await db.execute(
-            update(Session)
-            .where(Session.id == session_id)
-            .values(is_revoked=True, revoke_reason=reason, revoked_at=utcnow())
-        )
-        await db.commit()
+    await db.execute(
+        update(Session)
+        .where(Session.id == session_id)
+        .values(is_revoked=True, revoke_reason=reason, revoked_at=utcnow())
+    )
+    await db.commit()
 
 
 async def rotate_session(
@@ -240,18 +225,17 @@ async def rotate_session(
     the caller writes the successor session in the same transaction, so a
     revocation or replay that queues on the user lock sees the successor.
     """
-    with DatabaseTimer("update", "sessions"):
-        result = await db.execute(
-            update(Session)
-            .where(
-                Session.token_hash == token_hash,
-                Session.is_revoked.is_(False),
-                Session.expires_at > func.now(),
-            )
-            .values(is_revoked=True, revoke_reason="rotated", revoked_at=func.now())
-            .returning(Session.user_id, Session.family_id)
+    result = await db.execute(
+        update(Session)
+        .where(
+            Session.token_hash == token_hash,
+            Session.is_revoked.is_(False),
+            Session.expires_at > func.now(),
         )
-        row = result.first()
+        .values(is_revoked=True, revoke_reason="rotated", revoked_at=func.now())
+        .returning(Session.user_id, Session.family_id)
+    )
+    row = result.first()
     if row is None:
         return None
     return row[0], row[1]
@@ -273,15 +257,14 @@ async def revoke_user_sessions(
     conditions = [Session.user_id == user_id, Session.is_revoked.is_(False)]
     if except_family is not None:
         conditions.append(Session.family_id != except_family)
-    with DatabaseTimer("update", "sessions"):
-        result = await db.execute(
-            update(Session)
-            .where(*conditions)
-            .values(is_revoked=True, revoke_reason=reason, revoked_at=func.now())
-            .returning(Session.id)
-        )
-        revoked = len(result.all())
-        await db.commit()
+    result = await db.execute(
+        update(Session)
+        .where(*conditions)
+        .values(is_revoked=True, revoke_reason=reason, revoked_at=func.now())
+        .returning(Session.id)
+    )
+    revoked = len(result.all())
+    await db.commit()
     return revoked
 
 
@@ -298,26 +281,24 @@ async def revoke_family(
     row was active, so earlier writes of the caller's transaction persist.
     """
     await lock_user(db, user_id)
-    with DatabaseTimer("update", "sessions"):
-        result = await db.execute(
-            update(Session)
-            .where(
-                Session.user_id == user_id,
-                Session.family_id == family_id,
-                Session.is_revoked.is_(False),
-            )
-            .values(is_revoked=True, revoke_reason=reason, revoked_at=func.now())
-            .returning(Session.id)
+    result = await db.execute(
+        update(Session)
+        .where(
+            Session.user_id == user_id,
+            Session.family_id == family_id,
+            Session.is_revoked.is_(False),
         )
-        revoked = len(result.all())
-        await db.commit()
+        .values(is_revoked=True, revoke_reason=reason, revoked_at=func.now())
+        .returning(Session.id)
+    )
+    revoked = len(result.all())
+    await db.commit()
     return revoked
 
 
 async def create_email_token(db: AsyncSession, token: EmailToken) -> EmailToken:
-    with DatabaseTimer("insert", "email_tokens"):
-        db.add(token)
-        await db.commit()
+    db.add(token)
+    await db.commit()
     return token
 
 
@@ -334,20 +315,19 @@ async def consume_email_token(
     Does NOT commit: the caller's next write commits it together with the
     effect of the token (a failure before that rolls the redemption back).
     """
-    with DatabaseTimer("update", "email_tokens"):
-        result = await db.execute(
-            update(EmailToken)
-            .where(
-                EmailToken.token_hash == token_hash,
-                EmailToken.purpose.in_(purposes),
-                EmailToken.used_at.is_(None),
-                EmailToken.invalidated_at.is_(None),
-                EmailToken.expires_at > func.now(),
-            )
-            .values(used_at=func.now())
-            .returning(EmailToken.user_id, EmailToken.purpose, EmailToken.new_email)
+    result = await db.execute(
+        update(EmailToken)
+        .where(
+            EmailToken.token_hash == token_hash,
+            EmailToken.purpose.in_(purposes),
+            EmailToken.used_at.is_(None),
+            EmailToken.invalidated_at.is_(None),
+            EmailToken.expires_at > func.now(),
         )
-        row = result.first()
+        .values(used_at=func.now())
+        .returning(EmailToken.user_id, EmailToken.purpose, EmailToken.new_email)
+    )
+    row = result.first()
     if row is None:
         return None
     return row[0], row[1], row[2]
@@ -364,25 +344,23 @@ async def invalidate_tokens_for_user_purpose(
 
     With `commit=False` the caller's next commit includes the invalidation.
     """
-    with DatabaseTimer("update", "email_tokens"):
-        await db.execute(
-            update(EmailToken)
-            .where(
-                and_(
-                    EmailToken.user_id == user_id,
-                    EmailToken.purpose == purpose,
-                    EmailToken.used_at == None,  # noqa: E711
-                    EmailToken.invalidated_at == None,  # noqa: E711
-                )
+    await db.execute(
+        update(EmailToken)
+        .where(
+            and_(
+                EmailToken.user_id == user_id,
+                EmailToken.purpose == purpose,
+                EmailToken.used_at == None,  # noqa: E711
+                EmailToken.invalidated_at == None,  # noqa: E711
             )
-            .values(invalidated_at=utcnow())
         )
-        if commit:
-            await db.commit()
+        .values(invalidated_at=utcnow())
+    )
+    if commit:
+        await db.commit()
 
 
 async def create_audit_log(db: AsyncSession, log: AuthAuditLog) -> AuthAuditLog:
-    with DatabaseTimer("insert", "auth_audit_log"):
-        db.add(log)
-        await db.commit()
+    db.add(log)
+    await db.commit()
     return log

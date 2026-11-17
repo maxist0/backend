@@ -1,105 +1,20 @@
-"""
-Structured logging via structlog.
+"""Structured logging with structlog, written to stdout.
 
-Architecture
-───────────────────────────────────────────────────────────────────────────
-  Application code
-      │  structlog.get_logger() / get_logger()
-      ▼
-  structlog processors  (add_log_level, timestamp, exc_info, …)
-      │
-      ▼  stdlib bridge  (ProcessorFormatter)
-  stdlib logging.Handler(s)
-      ├── StreamHandler(stdout)
-      │       DEV  → structlog.dev.ConsoleRenderer  (coloured, human-readable)
-      │       PROD → structlog.processors.JSONRenderer
-      └── OTLPLogHandler  (when OTLP_LOGS_ENABLED=True)
-                │  opentelemetry.sdk.logs.LoggingHandler
-                ▼
-          OTLPLogExporter  →  Grafana Alloy  (HTTP /v1/logs)
-───────────────────────────────────────────────────────────────────────────
+`setup_logging` configures structlog and the stdlib root logger, so records
+from structlog and from stdlib loggers (uvicorn, SQLAlchemy) share one
+handler: the console renderer in `dev`, one JSON object per line otherwise.
+A log collector reads the container output; the app exports nothing itself.
 """
-
-from __future__ import annotations
 
 import importlib.util
 import logging
 import socket
 import sys
-import warnings
-from typing import TYPE_CHECKING, Any
 
 import structlog
+from structlog.typing import EventDict, Processor, WrappedLogger
 
-
-if TYPE_CHECKING:
-    from app.core.config import Settings
-
-
-def _parse_otlp_headers(raw: str) -> dict[str, str]:
-    """Parse `KEY=VALUE,KEY2=VALUE2` header string into a dict."""
-    headers: dict[str, str] = {}
-    for part in raw.split(","):
-        part = part.strip()
-        if "=" in part:
-            k, _, v = part.partition("=")
-            headers[k.strip()] = v.strip()
-    return headers
-
-
-def _build_otlp_handler(settings: "Settings") -> logging.Handler | None:
-    """
-    Create a stdlib logging.Handler that exports to an OTLP endpoint.
-
-    Returns *None* if the required packages are missing or configuration is
-    invalid – so the app can still start without the OTel extras installed.
-    """
-    try:
-        from opentelemetry.sdk._logs import LoggerProvider
-        from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
-        from opentelemetry.sdk._logs import LoggingHandler as OtelLoggingHandler
-        from opentelemetry.exporter.otlp.proto.http._log_exporter import (
-            OTLPLogExporter,
-        )
-        from opentelemetry.sdk.resources import Resource, SERVICE_NAME
-        from opentelemetry._logs import set_logger_provider
-    except ImportError as exc:
-        logging.getLogger(__name__).warning(
-            "OTLP log export requested but opentelemetry packages are not "
-            "installed – skipping.  Install: opentelemetry-sdk "
-            "opentelemetry-exporter-otlp-proto-http  (%s)",
-            exc,
-        )
-        return None
-
-    headers = (
-        _parse_otlp_headers(settings.OTLP_HEADERS) if settings.OTLP_HEADERS else {}
-    )
-
-    exporter = OTLPLogExporter(
-        endpoint=f"{settings.OTLP_ENDPOINT.rstrip('/')}/v1/logs",
-        headers=headers,
-    )
-
-    resource = Resource(attributes={SERVICE_NAME: settings.OTLP_SERVICE_NAME})
-    provider = LoggerProvider(resource=resource)
-    provider.add_log_record_processor(BatchLogRecordProcessor(exporter))
-    set_logger_provider(provider)
-
-    # opentelemetry-sdk >= 1.40 deprecates its LoggingHandler in favour of the
-    # one in opentelemetry-instrumentation-logging (warns in __init__). That
-    # replacement (0.66b2) exports structlog's event dict as a repr string
-    # instead of a structured body, so the switch belongs to the observability
-    # redesign. Until then only this one warning is silenced.
-    with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "ignore",
-            message="`LoggingHandler` in `opentelemetry-sdk` is deprecated",
-            category=DeprecationWarning,
-        )
-        otlp_handler = OtelLoggingHandler(logger_provider=provider)
-    otlp_handler.setLevel(logging.DEBUG)
-    return otlp_handler
+from app.core.config import Settings
 
 
 def _console_colors() -> bool:
@@ -116,133 +31,74 @@ def _console_colors() -> bool:
     return True
 
 
-def _make_static_fields_processor(environment: str) -> Any:
-    """
-    Return a structlog processor that stamps every record with:
-      - `hostname`  – the machine name (resolved once at startup)
-      - `environment` – dev / staging / prod (from Settings)
-    Uses `setdefault` so callers can still override either field.
-    """
-    _hostname = socket.gethostname()
-    _env = environment
+def _static_fields(environment: str) -> Processor:
+    """Return a processor that stamps `hostname` and `environment` on a record."""
+    hostname = socket.gethostname()
 
-    def _processor(_logger: Any, _method: str, event_dict: dict) -> dict:
-        event_dict.setdefault("hostname", _hostname)
-        event_dict.setdefault("environment", _env)
+    def add_fields(_: WrappedLogger, __: str, event_dict: EventDict) -> EventDict:
+        event_dict.setdefault("hostname", hostname)
+        event_dict.setdefault("environment", environment)
         return event_dict
 
-    return _processor
+    return add_fields
 
 
-_SHARED_PROCESSORS: list[Any] = [
-    structlog.contextvars.merge_contextvars,
-    structlog.stdlib.add_log_level,
-    structlog.stdlib.add_logger_name,
-    structlog.processors.TimeStamper(fmt="iso"),
-    structlog.processors.StackInfoRenderer(),
-    structlog.processors.ExceptionRenderer(),
-]
-
-
-def setup_logging(settings: "Settings") -> None:
-    """
-    Configure structlog + stdlib logging from *settings*.
-
-    Logs are written to stdout only.  When OTLP_LOGS_ENABLED is True,
-    records are additionally pushed to an OTLP/HTTP endpoint (Grafana Alloy).
+def setup_logging(settings: Settings) -> None:
+    """Configure structlog and stdlib logging from `settings`.
 
     Called once per process: by the lifespan (API) and by the taskiq
-    `WORKER_STARTUP` hook (worker). Safe to call again (the test suite
-    runs one lifespan per test): handlers are replaced, not added.
+    `WORKER_STARTUP` hook (worker). A second call replaces the handler, so
+    repeated lifespans (tests, reload) neither duplicate output nor keep the
+    settings of the first call.
     """
-    log_level_int = getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO)
-
-    environment_str = (
-        settings.ENVIRONMENT.value
-        if hasattr(settings.ENVIRONMENT, "value")
-        else str(settings.ENVIRONMENT)
+    level = logging.getLevelNamesMapping().get(settings.LOG_LEVEL.upper(), logging.INFO)
+    shared: list[Processor] = [
+        structlog.contextvars.merge_contextvars,
+        structlog.stdlib.add_log_level,
+        structlog.stdlib.add_logger_name,
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.StackInfoRenderer(),
+        structlog.processors.ExceptionRenderer(),
+    ]
+    renderer: Processor = (
+        structlog.dev.ConsoleRenderer(colors=_console_colors())
+        if settings.is_development
+        else structlog.processors.JSONRenderer()
     )
-    static_fields = _make_static_fields_processor(environment_str)
-    # Position 1: runs right after the contextvars are merged. Inserted once
-    # per process, so repeated setup (hot reload, tests) adds no duplicate.
-    if not any(getattr(p, "__name__", "") == "_processor" for p in _SHARED_PROCESSORS):
-        _SHARED_PROCESSORS.insert(1, static_fields)
-
-    json_formatter = structlog.stdlib.ProcessorFormatter(
-        processors=[
-            structlog.stdlib.ProcessorFormatter.remove_processors_meta,
-            structlog.processors.JSONRenderer(),
-        ],
-        foreign_pre_chain=_SHARED_PROCESSORS,
-    )
-
-    console_formatter = structlog.stdlib.ProcessorFormatter(
-        processors=[
-            structlog.stdlib.ProcessorFormatter.remove_processors_meta,
-            structlog.dev.ConsoleRenderer(colors=_console_colors()),
-        ],
-        foreign_pre_chain=_SHARED_PROCESSORS,
-    )
-
-    handlers: list[logging.Handler] = []
-
-    stdout_handler = logging.StreamHandler(sys.stdout)
-    stdout_handler.setLevel(log_level_int)
-    stdout_handler.setFormatter(
-        console_formatter if not settings.is_production else json_formatter
-    )
-    handlers.append(stdout_handler)
-
-    if settings.OTLP_LOGS_ENABLED:
-        otlp_handler = _build_otlp_handler(settings)
-        if otlp_handler is not None:
-            handlers.append(otlp_handler)
-
-    root_logger = logging.getLogger()
-    root_logger.setLevel(log_level_int)
-    root_logger.handlers = []  # avoid duplicates on hot-reload
-    for h in handlers:
-        root_logger.addHandler(h)
-
-    # Silence noisy third-party loggers
-    for name in (
-        "uvicorn.access",
-        "uvicorn.error",
-        "sqlalchemy.engine",
-        "urllib3",
-        "sqlalchemy",
-        "python_multipart.multipart",
-    ):
-        logger = logging.getLogger(name)
-        logger.setLevel(logging.WARNING)
-        logger.handlers = []  # Clear any existing handlers
-        logger.propagate = False
-    if settings.ACCESS_LOG_ENABLED:
-        access_log = logging.getLogger("access")
-        access_log.setLevel(logging.INFO)
-        access_log.propagate = False  # don't double-write to root
-
-        access_stdout = logging.StreamHandler(sys.stdout)
-        access_stdout.setLevel(logging.INFO)
-        access_stdout.setFormatter(
-            console_formatter if not settings.is_production else json_formatter
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(
+        structlog.stdlib.ProcessorFormatter(
+            foreign_pre_chain=shared,
+            processors=[
+                _static_fields(settings.ENVIRONMENT.value),
+                structlog.stdlib.ProcessorFormatter.remove_processors_meta,
+                renderer,
+            ],
         )
-        access_log.handlers = []
-        access_log.addHandler(access_stdout)
+    )
+    root = logging.getLogger()
+    root.handlers = [handler]
+    root.setLevel(level)
 
-        if settings.OTLP_LOGS_ENABLED:
-            for h in handlers:
-                from opentelemetry.sdk._logs import LoggingHandler as _OtelH
+    # uvicorn's own handlers (from its default log config) are dropped so its
+    # records, startup errors included, reach the root handler once. A
+    # fileConfig() elsewhere in the process (Alembic's env.py) disables every
+    # logger that existed before it ran. The request middleware's
+    # `http.access` event replaces uvicorn's access log.
+    for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        uvicorn_logger = logging.getLogger(name)
+        uvicorn_logger.handlers = []
+        uvicorn_logger.propagate = True
+        uvicorn_logger.disabled = False
+    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+    for name in ("sqlalchemy", "python_multipart"):
+        logging.getLogger(name).setLevel(logging.WARNING)
 
-                if isinstance(h, _OtelH):
-                    access_log.addHandler(h)
-                    break
-
+    # Everything that depends on `settings` lives in the handler's formatter.
+    # Loggers cached on first use keep this chain, which is the same on
+    # every call, so a later call still takes effect.
     structlog.configure(
-        processors=_SHARED_PROCESSORS
-        + [
-            structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
-        ],
+        processors=[*shared, structlog.stdlib.ProcessorFormatter.wrap_for_formatter],
         logger_factory=structlog.stdlib.LoggerFactory(),
         wrapper_class=structlog.stdlib.BoundLogger,
         cache_logger_on_first_use=True,
@@ -250,18 +106,11 @@ def setup_logging(settings: "Settings") -> None:
 
 
 def get_logger(name: str) -> structlog.stdlib.BoundLogger:
-    """
-    Return a structlog logger bound to *name*.
+    """Return a structlog logger named `name`.
 
-    Usage::
-
-        from app.core import get_logger
+    Usage:
         logger = get_logger(__name__)
-        logger.info("user_created", user_id=42)
+        logger.info("users.created", user_id=str(user.id))
     """
-    return structlog.get_logger(name)
-
-
-def get_access_logger() -> structlog.stdlib.BoundLogger:
-    """Return the dedicated HTTP access logger."""
-    return structlog.get_logger("access")
+    logger: structlog.stdlib.BoundLogger = structlog.get_logger(name)
+    return logger

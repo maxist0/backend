@@ -92,3 +92,96 @@ class TestEnvLocal:
         fresh_settings.chdir(tmp_path)
 
         assert get_settings().APP_NAME == "api"
+
+
+class TestCorsOrigins:
+    def test_default_is_the_local_frontend(self, settings_factory):
+        assert settings_factory().CORS_ORIGINS == ["http://localhost:5173"]
+
+    def test_read_from_the_environment_as_a_json_list(self, fresh_settings):
+        fresh_settings.setenv(
+            "CORS_ORIGINS", '["https://app.example.com", "http://localhost:3000"]'
+        )
+
+        assert get_settings().CORS_ORIGINS == [
+            "https://app.example.com",
+            "http://localhost:3000",
+        ]
+
+    @pytest.mark.parametrize("environment", ["dev", "unittest", "prod"])
+    def test_wildcard_is_refused_in_every_environment(
+        self, settings_factory, environment
+    ):
+        with pytest.raises(ValidationError, match="must not contain"):
+            settings_factory(
+                ENVIRONMENT=environment,
+                JWT_SECRET_KEY="k" * 48,
+                CORS_ORIGINS=["https://app.example.com", "*"],
+            )
+
+    @pytest.mark.parametrize(
+        "origin",
+        ["https://app.example.com/", "https://app.example.com/path", "null", "app"],
+    )
+    def test_values_that_are_not_origins_are_refused(self, settings_factory, origin):
+        with pytest.raises(ValidationError, match="is not an origin"):
+            settings_factory(CORS_ORIGINS=[origin])
+
+    def test_the_app_uses_the_configured_origins(self, settings_factory):
+        from app.main import create_app
+        from tests.helpers import new_test_client
+
+        app = create_app(settings_factory(CORS_ORIGINS=["https://app.example.com"]))
+        client = new_test_client(app)
+
+        allowed = client.get("/health", headers={"Origin": "https://app.example.com"})
+        other = client.get("/health", headers={"Origin": "http://localhost:5173"})
+        preflight = client.options(
+            "/api/v1/auth/login",
+            headers={
+                "Origin": "https://app.example.com",
+                "Access-Control-Request-Method": "POST",
+            },
+        )
+
+        assert allowed.headers["access-control-allow-origin"] == (
+            "https://app.example.com"
+        )
+        assert allowed.headers["access-control-allow-credentials"] == "true"
+        assert "access-control-allow-origin" not in other.headers
+        assert preflight.status_code == 200
+
+
+class TestProxyAndLockoutSettings:
+    def test_forwarded_allow_ips_defaults_to_localhost(self, settings_factory):
+        assert settings_factory().FORWARDED_ALLOW_IPS == "127.0.0.1"
+
+    def test_lockout_defaults(self, settings_factory):
+        settings = settings_factory()
+
+        assert (settings.LOGIN_MAX_ATTEMPTS, settings.LOGIN_LOCKOUT_SECONDS) == (5, 900)
+
+    @pytest.mark.parametrize(
+        "override",
+        [
+            {"LOGIN_MAX_ATTEMPTS": 0},
+            {"LOGIN_MAX_ATTEMPTS": 101},
+            {"LOGIN_LOCKOUT_SECONDS": 0},
+            {"LOGIN_LOCKOUT_SECONDS": 86_401},
+        ],
+        ids=lambda o: "-".join(f"{k}={v}" for k, v in o.items()),
+    )
+    def test_values_outside_the_bounds_are_rejected(self, settings_factory, override):
+        with pytest.raises(ValidationError):
+            settings_factory(**override)
+
+    def test_the_bounds_themselves_are_accepted(self, settings_factory):
+        """GUARD (control): the rejections above are caused by the bound only."""
+        low = settings_factory(LOGIN_MAX_ATTEMPTS=1, LOGIN_LOCKOUT_SECONDS=1)
+        high = settings_factory(LOGIN_MAX_ATTEMPTS=100, LOGIN_LOCKOUT_SECONDS=86_400)
+
+        assert (low.LOGIN_MAX_ATTEMPTS, high.LOGIN_LOCKOUT_SECONDS) == (1, 86_400)
+
+    def test_removed_settings_are_gone(self):
+        for name in ("DEBUG", "ROUTE_CACHE_ENABLED", "OTLP_LOGS_ENABLED"):
+            assert name not in Settings.model_fields

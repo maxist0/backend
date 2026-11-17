@@ -6,7 +6,7 @@ import os
 class TestHarness:
     def test_app_uses_the_redis_container_not_localhost_6379(self, client):
         """CACHE_HOST/CACHE_PORT must point at the container."""
-        kwargs = client.app.state.cache.connection_pool.connection_kwargs
+        kwargs = client.app.state.redis.connection_pool.connection_kwargs
         assert kwargs["port"] == int(os.environ["CACHE_PORT"])
         assert kwargs["port"] != 6379
 

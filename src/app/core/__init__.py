@@ -8,6 +8,7 @@ The core never imports from `app.modules`. Importing this package reads no
 settings and opens no connection.
 """
 
+from app.core.cache import RedisDep, cached, invalidate
 from app.core.config import Settings, SettingsDep, get_settings
 from app.core.database import Base, DbSession, utcnow
 from app.core.errors import (
@@ -35,11 +36,14 @@ __all__ = [
     "Module",
     "NotFound",
     "ProblemDetail",
+    "RedisDep",
     "Settings",
     "SettingsDep",
     "Unauthorized",
+    "cached",
     "get_logger",
     "get_settings",
+    "invalidate",
     "log_unexpected_error",
     "problem_responses",
     "task",

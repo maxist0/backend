@@ -8,6 +8,7 @@ Routes receive the settings through `SettingsDep`.
 """
 
 import os
+import re
 from enum import Enum
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError
@@ -32,6 +33,8 @@ _MIN_JWT_SECRET_LENGTH = 32
 _DISTRIBUTION_NAME = "api"
 # PEP 440 local version: marks a build that runs without installed metadata.
 _UNKNOWN_VERSION = "0.0.0+unknown"
+# A browser `Origin` value: scheme and host with an optional port, no path.
+_ORIGIN = re.compile(r"https?://[^/\s]+")
 
 
 def _installed_version() -> str:
@@ -112,9 +115,6 @@ class Settings(BaseSettings):
     CACHE_DB: int = 0
     CACHE_PASSWORD: str | None = None
     CACHE_MAX_CONNECTIONS: int = 10
-    ROUTE_CACHE_ENABLED: bool = True
-    ROUTE_CACHE_TTL: str = "2m"
-    ROUTE_CACHE_TIME_CONDITION: str = "50ms"
 
     # Taskiq (DB 1 = broker queue, DB 2 = result backend, keeps app cache on DB 0)
     TASKIQ_BROKER_URL: str = "redis://localhost:6379/1"
@@ -140,17 +140,16 @@ class Settings(BaseSettings):
     # ARGON2_MEMORY_KIB of RAM); further requests wait for a free slot.
     PASSWORD_HASH_CONCURRENCY: int = Field(default=4, ge=1)
 
-    # Logging
+    # Login lockout: this many failed password logins lock the account for
+    # LOGIN_LOCKOUT_SECONDS. NIST SP 800-63B-4 (3.2.2) allows at most 100
+    # consecutive failures; a lock longer than a day hands anyone who knows a
+    # username a long denial of service.
+    LOGIN_MAX_ATTEMPTS: int = Field(default=5, ge=1, le=100)
+    LOGIN_LOCKOUT_SECONDS: int = Field(default=900, ge=1, le=86_400)
+
+    # Logging (stdout only)
     LOG_LEVEL: str = "INFO"
-
-    # Access Logging
     ACCESS_LOG_ENABLED: bool = True
-
-    # OTLP log export (Grafana Alloy / OpenTelemetry Collector)
-    OTLP_LOGS_ENABLED: bool = False
-    OTLP_ENDPOINT: str = "http://localhost:4318"  # base URL (no path)
-    OTLP_SERVICE_NAME: str = "api"
-    OTLP_HEADERS: str = ""  # comma-separated key=value pairs
 
     # Mail Server
     MAIL_USERNAME: str | None = None
@@ -166,11 +165,12 @@ class Settings(BaseSettings):
     ADMIN_PASSWORD: SecretStr = SecretStr(_DEFAULT_ADMIN_PASSWORD)
     ADMIN_SECRET_KEY: SecretStr = SecretStr(_DEFAULT_ADMIN_SECRET_KEY)
 
-    # Metrics
+    # Metrics and health
     METRICS_ENABLED: bool = True
+    # Per dependency check of `GET /health/ready`.
+    READINESS_TIMEOUT_SECONDS: float = Field(default=2.0, gt=0, le=30)
 
     # App
-    DEBUG: bool = False
     APP_NAME: str = "api"
     APP_DESCRIPTION: str = "API Description"
     APP_VERSION: str = Field(default_factory=_installed_version)
@@ -182,9 +182,17 @@ class Settings(BaseSettings):
         "http://localhost:3000"  # used for email links; override in production
     )
 
+    # Browser origins allowed to call the API with credentials (CORS). A JSON
+    # list in the environment: CORS_ORIGINS='["https://app.example.com"]'.
+    CORS_ORIGINS: list[str] = ["http://localhost:5173"]
+
     # Server
     HOST: str = "0.0.0.0"
     PORT: int = 8000
+    # Proxy addresses whose X-Forwarded-For/-Proto uvicorn trusts for the
+    # client address and scheme (comma-separated). Set it to the reverse
+    # proxy's addresses, otherwise every client IP is the proxy's.
+    FORWARDED_ALLOW_IPS: str = "127.0.0.1"
 
     @property
     def is_development(self) -> bool:
@@ -207,6 +215,27 @@ class Settings(BaseSettings):
     @classmethod
     def _normalize_database_url(cls, value: str) -> str:
         return normalize_database_url(value)
+
+    @field_validator("CORS_ORIGINS")
+    @classmethod
+    def _require_explicit_origins(cls, origins: list[str]) -> list[str]:
+        """Refuse `*` and anything that is not an origin, in every environment.
+
+        Credentials are allowed, and with `*` Starlette answers every origin
+        with credentials, so any website could call the API as the user.
+        """
+        for origin in origins:
+            if origin == "*":
+                raise ValueError(
+                    "CORS_ORIGINS must not contain '*': credentials are allowed, "
+                    "so list the allowed origins explicitly."
+                )
+            if not _ORIGIN.fullmatch(origin):
+                raise ValueError(
+                    f"CORS_ORIGINS entry {origin!r} is not an origin "
+                    "(scheme://host[:port], no path or trailing slash)."
+                )
+        return origins
 
     @model_validator(mode="after")
     def _refuse_insecure_defaults(self) -> Self:

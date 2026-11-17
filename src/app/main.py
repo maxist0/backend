@@ -1,38 +1,25 @@
 """Application factory and ASGI entrypoint (composition root of the API).
 
-`create_app(settings)` assembles the FastAPI app (middleware, the routers of
-every module in `MODULES` under `API_PREFIX`, the problem-details error
-handlers, optional admin) without any I/O. The lifespan opens the resources (logging, metrics, DB engine, Redis,
-route cache, taskiq broker) and closes them again, also when startup fails
-half-way. `app = create_app()` is the entrypoint for uvicorn, `fastapi run`
+`create_app(settings)` assembles the FastAPI app (middleware, the health
+and metrics routes, the routers of every module in `MODULES` under
+`API_PREFIX`, the problem-details error handlers, optional admin) without
+any I/O. The lifespan opens the resources (logging, DB engine, Redis, cache,
+taskiq broker) and closes them again, also when startup fails half-way. `app = create_app()` is the entrypoint for uvicorn, `fastapi run`
 and `run.py`; importing this module requires `ENVIRONMENT` to be set.
 """
 
 import os
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
-from datetime import datetime
 
-from cashews import cache
-from cashews.contrib.fastapi import (
-    CacheEtagMiddleware,
-    CacheRequestControlMiddleware,
-    cache_control_ttl,
-)
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from taskiq import async_shared_broker
 
 from app.core.admin import create_admin
-from app.core.cache import (
-    close_cache_pool,
-    close_route_cache,
-    init_cache_pool,
-    init_route_cache,
-)
+from app.core.cache import close_cache, close_redis, open_redis, setup_cache
 from app.core.config import Settings, get_settings
 from app.core.database import (
     build_engine,
@@ -42,15 +29,9 @@ from app.core.database import (
     init_db,
 )
 from app.core.errors import register_error_handlers
+from app.core.health import METRICS_PATH, include_health_routes
 from app.core.logging import get_logger, setup_logging
-from app.core.metrics import init_metrics
-from app.core.metrics import router as metrics_router
-from app.core.middleware import (
-    AccessLogMiddleware,
-    MetaDataMiddleware,
-    MetricsMiddleware,
-    SecurityHeadersMiddleware,
-)
+from app.core.middleware import RequestMiddleware
 from app.core.tasks import build_broker
 from app.modules import MODULES
 
@@ -76,12 +57,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     session_factory: async_sessionmaker[AsyncSession] = app.state.session_factory
 
     setup_logging(settings)
-    init_metrics(
-        app_name=app.title,
-        app_version=app.version,
-        environment=settings.ENVIRONMENT.value,
-    )
-    # One consolidated structured startup event.
     logger.info(
         "app.startup",
         pid=os.getpid(),
@@ -105,11 +80,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         stack.callback(_unbind_session_factory, session_factory)
         app.state.engine = engine
 
-        # Redis client and cashews route cache.
-        app.state.cache = await init_cache_pool(settings)
-        stack.push_async_callback(close_cache_pool, app.state.cache)
-        init_route_cache(settings)
-        stack.push_async_callback(close_route_cache, settings)
+        # Redis client (RedisDep) and the @cached cache on the same server.
+        app.state.redis = await open_redis(settings)
+        stack.push_async_callback(close_redis, app.state.redis)
+        setup_cache(settings)
+        stack.push_async_callback(close_cache)
 
         # Taskiq broker for enqueueing. Shared tasks (`app.core.task`) send
         # to the default broker; a later lifespan replaces it.
@@ -118,8 +93,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await broker.startup()
         async_shared_broker.default_broker(broker)
         app.state.broker = broker
-
-        app.state.start_time = datetime.now()
 
         yield
 
@@ -138,19 +111,15 @@ class RootResponse(BaseModel):
 
 
 def _add_root_route(app: FastAPI, settings: Settings) -> None:
-    """Register `GET /` (needs the settings for its cache TTL)."""
+    """Register `GET /`, which lists the entry points for these settings."""
 
     @app.get("/", summary="API entry points")
-    @cache(
-        ttl=cache_control_ttl(default=settings.ROUTE_CACHE_TTL),
-        key="route:root",
-    )
     async def root() -> RootResponse:
         """List the entry points of the API."""
         return RootResponse(
             message="Welcome to the FastAPI application with JWT authentication!",
             docs_url="/docs" if not settings.is_production else None,
-            metrics_url="/metrics" if settings.METRICS_ENABLED else None,
+            metrics_url=METRICS_PATH if settings.METRICS_ENABLED else None,
             auth_url=f"{settings.API_PREFIX}/auth",
         )
 
@@ -178,12 +147,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         docs_url=None if settings.is_production else "/docs",
         redoc_url=None if settings.is_production else "/redoc",
         openapi_url=None if settings.is_production else "/openapi.json",
-        # FastAPI >= 0.142 emits its own OpenTelemetry spans, metrics and log
-        # records through the global providers. With OTLP_LOGS_ENABLED the
-        # logging setup installs a global logger provider, and FastAPI would
-        # then export unhandled exceptions with their message and stack trace
-        # (which can carry personal data), bypassing log_unexpected_error.
-        # Off until the observability redesign decides.
+        # FastAPI >= 0.142 emits OpenTelemetry spans, metrics and log records
+        # once a global provider exists; its log records carry exception
+        # messages and stack traces (personal data), bypassing
+        # log_unexpected_error. Off until tracing is decided.
         telemetry={"tracing": False, "metrics": False, "logs": False},
     )
     app.state.settings = settings
@@ -198,30 +165,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     register_error_handlers(app)
 
-    # Middleware (order unchanged: the last added runs first)
-    app.add_middleware(MetaDataMiddleware)
+    # The last middleware added runs first. CORS is outside the request
+    # middleware so the 500 that the request middleware renders still gets
+    # the CORS headers; Starlette's ServerErrorMiddleware wraps both.
+    app.add_middleware(
+        RequestMiddleware,
+        api_prefix=settings.API_PREFIX,
+        access_log=settings.ACCESS_LOG_ENABLED,
+        metrics=settings.METRICS_ENABLED,
+    )
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://localhost:5173"],  # List your specific frontend URLs
+        allow_origins=settings.CORS_ORIGINS,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
     )
-    if settings.ROUTE_CACHE_ENABLED:
-        app.add_middleware(CacheEtagMiddleware)
-        app.add_middleware(CacheRequestControlMiddleware)
-    # GZip compression for responses larger than 1KB
-    app.add_middleware(GZipMiddleware, minimum_size=1000)
-    app.add_middleware(SecurityHeadersMiddleware)
-    # Metrics middleware (before other middleware for accurate timing)
-    if settings.METRICS_ENABLED:
-        app.add_middleware(MetricsMiddleware)
-    if settings.ACCESS_LOG_ENABLED:
-        app.add_middleware(AccessLogMiddleware)
 
-    # Routers
-    if settings.METRICS_ENABLED:
-        app.include_router(metrics_router, prefix="/metrics", tags=["monitoring"])
+    include_health_routes(app, settings)
     for module in MODULES:
         app.include_router(module.router, prefix=settings.API_PREFIX)
     _add_root_route(app, settings)

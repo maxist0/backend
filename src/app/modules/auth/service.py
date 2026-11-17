@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from typing import NoReturn
 
 from fastapi import Request
+from prometheus_client import Counter
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import set_committed_value
@@ -59,9 +60,22 @@ from app.modules.users.models import lock_is_active
 
 logger = get_logger(__name__)
 
-# Login lockout: this many failed attempts lock the account for the window.
-MAXIMUM_LOGIN_ATTEMPTS = 5
-LOGIN_ATTEMPT_WINDOW_SECONDS = 900  # 15 minutes
+LOGIN_FAILURES = Counter(
+    "auth_login_failures_total",
+    "Refused password logins by reason.",
+    ["reason"],
+)
+LOGIN_FAILURE_REASONS = ("invalid_password", "unknown_user", "locked", "inactive")
+for _reason in LOGIN_FAILURE_REASONS:
+    # Export every reason from the start, so rate() sees the first failure.
+    LOGIN_FAILURES.labels(reason=_reason)
+LOCKOUTS = Counter(
+    "auth_lockouts_total", "Accounts locked by too many failed password logins."
+)
+REFRESH_TOKEN_REUSE = Counter(
+    "auth_refresh_token_reuse_total",
+    "Rotated refresh tokens presented again; each revoked its session family.",
+)
 
 # Header values are client-controlled; cut them to the column sizes in
 # models.py (sessions, auth_audit_log) before storing them.
@@ -182,7 +196,8 @@ async def _record_locked_login(
     locked_until: datetime | None,
     request: Request | None,
 ) -> None:
-    """Audit and log a login attempt on a locked account."""
+    """Audit, log and count a login attempt on a locked account."""
+    LOGIN_FAILURES.labels(reason="locked").inc()
     remaining = (
         max(int((locked_until - utcnow()).total_seconds()), 0)
         if locked_until is not None
@@ -232,9 +247,11 @@ async def authenticate_user(
     path is a conditional UPDATE that refuses if a lock was committed while
     the password was being verified.
     """
+    settings = get_settings()
     user = await users_crud.get_user_by_username(db, username)
     if user is None:
         await equalize_password_timing(password)
+        LOGIN_FAILURES.labels(reason="unknown_user").inc()
         logger.warning("auth.login_attempt_unknown_user")
         raise InvalidCredentialsError()
 
@@ -261,6 +278,7 @@ async def authenticate_user(
 
     if not user.is_active:
         await equalize_password_timing(password)
+        LOGIN_FAILURES.labels(reason="inactive").inc()
         logger.warning("auth.login_attempt_inactive_account", user_id=str(user.id))
         raise InvalidCredentialsError()
 
@@ -270,6 +288,7 @@ async def authenticate_user(
         # locked the account (fresh read, not the cached User).
         lock_state = await crud.get_lock_state(db, user.id)
         if lock_state is None:
+            LOGIN_FAILURES.labels(reason="unknown_user").inc()
             raise InvalidCredentialsError()
         if lock_is_active(*lock_state):
             await _record_locked_login(db, user.id, lock_state[1], request)
@@ -287,7 +306,10 @@ async def authenticate_user(
                 # Atomic increment + lock in the database (no lost update),
                 # committed before the admission slot is released.
                 failure = await crud.register_failed_login(
-                    db, user.id, MAXIMUM_LOGIN_ATTEMPTS, LOGIN_ATTEMPT_WINDOW_SECONDS
+                    db,
+                    user.id,
+                    settings.LOGIN_MAX_ATTEMPTS,
+                    settings.LOGIN_LOCKOUT_SECONDS,
                 ) or (0, False, None)
 
     if locked_meanwhile:
@@ -296,10 +318,12 @@ async def authenticate_user(
 
     if failure is not None or credential is None:
         attempts, is_locked, _locked_until = failure or (0, False, None)
+        LOGIN_FAILURES.labels(reason="invalid_password").inc()
         logger.warning("auth.login_failed", user_id=str(user.id), attempts=attempts)
         if is_locked:
             # Exactly one request reaches the threshold; it records the lock.
-            if attempts == MAXIMUM_LOGIN_ATTEMPTS:
+            if attempts == settings.LOGIN_MAX_ATTEMPTS:
+                LOCKOUTS.inc()
                 await _audit(
                     db,
                     AuditEventType.ACCOUNT_LOCKED,
@@ -437,6 +461,7 @@ async def refresh_session(
         if sess is not None and sess.is_revoked and sess.revoke_reason == "rotated":
             # A token that was already rotated is presented again: theft signal
             # (RFC 9700 section 4.14.2). Revoke the entire family.
+            REFRESH_TOKEN_REUSE.inc()
             logger.warning(
                 "auth.token_reuse_detected",
                 family_id=str(sess.family_id),

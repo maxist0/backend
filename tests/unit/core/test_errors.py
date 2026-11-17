@@ -2,9 +2,12 @@
 every handler path through the real middleware stack (no Docker: the probe
 routes touch neither the database nor Redis)."""
 
+import logging
+
 import pytest
 import structlog
 from fastapi import APIRouter, Header, Query
+from prometheus_client import REGISTRY
 from pydantic import BaseModel
 
 import app.main as main
@@ -63,7 +66,7 @@ def _probe_router() -> APIRouter:
 
 @pytest.fixture
 def probe_client(settings_factory):
-    app = main.create_app(settings_factory(ROUTE_CACHE_ENABLED=False))
+    app = main.create_app(settings_factory())
     app.include_router(_probe_router())
     return new_test_client(app, raise_server_exceptions=False)
 
@@ -262,15 +265,40 @@ class TestHandlers:
         _assert_problem(r, 401, "unauthorized")
         assert r.headers["www-authenticate"] == "Bearer"
 
-    def test_unexpected_error_is_a_generic_500(self, probe_client, caplog):
+    def test_unexpected_error_is_a_generic_500(self, probe_client):
         r = probe_client.get("/probe/crash", headers={"X-Request-ID": "crash-1"})
 
         body = _assert_problem(r, 500, "internal_error")
         assert body["detail"] == "An unexpected error occurred."
         assert _SECRET not in r.text
         assert "_LeakyError" not in r.text
-        # Known limitation: Starlette renders this in ServerErrorMiddleware,
-        # outside the user middleware, which binds the request id in a child
-        # task. Header and body member are both absent, never invented.
-        assert "x-request-id" not in r.headers
-        assert "request_id" not in body
+
+    def test_500_carries_request_id_headers_cors_metrics_and_access_log(
+        self, probe_client, caplog
+    ):
+        """The request middleware renders the 500 inside CORS, so it gets the
+        same treatment as every other response."""
+        labels = {"method": "GET", "route": "/probe/crash", "status": "500"}
+        before = REGISTRY.get_sample_value("http_requests_total", labels) or 0
+        caplog.set_level(logging.INFO)
+
+        r = probe_client.get(
+            "/probe/crash",
+            headers={"X-Request-ID": "crash-2", "Origin": "http://localhost:5173"},
+        )
+
+        body = _assert_problem(r, 500, "internal_error")
+        assert r.headers["x-request-id"] == "crash-2"
+        assert body["request_id"] == "crash-2"
+        assert r.headers["x-content-type-options"] == "nosniff"
+        assert r.headers["x-frame-options"] == "DENY"
+        assert r.headers["access-control-allow-origin"] == "http://localhost:5173"
+        assert r.headers["access-control-allow-credentials"] == "true"
+        assert REGISTRY.get_sample_value("http_requests_total", labels) == before + 1
+        events = [r.msg for r in caplog.records if isinstance(r.msg, dict)]
+        [unexpected] = [e for e in events if e["event"] == "app.unhandled_exception"]
+        assert unexpected["error_type"] == "_LeakyError"
+        assert unexpected["request_id"] == "crash-2"
+        [access] = [e for e in events if e["event"] == "http.access"]
+        assert (access["status"], access["route"]) == (500, "/probe/crash")
+        assert access["request_id"] == "crash-2"

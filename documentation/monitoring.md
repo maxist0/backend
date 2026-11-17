@@ -1,6 +1,6 @@
 # Monitoring and Observability
 
-> **Status (2026-11-16):** this page is partly stale; the metric names and labels in the examples below (`path`, `db_query_total`, `cache_*`, `auth_*`) do not match the code. The metrics that exist are listed in [README.md → Observability](../README.md#observability) and defined in `src/common/metrics.py`. Verified corrections: the label for the request path is `endpoint` (not `path`), and its value is the route template or `unmatched`; the `active_refresh_tokens` gauge was removed; logs no longer contain usernames, emails or query strings.
+> **Status (2026-11-16):** this page is partly stale; the metric names and labels in the examples below (`path`, `db_query_total`, `cache_*`, `auth_*`) do not match the code. The metrics that exist are listed in [README.md → Observability](../README.md#observability) and defined in `src/app/core/middleware.py`, `src/app/core/health.py` and `src/app/modules/auth/service.py`. Verified corrections (2026-11-17): the endpoint is `GET /metrics`; the label for the request path is `route` (not `path`), and its value is the route template or `unmatched`; the status label is `status`; the `active_refresh_tokens` gauge was removed; logs no longer contain usernames, emails or query strings.
 
 ## Overview
 

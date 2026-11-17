@@ -1,9 +1,11 @@
 """Errors: the `AppError` family, RFC 9457 handlers and database error inspection.
 
 Services raise `AppError` subclasses; `register_error_handlers` turns them,
-request validation errors, Starlette `HTTPException`s and unexpected
-exceptions into `application/problem+json` responses (RFC 9457) with a
-stable machine-readable `code` and the request id.
+request validation errors and Starlette `HTTPException`s into
+`application/problem+json` responses (RFC 9457) with a stable
+machine-readable `code` and the request id. Unexpected exceptions are
+rendered by the request middleware with `internal_error_response`, so the
+500 carries the same headers as every other response.
 
 PostgreSQL error text can contain row values (`DETAIL: Key (email)=(...)`),
 which are personal data. Code that reacts to a database error or logs one
@@ -282,17 +284,18 @@ async def _http_exception_handler(
     )
 
 
-async def _unexpected_error_handler(request: Request, exc: Exception) -> Response:
-    # Starlette runs this handler in ServerErrorMiddleware, outside the user
-    # middleware. The request middleware binds the request id in a child task
-    # (BaseHTTPMiddleware), so neither the X-Request-ID header nor `request_id`
-    # is available here; the response omits both.
-    log_unexpected_error(logger, "app.unhandled_exception", exc)
+def internal_error_response() -> JSONResponse:
+    """Render the generic 500 problem; it never contains exception details."""
     return problem_response(500, "internal_error", _INTERNAL_ERROR_DETAIL)
 
 
 def register_error_handlers(app: FastAPI) -> None:
     """Install the problem-details handlers and the `ProblemDetail` schema.
+
+    No handler is registered for `Exception`: Starlette would run it in
+    `ServerErrorMiddleware`, outside the user middleware, so the 500 would
+    miss the request id and the security headers. The request middleware
+    renders it instead.
 
     Routes reference `#/components/schemas/ProblemDetail` through
     `problem_responses`; FastAPI adds only schemas that a route uses as a
@@ -303,7 +306,6 @@ def register_error_handlers(app: FastAPI) -> None:
     app.exception_handler(AppError)(_app_error_handler)
     app.exception_handler(RequestValidationError)(_validation_error_handler)
     app.exception_handler(StarletteHTTPException)(_http_exception_handler)
-    app.exception_handler(Exception)(_unexpected_error_handler)
 
     generate_openapi = app.openapi
 

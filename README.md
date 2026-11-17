@@ -35,9 +35,9 @@ Contributor and AI-agent conventions live in [AGENTS.md](AGENTS.md). Read it bef
 | Users | `GET` and `PATCH /api/v1/users/me` (profile), `PUT /api/v1/users/me/password`, `PUT /api/v1/users/me/email` (pending change, completed by `POST /api/v1/auth/email/verify`) |
 | API contract | Everything under `/api/v1`, plain typed responses, RFC 9457 `application/problem+json` errors with a stable `code` ([ADR 0002](documentation/adr/0002-rfc9457-errors-plain-responses-api-v1.md), frontend view: [backend-contract.md](../frontend/documentation/backend-contract.md)) |
 | Data | PostgreSQL, Alembic migrations, UUID primary keys, timezone-aware timestamps |
-| Caching | Redis via `cashews` route cache with ETag and Cache-Control middleware |
+| Caching | `@cached(ttl, key)` and `invalidate(pattern)` on Redis (`cashews`, JSON values), `RedisDep` for direct Redis access |
 | Background jobs | `taskiq` with Redis broker, result backend, cron scheduler, transactional email tasks |
-| Observability | `structlog` JSON logs with request IDs, Prometheus metrics, optional OTLP log export, Grafana/Loki/Tempo/Alloy stack |
+| Observability | `structlog` JSON logs on stdout with request IDs, Prometheus metrics at `/metrics`, `/health` and `/health/ready`, Grafana/Loki/Tempo/Alloy stack |
 | Admin | `sqladmin` panel at `/admin` (users, credentials, sessions, tokens, audit log); opt-in outside `dev` via `ADMIN_ENABLED` |
 | Testing | pytest integration suite against real Postgres and Redis via Testcontainers |
 | Packaging | `uv` lockfile, multi-stage Dockerfile, non-root container, Docker Swarm stack with Traefik |
@@ -95,8 +95,9 @@ The dev launcher also starts a `taskiq` worker as a child process so emails and 
 |---|---|
 | http://localhost:8000/docs | Swagger UI (disabled in `prod`) |
 | http://localhost:8000/redoc | ReDoc |
-| http://localhost:8000/metrics/ | Prometheus metrics |
-| http://localhost:8000/metrics/health | Health check |
+| http://localhost:8000/metrics | Prometheus metrics |
+| http://localhost:8000/health | Liveness check |
+| http://localhost:8000/health/ready | Readiness check (PostgreSQL and Redis) |
 | http://localhost:8000/admin | Admin panel (mounted by default only in `dev`; `admin` / `admin` by default, change it) |
 
 ### 5. Verify
@@ -130,19 +131,18 @@ backend/
 │   ├── api/                   # Feature modules (one folder per bounded context)
 │   │   ├── auth/              # router, service, crud, models, schemas, dependencies, exceptions
 │   │   ├── user/              # profile endpoints (re-uses auth models)
-│   │   ├── metrics/           # /metrics and /metrics/health
 │   │   └── exampleRoute/      # empty template module (to be replaced, see Roadmap)
 │   ├── common/                # Cross-cutting infrastructure
 │   │   ├── config.py          # pydantic-settings Settings, environments
 │   │   ├── database.py        # async engine, session factory, get_db
 │   │   ├── dependencies.py    # DbSession = Annotated[AsyncSession, Depends(get_db)]
-│   │   ├── cache.py           # Redis pool + cashews setup
+│   │   ├── cache.py           # Redis client (RedisDep), @cached and invalidate
 │   │   ├── taskiq.py          # broker, scheduler, task registration
 │   │   ├── mail.py            # fastapi-mail configuration
-│   │   ├── logging.py         # structlog + stdlib bridge + OTLP handler, log_unexpected_error
+│   │   ├── logging.py         # structlog + stdlib bridge, stdout only
 │   │   ├── db_errors.py       # constraint_name, sqlstate, find_db_error for DB errors
-│   │   ├── middleware.py      # access log, metrics (bounded method label), security headers, request id
-│   │   ├── metrics.py         # Prometheus registry and collectors
+│   │   ├── middleware.py      # one ASGI middleware: request id, access log, HTTP metrics, security headers
+│   │   ├── health.py          # /health, /health/ready, /metrics
 │   │   ├── responses.py       # response envelope helpers
 │   │   ├── schemas.py         # envelope models, ErrorCode enum
 │   │   ├── exceptions.py      # global exception handlers
@@ -184,24 +184,20 @@ backend/
      │  tokens,   │      │ db2 results│
      │  audit)    │      └────────────┘
      └────────────┘
-           │ metrics /metrics, logs stdout (JSON) or OTLP
+           │ metrics /metrics, logs stdout (JSON)
            ▼
      Prometheus ── Grafana ── Loki ── Tempo ── Alloy (OTLP receiver)
 ```
 
 ### Request lifecycle
 
-Middleware is applied in `src/main.py`; the last one added runs first. Effective order for a request:
+Middleware is applied in `src/app/main.py`; the last one added runs first. Effective order for a request:
 
-1. `AccessLogMiddleware` captures client IP, method, path, duration and emits one `http.access` event.
-2. `MetricsMiddleware` records `http_requests_total`, duration and size histograms, active connections.
-3. `SecurityHeadersMiddleware` sets `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, `Permissions-Policy`.
-4. `GZipMiddleware` compresses responses above 1 KB.
-5. `CacheRequestControlMiddleware` and `CacheEtagMiddleware` (cashews) honour `Cache-Control` and `If-None-Match` when `ROUTE_CACHE_ENABLED`.
-6. `CORSMiddleware` (FastAPI built-in).
-7. `MetaDataMiddleware` binds a `request_id` into `structlog` context and returns it as `X-Request-ID` with `X-Process-Time`.
-8. Router → dependencies (`DbSession`, `get_current_user`) → handler → service → crud.
-9. Exception handlers translate `AppError`, `RequestValidationError`, Starlette `HTTPException` and unhandled `Exception` into RFC 9457 problem responses (see [Error handling](#error-handling)).
+1. Starlette's `ServerErrorMiddleware` (last-resort 500 for a failure in the middleware itself).
+2. `CORSMiddleware` with `CORS_ORIGINS` from `Settings`. It answers CORS preflights itself, so preflights skip the next step.
+3. `RequestMiddleware` (`src/app/core/middleware.py`, pure ASGI): validates or generates the request id, binds it to the `structlog` context and returns it as `X-Request-ID`; sets `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, `Permissions-Policy` and, under `API_PREFIX`, `Cache-Control: no-store` unless the route set one; records `http_requests_total` and `http_request_duration_seconds`; emits one `http.access` event. An unhandled exception is logged with `log_unexpected_error` and answered here with the generic 500 problem, so the 500 carries the same headers.
+4. Router → dependencies (`DbSession`, `CurrentUser`) → handler → service → crud.
+5. Exception handlers translate `AppError`, `RequestValidationError` and Starlette `HTTPException` into RFC 9457 problem responses (see [Error handling](#error-handling)).
 
 ### Module pattern
 
@@ -226,8 +222,8 @@ The dependency arrow points inward: `router → service → crud → models`. Ro
 | Value | Docs | Log format | `.env.local` | Notes |
 |---|---|---|---|---|
 | `dev` | on | coloured console | read | taskiq worker auto-started by `app.py` |
-| `unittest` | on | console | ignored | used by `tests/conftest.py` |
-| `test`, `stage` | on | console | ignored | runtime injects variables |
+| `unittest` | on | JSON | ignored | used by `tests/conftest.py` |
+| `test`, `stage` | on | JSON | ignored | runtime injects variables |
 | `prod` | off | JSON | ignored | admin panel mounted only with `ADMIN_ENABLED=true`; startup guard active |
 
 ### Authentication design
@@ -258,8 +254,8 @@ Access tokens are stateless and remain valid until expiry (up to 15 minutes), wi
 
 | | Timed lock | Admin lock |
 |---|---|---|
-| Set by | `MAXIMUM_LOGIN_ATTEMPTS` (5) failed logins within the window | admin panel action "Lock selected" |
-| `users` columns | `is_locked`, `locked_until` set (`LOGIN_ATTEMPT_WINDOW_SECONDS`, 900 s) | `is_locked`, `locked_until` NULL (indefinite) |
+| Set by | `LOGIN_MAX_ATTEMPTS` (5) consecutive failed logins | admin panel action "Lock selected" |
+| `users` columns | `is_locked`, `locked_until` set (`LOGIN_LOCKOUT_SECONDS`, 900 s) | `is_locked`, `locked_until` NULL (indefinite) |
 | Password login | blocked | blocked |
 | Existing sessions, access tokens, refresh | stay valid | access tokens get 401 at once; refresh is denied and the family revoked |
 | Sessions | untouched | all revoked by the admin action |
@@ -287,13 +283,14 @@ All primary keys are UUIDv4 generated in the application. Timestamps are `timest
 
 ### Caching and background work
 
-- **Route cache:** `@cache(ttl=cache_control_ttl(default=settings.ROUTE_CACHE_TTL), key=...)` from `cashews` on idempotent GET routes. ETag and `Cache-Control` request directives are honoured by the two cashews middlewares.
+- **Cache:** `@cached(ttl, key)` and `invalidate(pattern)` from `app.core` cache return values of service functions in Redis ([ADR 0003](documentation/adr/0003-caching-via-cached-decorator.md)). Values are stored as JSON, never pickled, so a value in Redis cannot run code in the app. There is no HTTP response cache.
 - **Jobs:** `taskiq` `ListQueueBroker` on Redis db 1, results in db 2. Tasks are declared with `@broker.task(...)` in `src/utils/`; the scheduler reads `schedule=[{"cron": ...}]` labels. Workers and scheduler are separate Swarm services.
 
 ### Observability
 
-- **Logs:** `structlog` with contextvars. Every request has `request_id`; authenticated requests add `user_id` only. Logs contain no usernames, emails, query strings, `Referer` or token prefixes, and the database password is masked. Dev renders coloured console output, `prod` renders JSON lines to stdout. Optional OTLP/HTTP export of the same records to Grafana Alloy (`OTLP_LOGS_ENABLED`).
-- **Metrics:** custom Prometheus registry exposed at `GET /metrics/`: `http_requests_total`, `http_request_duration_seconds`, request and response size histograms, `active_connections`, `database_operations_total`, `database_operation_duration_seconds`, `api_errors_total`, `application_info`. The `endpoint` label is the route template (for example `/user/{id}`) or `unmatched`, so arbitrary paths cannot create label values. The `active_refresh_tokens` gauge was removed.
+- **Logs:** `structlog` with contextvars. Every request has `request_id`; authenticated requests add `user_id` only. Logs contain no usernames, emails, query strings, `Referer` or token prefixes, and the database password is masked. `dev` renders coloured console output, every other environment JSON lines; everything goes to stdout and a collector reads the container output ([ADR 0004](documentation/adr/0004-logging-stdout-only.md)). `http.access` carries `request_id`, method, path without query string, route template, status, duration and client IP (from the ASGI scope).
+- **Metrics:** prometheus_client's default registry (with the process and GC collectors) at `GET /metrics`: `http_requests_total{method,route,status}`, `http_request_duration_seconds{method,route}` (5 ms to 10 s buckets), `app_info{name,version,environment}`, and the auth counters `auth_login_failures_total{reason}`, `auth_lockouts_total`, `auth_refresh_token_reuse_total`. The `route` label is the route template (for example `/api/v1/users/me`) or `unmatched`, so arbitrary paths cannot create label values; `/metrics` itself is not counted. One process per container is assumed; several uvicorn workers in one container would need prometheus_client's multiprocess mode.
+- **Health:** `GET /health` (liveness, no I/O) and `GET /health/ready` (PostgreSQL `SELECT 1` and Redis `PING`, each bounded by `READINESS_TIMEOUT_SECONDS`; 503 with the failed check, never error text).
 - **Traces:** not yet wired (Tempo is deployed, the application does not emit spans; see Roadmap Phase 3).
 
 ### Error handling
@@ -334,9 +331,9 @@ Success responses are plain typed models without an envelope. Errors are RFC 945
 | Migrations | Alembic with async `env.py`, run as a separate step before rollout | never migrate at import time; CI can run `alembic check` | app-startup migrations |
 | Primary keys | UUID generated client-side | safe to expose, mergeable across environments | bigint identity (planned evaluation of UUIDv7, Postgres 18) |
 | Background jobs | `taskiq` + Redis | async-native, FastAPI dependency integration, cron via labels | Celery (no async tasks), arq (maintenance only) |
-| Route cache | `cashews` | maintained, ETag and Cache-Control middlewares included | fastapi-cache2 (dormant since 2024) |
+| Cache | `cashews` behind `@cached`/`invalidate`, JSON values | maintained; caches return values, not responses | fastapi-cache2 (dormant since 2024), route cache with ETag middleware (removed) |
 | Logging | `structlog` over stdlib, JSON in prod | third-party loggers are captured by the stdlib bridge; machine-readable | loguru, stdlib only |
-| Metrics | `prometheus_client` with own registry | pull model, Grafana-native | push to OTLP only |
+| Metrics | `prometheus_client` default registry | pull model, Grafana-native, process and GC metrics included | push to OTLP only |
 | Email | `fastapi-mail` + Jinja2 templates, sent from tasks | never block a request on SMTP | synchronous send in handler |
 | Admin | `sqladmin` | zero-code CRUD for support staff | custom admin, none |
 | Testing | integration tests against real Postgres and Redis (Testcontainers) | catches SQL, migration and cookie behaviour that mocks hide | mocked repositories |
@@ -364,7 +361,8 @@ Implemented:
 - Startup guard outside `dev` and `unittest`: `JWT_SECRET_KEY` must not be the default and must be at least 32 characters; admin secrets are checked only when the admin panel is enabled
 - Admin panel opt-in (`ADMIN_ENABLED`, default on only in `dev`), actions use `?pks=`, fixed redirect, constant-time credential comparison
 - Logs without usernames, emails, query strings, `Referer` or token prefixes; database password masked in logs; SQLAlchemy engine uses `hide_parameters`
-- Security headers, GZip, request-id correlation
+- Security headers on every response, the 500 included (`X-Content-Type-Options`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, `Permissions-Policy`), `Cache-Control: no-store` under `API_PREFIX`; validated request id; client IP only from the ASGI scope, with uvicorn's proxy headers trusted only from `FORWARDED_ALLOW_IPS`
+- CORS origins from `CORS_ORIGINS`; `*` is refused because credentials are allowed
 - OpenAPI docs disabled in `prod`
 - Non-root container user, multi-stage image
 - Security upgrades of dependencies (starlette 1.10, python-multipart 0.0.33, pyjwt 2.15.1, sqladmin 0.32, aiosmtplib 5.1.3, cryptography 50, certifi, pydantic-settings 2.16, idna) and transitive security floors in `[tool.uv] constraint-dependencies`
@@ -374,8 +372,7 @@ Not yet implemented (tracked in the [Roadmap](#roadmap) and the [review backlog]
 - `Secure` flag and `__Host-` prefix on the refresh cookie
 - Rate limiting (per IP and per account), request body size limit, request timeout
 - JWT `iss` and `aud` claims
-- HSTS, `Cache-Control: no-store`, CSP `frame-ancestors 'none'`; removal of the obsolete `X-XSS-Protection`
-- Trusted-proxy handling for `X-Forwarded-For`
+- HSTS (owned by the TLS-terminating proxy), CSP `frame-ancestors 'none'`
 - Authentication on `/metrics`
 - Hashing or dropping client IPs in logs (IPs are still logged)
 - Dependency and image scanning, SBOM, signed images
@@ -391,21 +388,23 @@ All settings are environment variables read by `Settings` (`src/common/config.py
 | `ENVIRONMENT` | `dev` | `dev`, `unittest`, `test`, `stage`, `prod` |
 | `DATABASE_URL` | `postgresql+asyncpg://postgres:postgres@localhost:5432/api` | asyncpg driver required at runtime |
 | `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` | `10` / `20` | per process |
-| `CACHE_HOST` / `CACHE_PORT` / `CACHE_DB` / `CACHE_PASSWORD` | `localhost` / `6379` / `0` / empty | Redis for the route cache (refresh tokens are not stored in Redis) |
-| `ROUTE_CACHE_ENABLED` / `ROUTE_CACHE_TTL` | `true` / `2m` | cashews |
+| `CACHE_HOST` / `CACHE_PORT` / `CACHE_DB` / `CACHE_PASSWORD` | `localhost` / `6379` / `0` / empty | Redis for `RedisDep` and `@cached` (refresh tokens are not stored in Redis) |
 | `TASKIQ_BROKER_URL` / `TASKIQ_RESULT_BACKEND_URL` | Redis db 1 / db 2 | |
 | `JWT_SECRET_KEY` | placeholder | **Secret.** Startup guard outside `dev`/`unittest`: must not be the default and must be at least 32 characters. Use a 256-bit random value. The JWT algorithm is HS256, pinned in code |
 | `ACCESS_TOKEN_EXPIRE_MINUTES` / `REFRESH_TOKEN_EXPIRE_DAYS` | `15` / `30` | |
 | `ADMIN_ENABLED` | unset | Unset means enabled only in `dev`. Set `true` to mount the admin panel elsewhere; the Swarm stack sets `false` |
 | `ADMIN_USERNAME` / `ADMIN_PASSWORD` / `ADMIN_SECRET_KEY` | `admin` / `admin` / placeholder | **Secrets** (`ADMIN_PASSWORD`, `ADMIN_SECRET_KEY`). The startup guard rejects the defaults outside `dev`/`unittest`, but only when the admin panel is enabled |
 | `ARGON2_TIME_COST` / `ARGON2_MEMORY_KIB` / `ARGON2_PARALLELISM` | `3` / `65536` / `4` | Argon2id parameters. Minimums `≥2` / `≥19456` / `≥1` (OWASP minimum), validated in every environment; lower values stop startup |
+| `LOGIN_MAX_ATTEMPTS` / `LOGIN_LOCKOUT_SECONDS` | `5` / `900` | Consecutive failed password logins that set a timed lock, and its length. Bounds `1..100` (NIST SP 800-63B-4 3.2.2) / `1..86400` |
 | `PASSWORD_HASH_CONCURRENCY` | `4` | `≥1`, validated in every environment. Maximum concurrent Argon2 operations and concurrent login credential checks per process (the bound is N × this value with N processes); each Argon2 operation needs `ARGON2_MEMORY_KIB` of RAM |
 | `MAIL_*` | unset | mail is skipped when incomplete |
-| `LOG_LEVEL` / `ACCESS_LOG_ENABLED` / `METRICS_ENABLED` | `INFO` / `true` / `true` | |
-| `OTLP_LOGS_ENABLED` / `OTLP_ENDPOINT` | `false` / `http://localhost:4318` | Grafana Alloy |
-| `API_PREFIX` | `/api/v1` | Path prefix of every module router (the API version) and of the refresh cookie path (`<API_PREFIX>/auth`). Empty, or segments of `[A-Za-z0-9._~-]` without a trailing slash. `/`, `/metrics/` and `/metrics/health` stay unprefixed |
+| `LOG_LEVEL` / `ACCESS_LOG_ENABLED` / `METRICS_ENABLED` | `INFO` / `true` / `true` | Logs go to stdout only; `METRICS_ENABLED` mounts `/metrics` |
+| `READINESS_TIMEOUT_SECONDS` | `2` | Per check of `GET /health/ready` (`>0`, `≤30`) |
+| `API_PREFIX` | `/api/v1` | Path prefix of every module router (the API version) and of the refresh cookie path (`<API_PREFIX>/auth`). Empty, or segments of `[A-Za-z0-9._~-]` without a trailing slash. `/`, `/health`, `/health/ready` and `/metrics` stay unprefixed |
 | `FRONTEND_URL` | `http://localhost:3000` | used in email links |
+| `CORS_ORIGINS` | `["http://localhost:5173"]` | JSON list of browser origins allowed with credentials. `*` and values with a path are refused in every environment |
 | `HOST` / `PORT` | `0.0.0.0` / `8000` | |
+| `FORWARDED_ALLOW_IPS` | `127.0.0.1` | Comma-separated proxy addresses whose `X-Forwarded-For`/`-Proto` uvicorn trusts (`run.py` enables proxy headers). Set it to the reverse proxy's addresses, or every client IP is the proxy's |
 
 Secrets must never be committed. `.env` in the repository is a template with empty values; `.env.local` is git-ignored. When the startup guard fails, the application refuses to start and names the offending variables, not their values.
 
@@ -468,9 +467,9 @@ This is the original implementation plan. The re-prioritised plan from the Novem
 - [x] Complete the email-change flow: `PUT /users/me/email` creates a pending change, `POST /auth/email/verify` consumes the `CHANGE_EMAIL` token (no separate confirm endpoint), dedicated template (`confirm_email_change.html`), `EMAIL_CHANGED` audit event; confirming invalidates open password-reset tokens. The `FRONTEND_URL` in the reset link is tracked in the email-links item below (Known issue 7).
 - [ ] Rate limiting with `limits` + Redis: per IP on `/auth/*`, per account on login; return `429` with `Retry-After`. Decouple lockout from DoS by lockout-by-IP-window instead of hard account locks. Partly mitigated in Phase 0b: the timed account lock blocks only password login and leaves existing sessions valid, and a per-process admission limiter bounds login bursts; both remain no substitute for rate limits.
 - [x] Uniform credential error (`Invalid username or password`, code `invalid_credentials`) for locked, inactive and unknown accounts; the real reason is logged and audited server-side only.
-- [ ] Security headers: add HSTS (behind TLS), `Cache-Control: no-store` on authenticated responses, `Content-Security-Policy: frame-ancestors 'none'`; drop `X-XSS-Protection`.
-- [ ] Trusted proxies: run uvicorn with `--proxy-headers --forwarded-allow-ips=<traefik>`; remove manual `X-Forwarded-For` parsing; use the same client IP source for access logs and audit logs.
-- [ ] CORS origins, methods and headers from `Settings` (`CORS_ORIGINS` list); delete the dead custom `CORSMiddleware` class.
+- [ ] Security headers: add HSTS (behind TLS), `Cache-Control: no-store` on authenticated responses, `Content-Security-Policy: frame-ancestors 'none'`; drop `X-XSS-Protection`. Partly done: `X-XSS-Protection` is gone and every response under `API_PREFIX` gets `Cache-Control: no-store`; HSTS belongs to the TLS proxy; the CSP is still open.
+- [x] Trusted proxies: run uvicorn with `--proxy-headers --forwarded-allow-ips=<traefik>`; remove manual `X-Forwarded-For` parsing; use the same client IP source for access logs and audit logs. (`run.py` with `FORWARDED_ALLOW_IPS`; access and audit logs read the ASGI scope.)
+- [ ] CORS origins, methods and headers from `Settings` (`CORS_ORIGINS` list); delete the dead custom `CORSMiddleware` class. Partly done: origins come from `CORS_ORIGINS` (`*` refused); methods and headers are still `*`.
 - [ ] Admin panel: Argon2 hash for the admin password with constant-time compare, `ADMIN_ENABLED` flag defaulting to `false` in `prod`, hide `token_hash` columns. Partly done: `ADMIN_ENABLED` (default on only in `dev`) and constant-time compare of the admin credentials exist. Still open: Argon2 hash for the admin password, and `token_hash` is still shown in the sessions detail view.
 - [ ] Protect `/metrics` (network policy or bearer token); remove the `KEYS` scan. Partly done: the `active_refresh_tokens` gauge and its `KEYS` scan are removed; `/metrics` is still unauthenticated.
 - [ ] Request limits: `max_body_size`, per-request timeout, `strict_content_type` kept on.
@@ -481,15 +480,15 @@ This is the original implementation plan. The re-prioritised plan from the Novem
 
 ### Phase 2: API contract
 
-- [x] API versioning: all module routers are mounted under `API_PREFIX` (`/api/v1`); `/`, `/metrics/` and `/metrics/health` stay unversioned. Old paths return 404 (no deprecation window; the frontend migrates right after S1).
+- [x] API versioning: all module routers are mounted under `API_PREFIX` (`/api/v1`); `/`, `/health`, `/health/ready` and `/metrics` stay unversioned. Old paths return 404 (no deprecation window; the frontend migrates right after S1).
 - [ ] Align the Swarm stack's Traefik router with `/api/v1`: `api-prod-strip` still strips `/api`, which would hand the app `/v1/...` (see [backend task 4](../frontend/documentation/backend-contract.md#backend-task-4-refresh-cookie-path-behind-the-api-prefix)).
-- [x] Error format decided (D1, [ADR 0002](documentation/adr/0002-rfc9457-errors-plain-responses-api-v1.md)) and one consistent handler in `src/app/core/errors.py`: validation, auth, named domain errors, unhandled 500 (no internals leaked). The 500 still lacks `request_id` (S1.4).
+- [x] Error format decided (D1, [ADR 0002](documentation/adr/0002-rfc9457-errors-plain-responses-api-v1.md)) and one consistent handler in `src/app/core/errors.py`: validation, auth, named domain errors, unhandled 500 (no internals leaked), rendered by the request middleware with `X-Request-ID`, `request_id` and the security and CORS headers.
 - [x] Named exceptions in services instead of `(None, "message")` tuples; routers do not catch `Exception`. A module's `errors.py` subclasses the `AppError` family from `app.core`, which maps each class to a status and a `code`.
-- [x] `response_model` (or a return annotation) on every module route; no `top_level_fields`; FastAPI serialises Pydantic directly. Swagger login works through `LoginResponse`, a `TokenResponse` plus the user. The Prometheus exposition at `/metrics/` is plain text.
+- [x] `response_model` (or a return annotation) on every module route; no `top_level_fields`; FastAPI serialises Pydantic directly. Swagger login works through `LoginResponse`, a `TokenResponse` plus the user. The Prometheus exposition at `/metrics` is plain text.
 - [ ] Pagination helper: cursor-based for lists, bounded `limit` (default 20, max 100), stable ordering.
 - [ ] Optional `Idempotency-Key` support for POST (Redis-backed, 24 h TTL, 409 on payload mismatch) to match the frontend blueprint.
 - [ ] `ETag`/`If-Match` on mutable resources (412 on mismatch).
-- [ ] Health endpoints: `GET /health/live` (no dependencies), `GET /health/ready` (DB `SELECT 1`, Redis `PING`, 503 on failure or during shutdown), `GET /health/startup`. Update the Dockerfile `HEALTHCHECK` and Swarm probes.
+- [ ] Health endpoints: `GET /health/live` (no dependencies), `GET /health/ready` (DB `SELECT 1`, Redis `PING`, 503 on failure or during shutdown), `GET /health/startup`. Update the Dockerfile `HEALTHCHECK` and Swarm probes. Partly done: `GET /health` (liveness) and `GET /health/ready` (503 on a failed check) exist and the Dockerfile `HEALTHCHECK` uses `/health`; still open: 503 during shutdown, the Swarm probes.
 - [ ] OpenAPI: `summary`, `description`, `responses` per route; export the schema in CI and lint it (Spectral or vacuum); diff against the previous release (oasdiff). Partly done: every module route has a summary, a docstring description and `application/problem+json` error responses listing the possible `code` values (`tests/unit/core/test_openapi_contract.py`). Still open: response examples, the CI export, lint and diff.
 - [ ] Timezone-aware timestamps everywhere (`datetime.now(timezone.utc)`), RFC 3339 output.
 - [ ] Invitation endpoints `POST /auth/invitations/lookup` and `POST /auth/invitations/accept` (requested by the frontend, [task 1](../frontend/documentation/backend-contract.md#backend-task-1-invitation-endpoints-new); the frontend page is built against this contract): tokens only in request bodies, stored as SHA-256 hashes, single use and expiring; the email is bound to the invitation; the accepted user is created with `is_email_verified: true` and joined to the workspace in one transaction; rate limiting, no enumeration, audit events.
@@ -497,7 +496,7 @@ This is the original implementation plan. The re-prioritised plan from the Novem
 
 ### Phase 3: Reliability and observability
 
-- [ ] Replace `BaseHTTPMiddleware` implementations with pure ASGI middleware (streaming-safe, lower overhead).
+- [x] Replace `BaseHTTPMiddleware` implementations with pure ASGI middleware (streaming-safe, lower overhead). One `RequestMiddleware` ([ADR 0005](documentation/adr/0005-single-asgi-request-middleware.md)).
 - [ ] Tracing: enable FastAPI native OpenTelemetry (`FastAPI(telemetry=...)`, 0.142+) plus SQLAlchemy, asyncpg, redis and httpx instrumentation; export OTLP to Alloy → Tempo; propagate W3C `traceparent`; add `trace_id`/`span_id` to log records.
 - [ ] Logs: redact PII (no emails, usernames or query strings in `http.access`; hash or drop IPs per policy); use `opentelemetry-instrumentation-logging` instead of the deprecated `LoggingHandler` path; keep `uvicorn.error` at INFO.
 - [ ] Metrics: align with OTel HTTP semantic conventions (`http.server.request.duration` in seconds with the standard buckets, `http.route` label); add cache hit/miss, task queue depth, DB pool usage; drop the broken `active_refresh_tokens` gauge (done in review Phase 0) or compute it from Postgres.
@@ -550,20 +549,20 @@ Fixed in Phase 0:
 - ~~13~~ `ruff format --check` passes.
 - ~~14~~ Not reproducible: the virtualenv runs Python 3.14.4.
 
-Fixed in the 2026-11 cleanup (S1.3):
+Fixed in the 2026-11 cleanup (S1.3, S1.4):
 
 - ~~6~~ The email-change token is consumed by `POST /auth/email/verify`; `PUT /users/me/email` replaces the email part of `PATCH /user/me`, and a dedicated template is sent to the new address.
+- ~~4~~ `/metrics` is served at the exact path and never counted as a request.
+- ~~12~~ The `Dockerfile` healthcheck targets `/health`, which works with `METRICS_ENABLED=false`.
 
 Open:
 
 2. `tests/conftest.py` runs `alembic upgrade head` and `Base.metadata.create_all` on the same database, and `asyncio.run()` shares the application's `AsyncEngine` across event loops. [Phase 0]
-4. `MetricsMiddleware` skips `/metrics` but the router is mounted at `/metrics/`, so scrapes are counted as requests. [Phase 3]
 7. The password-reset email link is relative (`/auth/reset-password?token=`) and lacks `FRONTEND_URL`. [Phase 1]
 8. Refresh cookie is set without `Secure`. [Phase 1]
 9. `pytest` `--cov-fail-under=80` and `[tool.coverage.report] fail_under = 85` conflict. [Phase 0]
-10. Partly fixed: `BCRYPT_ROUNDS` is removed. Still unused settings: `CACHE_KEY_PREFIX` (only in the `.env` template), `REDIS_URL` (set by tests), `TASKIQ_RETRY_*`, `TASKIQ_METRICS_PORT`, `ROUTE_CACHE_TIME_CONDITION` and `DEBUG`. `MAIL_*` values are read through `os.getenv` rather than `Settings`. [Phase 0]
+10. Partly fixed: `BCRYPT_ROUNDS`, `CACHE_KEY_PREFIX`, `ROUTE_CACHE_*`, `DEBUG` and `OTLP_*` are removed. Still unused settings: `REDIS_URL` (set by tests), `TASKIQ_RETRY_*` and `TASKIQ_METRICS_PORT` (used from S2). `MAIL_*` values are read through `os.getenv` rather than `Settings`. [Phase 0]
 11. Partly fixed: `alembic/env.py` no longer overrides injected variables, but it still loads `.env.local` in dev. [Phase 4]
-12. `Dockerfile` healthcheck targets `/metrics/health` and fails when `METRICS_ENABLED=false`. [Phase 2]
 
 ---
 

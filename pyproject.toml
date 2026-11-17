@@ -24,10 +24,6 @@ dependencies = [
     "psycopg[binary]>=3.3.9",
     "structlog>=26.1.0",
     "rich>=15.0.0",
-    "opentelemetry-api>=1.45.2",
-    "opentelemetry-sdk>=1.45.2",
-    "opentelemetry-exporter-otlp>=1.45.2",
-    "opentelemetry-exporter-otlp-proto-http>=1.45.2",
     "fastapi-mail>=1.6.8",
     "taskiq>=0.13.0",
     "taskiq-redis>=1.2.4",
@@ -74,8 +70,7 @@ constraint-dependencies = [
     "mako>=1.4.2",
     # rich -> pygments; console tracebacks in dev.
     "pygments>=2.20.0",
-    # OTLP/HTTP log exporter -> requests -> urllib3; reachable when
-    # OTLP_LOGS_ENABLED (outbound to the configured collector only).
+    # testcontainers -> docker -> requests -> urllib3 (dev group only).
     "requests>=2.33.0",
     "urllib3>=2.8.0",
 ]
@@ -141,7 +136,7 @@ filterwarnings = [
     "error::fastapi.exceptions.FastAPIDeprecationWarning",
     "error::starlette.exceptions.StarletteDeprecationWarning",
     # cashews 7.6.0 (latest on 2026-11-16) still calls the deprecated redis-py
-    # Redis.close() in backends/redis/backend.py when the route cache shuts
+    # Redis.close() in backends/redis/backend.py when the cache (`close_cache`) shuts
     # down. Upstream; the app's own redis client uses aclose(). Remove together
     # with tests/integration/core/test_upgrade_libraries.py::TestRedisPy8::
     # test_cashews_still_calls_the_deprecated_redis_close once that test fails.

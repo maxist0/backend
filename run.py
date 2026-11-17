@@ -1,5 +1,4 @@
-"""
-Thin launcher for the API (uvicorn on ``app.main:app``).
+"""Thin launcher for the API (uvicorn on `app.main:app`).
 
 Usage:
     python run.py           # ENVIRONMENT injected by Docker/Kubernetes
@@ -8,7 +7,7 @@ Usage:
     python run.py unittest  # unit testing environment (not for serving)
 
 Settings, logging and resources are handled by the app itself
-(``get_settings()`` and the lifespan); this file only selects the
+(`get_settings()` and the lifespan); this file only selects the
 environment and starts the processes.
 """
 
@@ -101,6 +100,10 @@ def main() -> None:
             reload=args.reload,
             loop=UVICORN_LOOP,
             log_config=None,  # logging is configured by the app's lifespan
+            # The client address in the ASGI scope (access log, audit log)
+            # comes from X-Forwarded-For only when the peer is a trusted proxy.
+            proxy_headers=True,
+            forwarded_allow_ips=settings.FORWARDED_ALLOW_IPS,
         )
     finally:
         if worker_process is not None and worker_process.poll() is None:

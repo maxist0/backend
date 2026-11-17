@@ -1,7 +1,7 @@
 """Library behaviour the app relies on that needs no running service.
 
-Covers the SQLAlchemy 2.1, taskiq 0.13 and OpenTelemetry 1.45 upgrades. Each
-test names the change it covers.
+Covers the SQLAlchemy 2.1 and taskiq 0.13 upgrades. Each test names the
+change it covers.
 """
 
 import importlib
@@ -12,8 +12,6 @@ import sys
 import tomllib
 
 from tests.helpers import BACKEND_DIR
-
-import app.core.logging as app_logging
 
 
 class TestSqlAlchemy21:
@@ -80,31 +78,3 @@ class TestTaskiqBroker:
             send_verification_email_task.task_name,
             send_password_reset_email_task.task_name,
         } <= names
-
-
-class TestOtlpLogHandler:
-    def test_handler_builds_without_the_sdk_deprecation(
-        self, monkeypatch, settings_factory
-    ):
-        """1.40: the SDK ``LoggingHandler`` warns (DeprecationWarning) in __init__.
-
-        pytest turns deprecations into errors; ``_build_otlp_handler``
-        silences only that one message (see app.core.logging). The global
-        provider is not replaced, so no other test is affected.
-        """
-        import opentelemetry._logs as otel_logs
-        from opentelemetry.sdk._logs import LoggingHandler
-
-        providers: list = []
-        monkeypatch.setattr(otel_logs, "set_logger_provider", providers.append)
-        settings = settings_factory(
-            OTLP_LOGS_ENABLED=True, OTLP_ENDPOINT="http://127.0.0.1:1"
-        )
-
-        handler = app_logging._build_otlp_handler(settings)
-        try:
-            assert isinstance(handler, LoggingHandler)
-            assert len(providers) == 1
-        finally:
-            for provider in providers:
-                provider.shutdown()

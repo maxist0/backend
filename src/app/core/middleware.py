@@ -1,296 +1,180 @@
-"""HTTP middleware: request id, access log, metrics and security headers."""
+"""The request middleware: request id, access log, HTTP metrics, security headers.
+
+One pure ASGI middleware. It runs in the request's own task, so the request
+id it binds is in every log line and problem response of the request. It
+also renders the 500 for an unhandled exception, so that response gets the
+same headers, metrics and access log as every other one.
+
+`create_app` adds it inside Starlette's `CORSMiddleware`: the 500 rendered
+here passes CORS on the way out and keeps the CORS headers. CORS preflights
+are answered by `CORSMiddleware` itself and do not reach this middleware.
+"""
 
 import re
 import time
 import uuid
-from collections.abc import Callable
-from typing import Any
 
 import structlog
 from fastapi.routing import iter_route_contexts
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request
-from starlette.responses import Response
+from prometheus_client import Counter, Histogram
+from starlette.datastructures import MutableHeaders
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from app.core.logging import get_access_logger
+from app.core.errors import internal_error_response, log_unexpected_error
+from app.core.health import METRICS_PATH
+from app.core.logging import get_logger
 
-# (path regex, full path template) of every place a route object is reachable.
-_RouteTemplates = tuple[tuple[re.Pattern[str], str], ...]
+logger = get_logger(__name__)
 
-# The request method is client-controlled; as a metric label it must come from
-# a fixed set, or invented methods create unbounded time series.
+HTTP_REQUESTS = Counter(
+    "http_requests_total",
+    "HTTP requests by method, route template and status.",
+    ["method", "route", "status"],
+)
+# prometheus_client's default buckets span 5 ms to 10 s.
+HTTP_REQUEST_DURATION = Histogram(
+    "http_request_duration_seconds",
+    "HTTP request duration in seconds by method and route template.",
+    ["method", "route"],
+)
+
+UNMATCHED_ROUTE = "unmatched"
+
+# The method is client-controlled; as a metric label it must come from a fixed
+# set, or invented methods create unbounded time series.
 _METRIC_METHODS = frozenset(
     {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
 )
 
+# A client-supplied id is echoed into headers and logs, so only a short token
+# of safe characters is accepted.
+_REQUEST_ID = re.compile(r"[A-Za-z0-9._-]{1,128}")
 
-def _metric_method(method: str) -> str:
+# No HSTS: the TLS-terminating proxy owns it.
+_SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Permissions-Policy": "geolocation=()",
+}
+
+
+def metric_method(method: str) -> str:
     """Map the request method onto the bounded label set (else `other`)."""
     return method if method in _METRIC_METHODS else "other"
 
 
-def _get_client_ip(request: Request) -> str:
-    """
-    Get the client IP address, considering proxy headers.
-
-    Checks in order:
-    1. X-Forwarded-For (first IP in the chain)
-    2. X-Real-IP
-    3. Direct client host
-    """
-    # Check X-Forwarded-For header (may contain multiple IPs)
-    forwarded_for = request.headers.get("x-forwarded-for")
-    if forwarded_for:
-        # Take the first IP (original client)
-        return forwarded_for.split(",")[0].strip()
-
-    # Check X-Real-IP header
-    real_ip = request.headers.get("x-real-ip")
-    if real_ip:
-        return real_ip
-
-    # Fall back to direct client
-    if request.client:
-        return request.client.host
-
-    return "-"
+def request_id_from(scope: Scope) -> str:
+    """Return the client's `X-Request-ID` if it is a safe token, else a new UUID."""
+    for name, value in scope["headers"]:
+        if name == b"x-request-id":
+            candidate = value.decode("latin-1")
+            if _REQUEST_ID.fullmatch(candidate):
+                return candidate
+            break
+    return str(uuid.uuid4())
 
 
-class AccessLogMiddleware(BaseHTTPMiddleware):
-    """
-    Middleware to log HTTP access information as structured JSON events:
-    - Client IP address
-    - HTTP method and path (without query string: it can carry tokens)
-    - User agent
-    - Response status code and size
-    - Processing duration (ms)
+class RequestMiddleware:
+    """Request id, access log, HTTP metrics and security headers for HTTP requests.
 
-    The Referer header is not logged either (it can carry tokens and PII).
+    Args:
+        app: The wrapped ASGI app.
+        api_prefix: Responses under this path prefix get
+            `Cache-Control: no-store` unless the route set `Cache-Control`.
+        access_log: Emit one `http.access` event per request.
+        metrics: Record `http_requests_total` and
+            `http_request_duration_seconds` (never for `/metrics` itself).
     """
 
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        access_logger = get_access_logger()
+    def __init__(
+        self, app: ASGIApp, *, api_prefix: str, access_log: bool, metrics: bool
+    ) -> None:
+        self.app = app
+        self.api_prefix = api_prefix
+        self.access_log = access_log
+        self.metrics = metrics
+        # id(route) -> full path template; built on the first request, when
+        # every route is registered. Keyed by id because Starlette routes
+        # define __eq__ and are unhashable; the app keeps them alive.
+        self._templates: dict[int, str] | None = None
 
-        # Capture request metadata before processing
-        client_ip = _get_client_ip(request)
-        method = request.method
-        path = request.url.path
-        user_agent = request.headers.get("user-agent", "-")
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
 
-        # Process the request and measure duration
-        start = __import__("time").perf_counter()
-        response: Response = await call_next(request)
-        duration_ms = round((__import__("time").perf_counter() - start) * 1000, 2)
-
-        # Get response info
-        status_code = response.status_code
-        content_length = response.headers.get("content-length", "-")
-
-        # Emit a single structured access event
-        access_logger.info(
-            "http.access",
-            client_ip=client_ip,
-            method=method,
-            path=path,
-            status_code=status_code,
-            content_length=content_length,
-            duration_ms=duration_ms,
-            user_agent=user_agent,
-        )
-        return response
-
-
-class MetricsMiddleware(BaseHTTPMiddleware):
-    """
-    Middleware to collect HTTP metrics automatically.
-    """
-
-    def __init__(self, app, registry=None):
-        super().__init__(app)
-        from app.core.metrics import REGISTRY
-
-        self.registry = registry or REGISTRY
-        # id(route) -> (route, templates). The route object is kept so its id
-        # cannot be reused; routes live as long as the app.
-        self._templates: dict[int, tuple[Any, _RouteTemplates]] = {}
-
-    async def dispatch(self, request: Request, call_next):
-        # Skip metrics collection for the metrics endpoint itself
-        if request.url.path == "/metrics":
-            return await call_next(request)
-
-        from app.core.metrics import (
-            HTTP_REQUESTS_TOTAL,
-            HTTP_REQUEST_DURATION_SECONDS,
-            HTTP_REQUEST_SIZE_BYTES,
-            HTTP_RESPONSE_SIZE_BYTES,
-            ACTIVE_CONNECTIONS,
-            API_ERRORS_TOTAL,
-        )
-
-        # Record start time
-        start_time = time.perf_counter()
-
-        # Increment active connections
-        ACTIVE_CONNECTIONS.inc()
-
-        method = _metric_method(request.method)
-        try:
-            # Process the request; routing sets scope["route"] on a match.
-            response: Response = await call_next(request)
-            path_template = self._get_path_template(request)
-
-            # Measure request size
-            request_size = int(request.headers.get("content-length", 0))
-            HTTP_REQUEST_SIZE_BYTES.labels(
-                method=method, endpoint=path_template
-            ).observe(request_size)
-
-            # Calculate processing time
-            duration = time.perf_counter() - start_time
-
-            # Record metrics
-            status_code = str(response.status_code)
-            HTTP_REQUESTS_TOTAL.labels(
-                method=method, endpoint=path_template, status_code=status_code
-            ).inc()
-            HTTP_REQUEST_DURATION_SECONDS.labels(
-                method=method, endpoint=path_template
-            ).observe(duration)
-
-            # Measure response size
-            response_size = int(response.headers.get("content-length", 0))
-            if response_size == 0 and hasattr(response, "body"):
-                # Try to get size from body if content-length not set
-                try:
-                    response_size = len(response.body)
-                except AttributeError, TypeError:
-                    response_size = 0
-
-            HTTP_RESPONSE_SIZE_BYTES.labels(
-                method=method, endpoint=path_template
-            ).observe(response_size)
-
-            return response
-
-        except Exception as e:
-            # Record error metrics
-            error_type = type(e).__name__
-            path_template = self._get_path_template(request)
-            API_ERRORS_TOTAL.labels(error_type=error_type, endpoint=path_template).inc()
-            raise
-        finally:
-            # Decrement active connections
-            ACTIVE_CONNECTIONS.dec()
-
-    def _get_path_template(self, request: Request) -> str:
-        """
-        Return the route template (e.g. `/users/{id}`) of the matched route.
-
-        Read after `call_next`: the router stores the matched route in
-        `scope["route"]`. Unmatched requests (404 scans) all share the label
-        `unmatched`, so arbitrary paths cannot create new label values
-        (bounded cardinality).
-        """
-        route = request.scope.get("route")
-        if route is None:
-            return "unmatched"
-        templates = self._route_templates(request, route)
-        if len(templates) == 1:
-            return templates[0][1]
-        if templates:
-            # The same router included under several prefixes (e.g. two API
-            # versions): pick the template that matched this request.
-            route_path = _route_path(request.scope)
-            for regex, template in templates:
-                if regex.match(route_path):
-                    return template
-        path = getattr(route, "path", None)
-        return path if isinstance(path, str) and path else "unmatched"
-
-    def _route_templates(self, request: Request, route: Any) -> _RouteTemplates:
-        """Full path templates of *route* in this app (cached per route).
-
-        Since FastAPI 0.137 included routers are kept as a tree: the matched
-        `scope["route"]` is the router's own `APIRoute` whose `path` lacks
-        the include prefixes (`/login` instead of `/auth/login`). The
-        prefixed template comes from `fastapi.routing.iter_route_contexts`.
-        Routes outside the app's tree (e.g. inside the mounted admin app)
-        yield no template and keep their own `path`.
-        """
-        cached = self._templates.get(id(route))
-        if cached is not None and cached[0] is route:
-            return cached[1]
-        templates: _RouteTemplates = tuple(
-            (context.path_regex, context.path_format)
-            for context in iter_route_contexts(request.app.routes)
-            if context.original_route is route
-            and isinstance(context.path_format, str)
-            and context.path_format
-        )
-        self._templates[id(route)] = (route, templates)
-        return templates
-
-
-def _route_path(scope: Any) -> str:
-    """The request path relative to `root_path` (what routes match against)."""
-    path: str = scope.get("path", "")
-    root_path: str = scope.get("root_path", "")
-    if root_path and path.startswith(root_path):
-        rest = path[len(root_path) :]
-        if not rest or rest.startswith("/"):
-            return rest
-    return path
-
-
-class SecurityHeadersMiddleware(BaseHTTPMiddleware):
-    """
-    Middleware to add security-related HTTP headers.
-    """
-
-    async def dispatch(self, request: Request, call_next):
-        response = await call_next(request)
-
-        # Set security headers
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["X-Frame-Options"] = "DENY"
-        response.headers["X-XSS-Protection"] = "1; mode=block"
-        response.headers["Referrer-Policy"] = "no-referrer"
-        response.headers["Permissions-Policy"] = "geolocation=()"
-
-        return response
-
-
-class MetaDataMiddleware(BaseHTTPMiddleware):
-    """
-    Middleware to add standardized metadata to all responses.
-    """
-
-    async def dispatch(self, request: Request, call_next):
-        # Drop context left over from a previous request on this task
-        # (hot reload, task reuse) before binding this request's id.
+        # Read before the call: a mounted sub-app replaces scope["app"].
+        app = scope.get("app")
+        request_id = request_id_from(scope)
         structlog.contextvars.clear_contextvars()
-
-        # Use caller-supplied request id when present, otherwise generate one.
-        request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
         structlog.contextvars.bind_contextvars(request_id=request_id)
+        no_store = self._under_api_prefix(scope["path"])
+        status = 500
+        response_started = False
+        start = time.perf_counter()
 
-        # Record start time
-        start_time = time.perf_counter()
+        async def send_with_headers(message: Message) -> None:
+            nonlocal status, response_started
+            if message["type"] == "http.response.start":
+                response_started = True
+                status = message["status"]
+                headers = MutableHeaders(scope=message)
+                for name, value in _SECURITY_HEADERS.items():
+                    headers[name] = value
+                headers["X-Request-ID"] = request_id
+                if no_store and "cache-control" not in headers:
+                    headers["Cache-Control"] = "no-store"
+            await send(message)
 
-        # Process the request
-        response: Response = await call_next(request)
+        try:
+            await self.app(scope, receive, send_with_headers)
+        except Exception as exc:
+            # Not re-raised: the server would log it a second time, with the
+            # database error text that log_unexpected_error leaves out.
+            log_unexpected_error(logger, "app.unhandled_exception", exc)
+            if not response_started:
+                await internal_error_response()(scope, receive, send_with_headers)
+        finally:
+            duration = time.perf_counter() - start
+            route = self._route_template(app, scope)
+            self._record(scope, route, status, duration)
+            structlog.contextvars.clear_contextvars()
 
-        # Calculate processing time
-        process_time = time.perf_counter() - start_time
-        process_time_ms = round(process_time * 1000, 2)
+    def _under_api_prefix(self, path: str) -> bool:
+        return path == self.api_prefix or path.startswith(f"{self.api_prefix}/")
 
-        # Add processing time header to response
-        response.headers["X-Process-Time"] = f"{process_time_ms}ms"
+    def _route_template(self, app: object, scope: Scope) -> str:
+        """Full path template of the matched route, or `unmatched`.
 
-        # Forward the request id so clients / gateways can correlate logs.
-        response.headers["X-Request-ID"] = request_id
+        Unmatched requests (404 scans) and routes inside mounted sub-apps
+        share one label, so client paths cannot create new label values.
+        """
+        route = scope.get("route")
+        if route is None:
+            return UNMATCHED_ROUTE
+        if self._templates is None:
+            routes = getattr(app, "routes", [])
+            self._templates = {
+                id(context.original_route): context.path_format
+                for context in iter_route_contexts(routes)
+                if context.path_format
+            }
+        return self._templates.get(id(route), UNMATCHED_ROUTE)
 
-        # Clean up context so it doesn't bleed into the next request.
-        structlog.contextvars.clear_contextvars()
-        return response
+    def _record(self, scope: Scope, route: str, status: int, duration: float) -> None:
+        if self.metrics and route != METRICS_PATH:
+            method = metric_method(scope["method"])
+            HTTP_REQUESTS.labels(method=method, route=route, status=str(status)).inc()
+            HTTP_REQUEST_DURATION.labels(method=method, route=route).observe(duration)
+        if self.access_log:
+            client = scope.get("client")
+            logger.info(
+                "http.access",
+                method=scope["method"],
+                path=scope["path"],
+                route=route,
+                status=status,
+                duration_ms=round(duration * 1000, 2),
+                client_ip=client[0] if client else None,
+            )

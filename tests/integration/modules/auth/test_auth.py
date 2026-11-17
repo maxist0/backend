@@ -7,7 +7,7 @@ fixture intercepts the email task `.kiq(...)` calls and records every mail
 `captured_emails[addr]` returns the latest token.
 """
 
-from app.modules.auth.service import MAXIMUM_LOGIN_ATTEMPTS
+from tests.helpers import MAXIMUM_LOGIN_ATTEMPTS
 
 
 def register(

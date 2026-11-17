@@ -23,11 +23,9 @@ import jwt
 import time_machine
 
 from app.core.config import get_settings
-from app.modules.auth.service import (
-    LOGIN_ATTEMPT_WINDOW_SECONDS,
-    MAXIMUM_LOGIN_ATTEMPTS,
-)
 from tests.helpers import (
+    LOGIN_LOCKOUT_SECONDS,
+    MAXIMUM_LOGIN_ATTEMPTS,
     PASSWORD,
     audit_count,
     bearer,
@@ -397,7 +395,7 @@ class TestTimedLockEnd:
 
         row = db.one("SELECT locked_until - updated_at AS span FROM users")
 
-        assert row["span"] == timedelta(seconds=LOGIN_ATTEMPT_WINDOW_SECONDS)
+        assert row["span"] == timedelta(seconds=LOGIN_LOCKOUT_SECONDS)
 
     def test_login_is_refused_until_the_last_second_of_the_lock(
         self, client, captured_emails, db
