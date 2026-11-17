@@ -16,9 +16,7 @@ from tests.helpers import BACKEND_DIR
 
 # Queued messages carry these names; renaming one strands messages in Redis.
 TASK_NAMES = {
-    "email.send_email_change_confirmation",
-    "email.send_password_reset_email",
-    "email.send_verification_email",
+    "email.send_token_email",
     "maintenance.taskiq_heartbeat",
 }
 
@@ -47,7 +45,7 @@ def test_worker_broker_serves_every_task_under_its_name():
     """`app.worker:broker` finds the shared tasks of the core and the modules."""
     code = (
         "import app.worker\n"
-        "from app.modules.auth.tasks import send_verification_email_task as t\n"
+        "from app.modules.auth.tasks import send_token_email_task as t\n"
         "print(sorted(app.worker.broker.get_all_tasks()))\n"
         "print('DEFAULT', t.kicker().broker is app.worker.broker)\n"
     )

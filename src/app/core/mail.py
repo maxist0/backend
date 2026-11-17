@@ -2,7 +2,8 @@
 
 The mail client is built lazily on the first send (in practice: in the taskiq
 worker) from `Settings`; nothing is configured at import time. When the
-`MAIL_*` settings are incomplete, sending is skipped with a warning.
+`MAIL_*` settings are incomplete, `get_mailer` returns None and
+`send_templated_email` sends nothing and returns False.
 
 Templates are rendered here, not by fastapi-mail: fastapi-mail accepts a
 single `TEMPLATE_FOLDER`, while a module's templates live in the module and
@@ -180,7 +181,7 @@ async def send_templated_email(
     # Any: arbitrary Jinja2 template variables.
     context: dict[str, Any],
     template_dir: Path | None = None,
-) -> None:
+) -> bool:
     """Render a template and send it as an HTML email.
 
     Args:
@@ -189,11 +190,15 @@ async def send_templated_email(
         template_name: Template path, see `render_email`.
         context: Template variables; `app_name` defaults to `APP_NAME`.
         template_dir: The calling module's email template directory.
+
+    Returns:
+        True once the mail is handed to the SMTP server, False when mail is
+        not configured (`get_mailer` is None) and nothing was sent. The
+        caller logs the outcome; this function logs nothing per mail.
     """
     mailer = get_mailer()
     if mailer is None:
-        logger.warning("mail.skipped_not_configured", template=template_name)
-        return
+        return False
     context.setdefault("app_name", get_settings().APP_NAME)
     html = render_email(template_name, context, template_dir)
     recipient = NameEmail(name=context.get("username", ""), email=to)
@@ -204,3 +209,4 @@ async def send_templated_email(
         subtype=MessageType.html,
     )
     await mailer.send_message(message)
+    return True

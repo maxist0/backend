@@ -80,8 +80,9 @@ class TestEnvLocal:
         self._write_env_local(tmp_path, APP_NAME="from-env-local")
         fresh_settings.chdir(tmp_path)
         fresh_settings.setenv("ENVIRONMENT", environment)
-        # "test" is guarded: strong secrets, admin off.
+        # "test" is guarded: strong secrets, https frontend, admin off.
         fresh_settings.setenv("JWT_SECRET_KEY", "k" * 48)
+        fresh_settings.setenv("FRONTEND_URL", "https://app.example.com")
         fresh_settings.setenv("ADMIN_ENABLED", "false")
 
         assert get_settings().APP_NAME == "api"

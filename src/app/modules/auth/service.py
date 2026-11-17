@@ -5,10 +5,17 @@ change, email verification, the email change and the admin panel actions
 (one audited transaction per user or session). Orchestrates crud, password
 hashing, token creation, audit logging and the email tasks. Failures are
 raised as the module's `AppError` subclasses (`app.modules.auth.errors`).
+
+Email tokens are issued in two steps. The request stores the token row
+with the hash of a random value that is never sent, commits, and enqueues
+the mail task with the token's id only. The worker (`prepare_token_email`)
+gives that token a fresh value, commits, and mails it. No token, address
+or username passes through Redis.
 """
 
 import secrets
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import NoReturn
 
@@ -17,6 +24,7 @@ from prometheus_client import Counter
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import set_committed_value
+from taskiq.exceptions import SendTaskError
 
 from app.core import get_logger, get_settings, utcnow
 from app.core.errors import constraint_name
@@ -50,11 +58,7 @@ from app.modules.auth.models import (
     PasswordCredential,
     Session,
 )
-from app.modules.auth.tasks import (
-    send_email_change_confirmation_task,
-    send_password_reset_email_task,
-    send_verification_email_task,
-)
+from app.modules.auth.tasks import send_token_email_task
 from app.modules.users import User
 from app.modules.users import crud as users_crud
 from app.modules.users.models import lock_is_active
@@ -91,6 +95,14 @@ _REGISTER_CONFLICT_MESSAGES = {
     _USERS_EMAIL_KEY: "Email already registered",
 }
 
+# Validity of the links in the emails, counted from the request. A retried
+# or redelivered mail task keeps this expiry, so a late retry sends nothing.
+_RESET_TOKEN_LIFETIME = timedelta(hours=1)
+_EMAIL_TOKEN_LIFETIME = timedelta(hours=24)
+# Audit details are written when the mail is requested; whether it was sent
+# is logged by the worker (`email.sent`, `email.not_sent`).
+_VERIFICATION_REQUESTED = "Verification email requested"
+
 
 def _bounded_header(request: Request | None, name: str, max_length: int) -> str | None:
     """Return a request header cut to *max_length* characters (or None)."""
@@ -125,6 +137,63 @@ async def _audit(
         detail=detail,
     )
     await crud.create_audit_log(db, log, commit=commit)
+
+
+async def _open_email_token(
+    db: AsyncSession,
+    user_id: uuid.UUID,
+    purpose: EmailTokenPurpose,
+    valid_for: timedelta,
+    new_email: str | None = None,
+) -> uuid.UUID:
+    """Replace the user's open tokens of `purpose` by a new one; no commit.
+
+    The stored hash belongs to a random value that is never sent: the mail
+    task sets the hash of the value it mails (`prepare_token_email`), so
+    the raw token never has to be enqueued. Lock order: `email_tokens`
+    first.
+
+    Returns:
+        The new token's id, for `_enqueue_token_email` after the commit.
+    """
+    token_id = uuid.uuid4()
+    await crud.invalidate_tokens_for_user_purpose(db, user_id, purpose, commit=False)
+    await crud.create_email_token(
+        db,
+        EmailToken(
+            id=token_id,
+            user_id=user_id,
+            purpose=purpose,
+            token_hash=hash_token(secrets.token_urlsafe(32)),
+            new_email=new_email,
+            expires_at=utcnow() + valid_for,
+        ),
+        commit=False,
+    )
+    return token_id
+
+
+async def _enqueue_token_email(
+    token_id: uuid.UUID, user_id: uuid.UUID, purpose: EmailTokenPurpose
+) -> None:
+    """Enqueue the mail of one email token.
+
+    Call it after the commit: the worker must find the token row. A broker
+    that cannot take the task is logged, not raised: the request has
+    succeeded, the token row stays, and the user can ask for a new mail.
+    Only the token's id is enqueued; `user_id` and `purpose` are for the
+    log.
+    """
+    try:
+        await send_token_email_task.kiq(str(token_id))
+    except SendTaskError as exc:
+        cause = exc.__cause__ or exc
+        logger.error(
+            "auth.email_enqueue_failed",
+            user_id=str(user_id),
+            purpose=purpose.value,
+            error_type=type(cause).__name__,
+        )
 
 
 async def register_user(
@@ -179,22 +248,18 @@ async def register_user(
     )
     await crud.create_password_credential(db, credential)
 
-    # Create email verification token
-    raw_token = secrets.token_urlsafe(32)
-    email_token = EmailToken(
-        user_id=user.id,
-        purpose=EmailTokenPurpose.VERIFY_EMAIL,
-        token_hash=hash_token(raw_token),
-        expires_at=utcnow() + timedelta(hours=24),
+    token_id = await _open_email_token(
+        db, user.id, EmailTokenPurpose.VERIFY_EMAIL, _EMAIL_TOKEN_LIFETIME
     )
-    await crud.create_email_token(db, email_token)
-
-    # Audit
-    await _audit(db, AuditEventType.REGISTER, user.id, request)
-    await _audit(db, AuditEventType.EMAIL_VERIFICATION_SENT, user.id, request)
-
-    # Enqueue verification email (fire-and-forget via Taskiq)
-    await send_verification_email_task.kiq(user.email, username, raw_token)
+    await _audit(db, AuditEventType.REGISTER, user.id, request, commit=False)
+    await _audit(
+        db,
+        AuditEventType.EMAIL_VERIFICATION_SENT,
+        user.id,
+        request,
+        _VERIFICATION_REQUESTED,
+    )
+    await _enqueue_token_email(token_id, user.id, EmailTokenPurpose.VERIFY_EMAIL)
 
     logger.info("auth.user_registered", user_id=str(user.id))
     return user
@@ -584,29 +649,41 @@ async def forgot_password(
     """Initiate a password reset.
 
     Always returns normally, so the caller cannot tell whether the address
-    belongs to an account.
+    belongs to an account. An inactive or admin-locked account gets no
+    token and no mail, only an audit row: `verify_email` refuses the
+    tokens of such accounts as well. The mail goes to the stored address,
+    never to the request input. The response time still differs between
+    known and unknown addresses (README, Known issues).
     """
     user = await users_crud.get_user_by_email(db, email.lower())
     if user is None:
-        # Don't reveal whether the email exists
         return
 
-    # Invalidate old reset tokens
-    await crud.invalidate_tokens_for_user_purpose(
-        db, user.id, EmailTokenPurpose.RESET_PASSWORD
-    )
+    if not user.is_active or user.is_admin_locked():
+        reason = "inactive" if not user.is_active else "locked"
+        await _audit(
+            db,
+            AuditEventType.PASSWORD_RESET_REQUESTED,
+            user.id,
+            request,
+            f"No email sent: account {reason}",
+        )
+        logger.warning(
+            "auth.password_reset_refused_account_blocked", user_id=str(user.id)
+        )
+        return
 
-    raw_token = secrets.token_urlsafe(32)
-    email_token = EmailToken(
-        user_id=user.id,
-        purpose=EmailTokenPurpose.RESET_PASSWORD,
-        token_hash=hash_token(raw_token),
-        expires_at=utcnow() + timedelta(hours=1),
+    token_id = await _open_email_token(
+        db, user.id, EmailTokenPurpose.RESET_PASSWORD, _RESET_TOKEN_LIFETIME
     )
-    await crud.create_email_token(db, email_token)
-    await _audit(db, AuditEventType.PASSWORD_RESET_REQUESTED, user.id, request)
-    # Send to the stored address, never to the request input.
-    await send_password_reset_email_task.kiq(user.email, user.username, raw_token)
+    await _audit(
+        db,
+        AuditEventType.PASSWORD_RESET_REQUESTED,
+        user.id,
+        request,
+        "Password reset email requested",
+    )
+    await _enqueue_token_email(token_id, user.id, EmailTokenPurpose.RESET_PASSWORD)
 
 
 async def reset_password(
@@ -680,6 +757,9 @@ async def verify_email(
     if consumed is None:
         raise InvalidTokenError("Invalid or expired verification token")
     user_id, purpose, new_email = consumed
+    # Parallel requests can leave a second open token of this purpose; it
+    # ends with this redemption (email_tokens first in the lock order).
+    await crud.invalidate_tokens_for_user_purpose(db, user_id, purpose, commit=False)
 
     user = await users_crud.get_user_by_id(db, user_id)
     if user is None:
@@ -751,22 +831,100 @@ async def resend_verification_email(
     if user.is_email_verified:
         raise EmailAlreadyVerifiedError()
 
-    # Invalidate old verification tokens
-    await crud.invalidate_tokens_for_user_purpose(
-        db, user.id, EmailTokenPurpose.VERIFY_EMAIL
+    token_id = await _open_email_token(
+        db, user.id, EmailTokenPurpose.VERIFY_EMAIL, _EMAIL_TOKEN_LIFETIME
     )
+    await _audit(
+        db,
+        AuditEventType.EMAIL_VERIFICATION_SENT,
+        user.id,
+        request,
+        _VERIFICATION_REQUESTED,
+    )
+    await _enqueue_token_email(token_id, user.id, EmailTokenPurpose.VERIFY_EMAIL)
+    logger.info("auth.verification_email_resent", user_id=str(user.id))
+
+
+@dataclass(frozen=True)
+class TokenEmail:
+    """What the mail task needs to send one token email."""
+
+    user_id: uuid.UUID
+    purpose: EmailTokenPurpose
+    recipient: str
+    username: str
+    token: str
+
+
+async def prepare_token_email(
+    db: AsyncSession, token_id: uuid.UUID
+) -> TokenEmail | None:
+    """Give one open email token a fresh value for one mail.
+
+    The worker side of the token emails. Every run, a retry or a redelivery
+    included, sets a new value, so only the latest mail's link works. The
+    expiry stays as the request set it. One transaction under the token's
+    row lock: nothing is committed unless the new hash is.
+
+    Nothing is sent, and None returned, when the token is no longer open
+    (expired, redeemed, or cancelled by a password change, an admin action,
+    a newer request or the redemption of another token of its purpose),
+    when the account is inactive or admin-locked, and for a verification
+    mail when the address is verified already. A token skipped for the
+    account's state is invalidated, so a redelivery after the block is
+    lifted does not mail a link requested while it was in place.
+
+    Args:
+        db: The task's session; committed or rolled back here.
+        token_id: The token the request created.
+
+    Returns:
+        Owner, purpose, recipient, username and raw token, or None if
+        nothing must be sent. The recipient is the stored address, or the
+        requested new address for an email change.
+    """
+    token = await crud.lock_open_email_token(db, token_id)
+    user = await users_crud.get_user_by_id(db, token.user_id) if token else None
+    if token is None or user is None:
+        await db.rollback()
+        logger.info("email.not_sent", token_id=str(token_id), reason="no_open_token")
+        return None
+    user_id, purpose = token.user_id, token.purpose
+
+    skip_reason: str | None = None
+    if not user.is_active or user.is_admin_locked():
+        skip_reason = "account_blocked"
+    elif purpose is EmailTokenPurpose.VERIFY_EMAIL and user.is_email_verified:
+        skip_reason = "already_verified"
+    elif purpose is EmailTokenPurpose.CHANGE_EMAIL and not token.new_email:
+        skip_reason = "no_new_email"
+    if skip_reason is not None:
+        await crud.invalidate_email_token(db, token.id)
+        await db.commit()
+        logger.info(
+            "email.not_sent",
+            token_id=str(token_id),
+            user_id=str(user_id),
+            purpose=purpose.value,
+            reason=skip_reason,
+        )
+        return None
 
     raw_token = secrets.token_urlsafe(32)
-    email_token = EmailToken(
-        user_id=user.id,
-        purpose=EmailTokenPurpose.VERIFY_EMAIL,
-        token_hash=hash_token(raw_token),
-        expires_at=utcnow() + timedelta(hours=24),
+    await crud.set_email_token_hash(db, token.id, hash_token(raw_token))
+    await db.commit()
+    recipient = (
+        token.new_email
+        if purpose is EmailTokenPurpose.CHANGE_EMAIL and token.new_email
+        else user.email
     )
-    await crud.create_email_token(db, email_token)
-    await _audit(db, AuditEventType.EMAIL_VERIFICATION_SENT, user.id, request)
-    await send_verification_email_task.kiq(user.email, user.username, raw_token)
-    logger.info("auth.verification_email_resent", user_id=str(user.id))
+    return TokenEmail(
+        user_id=user_id,
+        purpose=purpose,
+        recipient=recipient,
+        username=user.username,
+        token=raw_token,
+    )
 
 
 async def _confirm_password(
@@ -909,18 +1067,13 @@ async def request_email_change(
     if await users_crud.get_user_by_email(db, new_email) is not None:
         raise EmailTakenError()
 
-    await crud.invalidate_tokens_for_user_purpose(
-        db, user.id, EmailTokenPurpose.CHANGE_EMAIL
-    )
-    raw_token = secrets.token_urlsafe(32)
-    email_token = EmailToken(
-        user_id=user.id,
-        purpose=EmailTokenPurpose.CHANGE_EMAIL,
-        token_hash=hash_token(raw_token),
+    token_id = await _open_email_token(
+        db,
+        user.id,
+        EmailTokenPurpose.CHANGE_EMAIL,
+        _EMAIL_TOKEN_LIFETIME,
         new_email=new_email,
-        expires_at=utcnow() + timedelta(hours=24),
     )
-    await crud.create_email_token(db, email_token)
     await _audit(
         db,
         AuditEventType.EMAIL_VERIFICATION_SENT,
@@ -928,7 +1081,7 @@ async def request_email_change(
         request,
         "Email change requested",
     )
-    await send_email_change_confirmation_task.kiq(new_email, user.username, raw_token)
+    await _enqueue_token_email(token_id, user.id, EmailTokenPurpose.CHANGE_EMAIL)
     logger.info("auth.email_change_requested", user_id=str(user.id))
 
 

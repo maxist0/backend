@@ -15,16 +15,25 @@ Harness design:
   deprecated `WindowsSelectorEventLoopPolicy`, every place that creates an
   event loop passes a loop factory (`helpers.LOOP_FACTORY`; the `TestClient`
   gets it via `backend_options`). Nothing calls `set_event_loop_policy`.
+* Tasks run in the request that enqueues them: the `app` fixture's broker is
+  taskiq's `InMemoryBroker` with the worker's database hooks, so a mail task
+  really re-keys its token in the test database. `captured_emails` records
+  what the tasks hand to the mailer. Tests of the Redis transport use
+  `redis_broker_client`.
 """
 
+import html
 import os
+import re
 from dataclasses import dataclass
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 import redis as redis_sync
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import create_engine, text
+from taskiq import InMemoryBroker
 from testcontainers.community.postgres import PostgresContainer
 from testcontainers.community.redis import RedisContainer
 
@@ -156,33 +165,107 @@ def clean_db(sync_engine, migrated_db):
     yield
 
 
+def build_inline_broker(_settings) -> InMemoryBroker:
+    """A broker that runs each task inside `kiq()`, on the caller's loop.
+
+    It fires the worker events at startup, so the tasks get their
+    `TaskDbSession` from the same hooks as in a worker process. A task's
+    error is stored as its result, not raised into the request, as with a
+    real broker.
+    """
+    from app.core.tasks import add_task_db_hooks
+
+    broker = InMemoryBroker(await_inplace=True)
+    add_task_db_hooks(broker)
+    return broker
+
+
 @pytest.fixture
-def app(test_environment):
-    """A fresh app built from the wired settings.
+def app(test_environment, monkeypatch):
+    """A fresh app built from the wired settings; its tasks run in-process.
 
     The collection-time `app.main.app` was created before the containers
     existed. `create_app()` does no I/O.
     """
+    from app import main
     from app.core.config import get_settings
-    from app.main import create_app
 
-    return create_app(get_settings())
+    monkeypatch.setattr(main, "build_broker", build_inline_broker)
+    return main.create_app(get_settings())
 
 
 @pytest.fixture
 def client(app, clean_db, flush_redis):
     """A `TestClient` per test: each owns its cookie jar, so refresh-token
-    cookies cannot leak between tests."""
+    cookies cannot leak between tests.
+
+    A task that failed fails the test: the inline broker keeps task errors
+    in its results instead of raising them into the request.
+    """
     with new_test_client(app) as c:
         yield c
+        results = c.app.state.broker.result_backend.results.values()
+        errors = [repr(result.error) for result in results if result.is_err]
+        assert not errors, f"background tasks failed: {errors}"
+
+
+@pytest.fixture
+def redis_broker_client(test_environment, clean_db, flush_redis):
+    """A `TestClient` whose app enqueues on the real Redis stream broker.
+
+    No worker runs: enqueued tasks stay in the stream for the test to read.
+    """
+    from app.core.config import get_settings
+    from app.main import create_app
+
+    with new_test_client(create_app(get_settings())) as c:
+        yield c
+
+
+def run_task(client, task, *args):
+    """Enqueue `task` on the client app's broker and return once it ran.
+
+    With the `app` fixture's inline broker the task runs before this
+    returns, on the app's event loop, with the app's task database.
+    """
+
+    async def _kiq():
+        return await task.kiq(*args)
+
+    return client.portal.call(_kiq)
+
+
+# The subject tells the mails apart (`app.modules.auth.tasks`).
+_KIND_BY_SUBJECT = {
+    "Verify your email address": "verify",
+    "Reset your password": "reset",
+    "Confirm your new email address": "change_email",
+}
+_LINK = re.compile(r'href="([^"]+)"')
 
 
 @dataclass(frozen=True)
 class CapturedEmail:
-    to: str  # exactly as passed to the task (not normalised)
+    to: str
     kind: str  # "verify" | "reset" | "change_email"
-    token: str
-    username: str | None = None
+    token: str  # read from the link in the body
+    username: str
+    link: str
+    html: str
+
+    @classmethod
+    def from_message(cls, message) -> "CapturedEmail":
+        [recipient] = message.recipients
+        link = html.unescape(_LINK.search(message.body).group(1))
+        [token] = parse_qs(urlsplit(link).query)["token"]
+        return cls(
+            to=recipient.email,
+            kind=_KIND_BY_SUBJECT[message.subject],
+            token=token,
+            username=recipient.name,
+            link=link,
+            html=message.body,
+        )
 
 
 class CapturedEmails(list):
@@ -215,12 +298,24 @@ class CapturedEmails(list):
         return super().__contains__(item)
 
 
+class CapturingMailer:
+    """Stands in for fastapi-mail's `FastMail`; records instead of sending."""
+
+    def __init__(self, emails: CapturedEmails) -> None:
+        self.emails = emails
+
+    async def send_message(self, message) -> None:
+        self.emails.append(CapturedEmail.from_message(message))
+
+
 @pytest.fixture
 def captured_emails(monkeypatch) -> CapturedEmails:
-    """Record every mail the services would dispatch.
+    """Record every mail the tasks send, rendered, with recipient and token.
 
-    Services dispatch taskiq tasks via `.kiq(to, username, token)`. Those
-    calls are patched and each one is recorded as a `CapturedEmail`.
+    The mail tasks run in-process (`app` fixture) and reach the SMTP
+    boundary, `get_mailer()`, which returns a `CapturingMailer` here.
+    Without this fixture mail is not configured in the tests, and the tasks
+    send nothing.
 
     Usage:
         def test_something(client, captured_emails):
@@ -230,27 +325,11 @@ def captured_emails(monkeypatch) -> CapturedEmails:
             assert captured_emails == []  # nothing sent
     """
     emails = CapturedEmails()
-
-    def _make(kind: str):
-        async def _capture(to: str, username: str | None = None, token: str = "", *a):
-            emails.append(
-                CapturedEmail(to=to, kind=kind, token=token, username=username)
-            )
-
-        return _capture
-
-    # One patch site per task: `.kiq` is an attribute of the task object, which
-    # every caller imports from `app.modules.auth.tasks`.
-    monkeypatch.setattr(
-        "app.modules.auth.tasks.send_verification_email_task.kiq", _make("verify")
-    )
-    monkeypatch.setattr(
-        "app.modules.auth.tasks.send_password_reset_email_task.kiq", _make("reset")
-    )
-    monkeypatch.setattr(
-        "app.modules.auth.tasks.send_email_change_confirmation_task.kiq",
-        _make("change_email"),
-    )
+    mailer = CapturingMailer(emails)
+    # Both lookups: `send_templated_email` asks `app.core.mail`, the mail
+    # task checks the configuration through its own import.
+    monkeypatch.setattr("app.core.mail.get_mailer", lambda: mailer)
+    monkeypatch.setattr("app.modules.auth.tasks.get_mailer", lambda: mailer)
     return emails
 
 

@@ -360,10 +360,61 @@ async def revoke_family(
     return revoked
 
 
-async def create_email_token(db: AsyncSession, token: EmailToken) -> EmailToken:
+async def create_email_token(
+    db: AsyncSession, token: EmailToken, *, commit: bool = True
+) -> EmailToken:
+    """Add an email token; with `commit=False` the caller's commit writes it."""
     db.add(token)
-    await db.commit()
+    if commit:
+        await db.commit()
     return token
+
+
+async def lock_open_email_token(
+    db: AsyncSession, token_id: uuid.UUID
+) -> EmailToken | None:
+    """Lock and return an email token if it is still open.
+
+    Open means not used, not invalidated and not expired. The row lock
+    (`FOR NO KEY UPDATE`, held until the transaction ends) makes a
+    redemption or an invalidation of this token wait, so it sees the hash
+    the caller sets; a token that a committed change closed meanwhile is
+    not returned. `email_tokens` is first in the lock order. Does not
+    commit.
+    """
+    result = await db.execute(
+        select(EmailToken)
+        .where(
+            EmailToken.id == token_id,
+            EmailToken.used_at.is_(None),
+            EmailToken.invalidated_at.is_(None),
+            EmailToken.expires_at > func.now(),
+        )
+        .with_for_update(key_share=True)
+    )
+    return result.scalars().first()
+
+
+async def set_email_token_hash(
+    db: AsyncSession, token_id: uuid.UUID, token_hash: str
+) -> None:
+    """Replace the stored hash of an email token. Does not commit."""
+    await db.execute(
+        update(EmailToken)
+        .where(EmailToken.id == token_id)
+        .values(token_hash=token_hash)
+        .execution_options(synchronize_session=False)
+    )
+
+
+async def invalidate_email_token(db: AsyncSession, token_id: uuid.UUID) -> None:
+    """Soft-invalidate one email token. Does not commit."""
+    await db.execute(
+        update(EmailToken)
+        .where(EmailToken.id == token_id, EmailToken.invalidated_at.is_(None))
+        .values(invalidated_at=utcnow())
+        .execution_options(synchronize_session=False)
+    )
 
 
 async def consume_email_token(

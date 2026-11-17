@@ -53,7 +53,10 @@ class TestRenderer:
         logger.info("probe.first")
         setup_logging(
             settings_factory(
-                ENVIRONMENT="test", JWT_SECRET_KEY="k" * 48, ADMIN_ENABLED=False
+                ENVIRONMENT="test",
+                JWT_SECRET_KEY="k" * 48,
+                FRONTEND_URL="https://app.example.com",
+                ADMIN_ENABLED=False,
             )
         )
 

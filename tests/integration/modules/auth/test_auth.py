@@ -1,9 +1,9 @@
 """Integration tests for the `/api/v1/auth` endpoints.
 
 Real PostgreSQL and Redis come from the integration fixtures; no service layer
-is mocked, so every test exercises the full stack. The `captured_emails`
-fixture intercepts the email task `.kiq(...)` calls and records every mail
-(recipient, kind, token) without an SMTP server;
+is mocked, so every test exercises the full stack. The mail tasks run
+in-process; the `captured_emails` fixture records every mail they send
+(recipient, kind, token, link) without an SMTP server;
 `captured_emails[addr]` returns the latest token.
 """
 
@@ -276,6 +276,37 @@ class TestRefresh:
             headers={"Cookie": f"refresh_token={newest_refresh}"},
         )
         assert r2.status_code == 401
+
+    @staticmethod
+    def _assert_cookie_cleared(response) -> None:
+        set_cookie = response.headers["set-cookie"].lower()
+        assert set_cookie.startswith('refresh_token="";')
+        assert "max-age=0" in set_cookie
+        assert "path=/api/v1/auth" in set_cookie
+
+    def test_reused_token_answer_clears_the_cookie(self, client, captured_emails):
+        register(client, username="alice")
+        login(client, username="alice")
+        old_refresh = client.cookies.get("refresh_token")
+        assert client.post("/api/v1/auth/refresh").status_code == 200
+        client.cookies.clear()
+
+        r = client.post(
+            "/api/v1/auth/refresh", headers={"Cookie": f"refresh_token={old_refresh}"}
+        )
+
+        assert r.status_code == 401
+        assert r.json()["code"] == "invalid_refresh_token"
+        assert r.headers["www-authenticate"] == "Bearer"
+        self._assert_cookie_cleared(r)
+
+    def test_unknown_token_answer_clears_the_cookie(self, client):
+        r = client.post(
+            "/api/v1/auth/refresh", headers={"Cookie": "refresh_token=unknown"}
+        )
+
+        assert r.status_code == 401
+        self._assert_cookie_cleared(r)
 
     def test_without_cookie_returns_401(self, client):
         r = client.post("/api/v1/auth/refresh")

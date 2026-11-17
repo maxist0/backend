@@ -115,10 +115,10 @@ class TestMailer:
 
         assert mail.get_mailer() is None
 
-    def test_sending_without_configuration_is_skipped(self, monkeypatch):
+    def test_sending_without_configuration_reports_nothing_sent(self, monkeypatch):
         monkeypatch.setattr(mail, "get_mailer", lambda: None)
 
-        asyncio.run(
+        sent = asyncio.run(
             mail.send_templated_email(
                 to="someone@example.com",
                 subject="s",
@@ -126,6 +126,8 @@ class TestMailer:
                 context={},
             )
         )
+
+        assert sent is False
 
     def test_sending_passes_the_rendered_html_body(
         self, monkeypatch, tmp_path, mail_settings
@@ -147,7 +149,7 @@ class TestMailer:
             mail, "get_settings", lambda: mail_settings(APP_NAME="Probe")
         )
 
-        asyncio.run(
+        outcome = asyncio.run(
             mail.send_templated_email(
                 to="someone@example.com",
                 subject="s",
@@ -157,6 +159,7 @@ class TestMailer:
             )
         )
 
+        assert outcome is True
         ((message, template_name),) = sent
         assert template_name is None
         assert message.subtype is MessageType.html

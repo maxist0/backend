@@ -42,7 +42,7 @@ from tests.helpers import (
 
 @pytest.fixture(autouse=True)
 def _no_real_email_dispatch(captured_emails):
-    """Every test here registers users; keep `.kiq` off the real taskiq broker."""
+    """Every test here registers users; record their mails instead of skipping them."""
     return captured_emails
 
 

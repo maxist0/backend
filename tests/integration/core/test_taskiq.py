@@ -24,7 +24,7 @@ from app.core.tasks import (
     build_retry_source,
     taskiq_heartbeat,
 )
-from app.modules.auth.tasks import send_verification_email_task
+from app.modules.auth.tasks import send_token_email_task
 from tests.helpers import run_async
 
 
@@ -180,8 +180,8 @@ def _fail(exc: BaseException) -> None:
         middleware.set_broker(broker)
         message = TaskiqMessage(
             task_id="t-2",
-            task_name=send_verification_email_task.task_name,
-            labels=dict(send_verification_email_task.labels),
+            task_name=send_token_email_task.task_name,
+            labels=dict(send_token_email_task.labels),
             args=[],
             kwargs={},
         )
@@ -206,7 +206,7 @@ def test_transient_failure_is_stored_as_a_json_retry_schedule():
         schedule = json.loads(r.get(data_key))
         queued_ids = r.lrange(time_key, 0, -1)
 
-    assert schedule["task_name"] == "email.send_verification_email"
+    assert schedule["task_name"] == "email.send_token_email"
     assert schedule["task_id"] == "t-2"
     assert schedule["time"] is not None
     assert queued_ids == [schedule["schedule_id"].encode()]
@@ -219,10 +219,12 @@ def test_permanent_failure_stores_no_retry():
         assert r.keys(f"{RETRY_SCHEDULE_PREFIX}:*") == []
 
 
-def test_api_broker_declares_the_group_without_worker_middlewares(client):
+def test_api_broker_declares_the_group_without_worker_middlewares(
+    redis_broker_client,
+):
     """The API creates the consumer group at startup, so tasks enqueued
     before any worker runs are delivered; it carries no worker middleware."""
-    broker = client.app.state.broker
+    broker = redis_broker_client.app.state.broker
 
     with _broker_redis() as r:
         groups = [g["name"] for g in r.xinfo_groups(TASK_STREAM)]

@@ -84,8 +84,8 @@ def register(
 def register_ok(client, *, username: str, **kwargs):
     """register() that fails loudly unless the API answered 201.
 
-    Callers must use the `captured_emails` fixture: without it the email task
-    is enqueued on the real broker, and the test cannot read the token.
+    Callers that need the verification token use the `captured_emails`
+    fixture: without it mail is not configured and nothing is sent.
     """
     r = register(client, username=username, **kwargs)
     assert r.status_code == 201, f"register failed: {r.status_code} {r.text[:200]}"

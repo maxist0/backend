@@ -24,6 +24,7 @@ STRONG = {
     "JWT_SECRET_KEY": "k" * 48,
     "ADMIN_PASSWORD": "a-long-random-admin-password-1234",
     "ADMIN_SECRET_KEY": "s" * 48,
+    "FRONTEND_URL": "https://app.example.com",
 }
 DEFAULTS = {
     "JWT_SECRET_KEY": "your-super-secret-jwt-key-change-in-production",
@@ -57,6 +58,7 @@ class TestStartupGuard:
         s = settings_factory(
             ENVIRONMENT=env,
             JWT_SECRET_KEY=STRONG["JWT_SECRET_KEY"],
+            FRONTEND_URL=STRONG["FRONTEND_URL"],
             ADMIN_ENABLED=admin_enabled,
         )
 
@@ -108,6 +110,28 @@ class TestStartupGuard:
         s = settings_factory(ENVIRONMENT="prod", **STRONG)
         assert s.is_production
 
+    @pytest.mark.parametrize("env", ["prod", "stage", "test"])
+    @pytest.mark.parametrize(
+        ("frontend_url", "problem"),
+        [
+            (None, "FRONTEND_URL is the development default"),
+            ("http://localhost:5173", "FRONTEND_URL is the development default"),
+            ("http://app.example.com", "FRONTEND_URL must use https"),
+        ],
+        ids=["unset", "default", "http"],
+    )
+    def test_frontend_url_outside_dev_must_be_https_and_not_the_default(
+        self, settings_factory, env, frontend_url, problem
+    ):
+        """Email links carry tokens: they must not point at a dev server or
+        travel over plain http."""
+        kwargs = {k: v for k, v in STRONG.items() if k != "FRONTEND_URL"}
+        if frontend_url is not None:
+            kwargs["FRONTEND_URL"] = frontend_url
+
+        with pytest.raises(ValueError, match=problem):
+            settings_factory(ENVIRONMENT=env, ADMIN_ENABLED=False, **kwargs)
+
     @pytest.mark.parametrize("env", ["dev", "unittest"])
     def test_defaults_are_still_allowed_in_dev_and_unittest(
         self, settings_factory, env
@@ -118,8 +142,9 @@ class TestStartupGuard:
     def test_secrets_are_not_exposed_by_repr_or_str(self, settings_factory):
         s = settings_factory(**STRONG)
         text = repr(s) + str(s)
-        for value in STRONG.values():
-            assert value not in text
+        for name, value in STRONG.items():
+            if name != "FRONTEND_URL":  # not a secret
+                assert value not in text
 
     def test_default_secrets_are_not_exposed_by_repr(self, settings_factory):
         text = repr(settings_factory())

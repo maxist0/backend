@@ -71,7 +71,9 @@ def ensure_supported_event_loop() -> None:
     (https://www.psycopg.org/psycopg3/docs/advanced/async.html). uvicorn uses
     that loop on Windows for a single process; `run.py` selects a
     `SelectorEventLoop` instead, `fastapi dev` (reload) and multi-worker
-    runs get one from uvicorn. Must be called inside the running loop.
+    runs get one from uvicorn. The `taskiq worker` CLI always uses the
+    default loop; `python -m app.worker` selects a `SelectorEventLoop`.
+    Must be called inside the running loop.
     """
     if sys.platform == "win32":
         loop = asyncio.get_running_loop()
@@ -79,8 +81,8 @@ def ensure_supported_event_loop() -> None:
             raise UnsupportedEventLoopError(
                 "The database driver (psycopg) cannot run on Windows' "
                 "ProactorEventLoop. Start the API with 'python run.py dev' or "
-                "'fastapi dev' (or 'fastapi run --workers 2'), which use a "
-                "SelectorEventLoop."
+                "'fastapi dev' (or 'fastapi run --workers 2') and the worker "
+                "with 'python -m app.worker'; they use a SelectorEventLoop."
             )
 
 

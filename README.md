@@ -293,7 +293,9 @@ All primary keys are UUIDv4 generated in the application. Timestamps are `timest
 ### Caching and background work
 
 - **Cache:** `@cached(ttl, key)` and `invalidate(pattern)` from `app.core` cache return values of service functions in Redis ([ADR 0003](documentation/adr/0003-caching-via-cached-decorator.md)). Values are stored as JSON, never pickled, so a value in Redis cannot run code in the app. There is no HTTP response cache.
-- **Jobs:** `taskiq` with taskiq-redis' `RedisStreamBroker` on Redis db 1 (stream `taskiq:tasks`, consumer group `taskiq`), results in db 2 for one hour, stored as JSON ([ADR 0009](documentation/adr/0009-taskiq-redis-stream-broker-and-delayed-retries.md)). Delivery is at least once: a worker acknowledges a message after the task and deletes the entry together with the acknowledgement, and a message unacknowledged for 10 minutes goes to another worker, so tasks must be idempotent. Tasks are declared with `@task(task_name=...)` in a module's `tasks.py`. A task labelled `retry_on_error=True` that raises `TransientTaskError` is retried `TASKIQ_RETRY_COUNT` times, `TASKIQ_RETRY_DELAY_SECONDS` apart. The retry is stored as a JSON schedule (keys `taskiq_retry:*` in db 1), and the scheduler sends it. The scheduler reads those retries and the `schedule=[{"cron": ...}]` labels. Run exactly one scheduler. Worker and scheduler are separate Swarm services. While Redis is unreachable, or the consumer group has vanished (`FLUSHALL`), the worker logs `taskiq.broker_unavailable` with the consecutive failures and the outage duration every few seconds, then `taskiq.broker_reconnected`, and resumes on its own. Wrong Redis credentials stop it.
+- **Jobs:** `taskiq` with taskiq-redis' `RedisStreamBroker` on Redis db 1 (stream `taskiq:tasks`, consumer group `taskiq`), results in db 2 for one hour, stored as JSON ([ADR 0009](documentation/adr/0009-taskiq-redis-stream-broker-and-delayed-retries.md)). Delivery is at least once: a worker acknowledges a message after the task and deletes the entry together with the acknowledgement, and a message unacknowledged for 10 minutes goes to another worker, so tasks must be idempotent. Tasks are declared with `@task(task_name=...)` in a module's `tasks.py`; a task that needs the database takes a `TaskDbSession`, and each worker process opens its own connection pool at startup (the scheduler opens none). A task labelled `retry_on_error=True` that raises `TransientTaskError` is retried `TASKIQ_RETRY_COUNT` times, `TASKIQ_RETRY_DELAY_SECONDS` apart. The retry is stored as a JSON schedule (keys `taskiq_retry:*` in db 1), and the scheduler sends it. The scheduler reads those retries and the `schedule=[{"cron": ...}]` labels. Run exactly one scheduler. Worker and scheduler are separate Swarm services. While Redis is unreachable, or the consumer group has vanished (`FLUSHALL`), the worker logs `taskiq.broker_unavailable` with the consecutive failures and the outage duration every few seconds, then `taskiq.broker_reconnected`, and resumes on its own. Wrong Redis credentials stop it.
+- **Token emails** (verification, password reset, email change; [ADR 0010](documentation/adr/0010-token-emails-rekeyed-in-the-worker.md)): the request writes the token row with the hash of a value that is never sent and enqueues only the token's id, after the commit. The worker locks that token, gives it a fresh value if it is still open, commits, and mails an absolute link `FRONTEND_URL` + `FRONTEND_VERIFY_EMAIL_PATH` or `FRONTEND_RESET_PASSWORD_PATH` + `?token=…`. Every run (retry, redelivery) sets a new value, so only the latest mail's link works; the expiry stays as the request set it, so a late retry finds the token closed and sends nothing. A newer request closes the older tokens of its purpose, and redeeming a token closes every other open token of the same user and purpose. No token, address or username is stored in Redis. The worker sends nothing for an inactive or admin-locked account or an already verified address (and invalidates that token), and logs `email.not_sent` with a `reason` (`no_open_token`, `account_blocked`, `already_verified`, `mail_not_configured`); a sent mail logs `email.sent`. The audit rows (`email_verification_sent`, `password_reset_requested`) record the request, with a "requested" detail; the worker's log records whether a mail went out. A failure to enqueue is logged as `auth.email_enqueue_failed` and answered like a success.
+- **Database errors in tasks:** the core `task` decorator replaces a database error by `TaskDatabaseError`, whose message holds only the exception types and the SQLSTATE, because taskiq logs a failed task's exception and stores it as the result (Redis db 2, one hour), and PostgreSQL messages can quote row values. Lost connections (class 08, or no SQLSTATE), deadlocks (40P01), serialization failures (40001) and an admin shutdown (57P01) become `TransientTaskDatabaseError` and are retried when the task sets `retry_on_error=True`.
 
 ### Observability
 
@@ -379,7 +381,7 @@ Implemented:
 
 Not yet implemented (tracked in the [Roadmap](#roadmap) and the [review backlog](documentation/review-2026-11/README.md)):
 
-- `Secure` flag and `__Host-` prefix on the refresh cookie
+- `Secure` flag and `__Secure-` prefix on the refresh cookie
 - Rate limiting (per IP and per account), request body size limit, request timeout
 - JWT `iss` and `aud` claims
 - HSTS (owned by the TLS-terminating proxy), CSP `frame-ancestors 'none'`
@@ -397,7 +399,7 @@ All settings are environment variables read by `Settings` (`src/common/config.py
 |---|---|---|
 | `ENVIRONMENT` | `dev` | `dev`, `unittest`, `test`, `stage`, `prod` |
 | `DATABASE_URL` | `postgresql+asyncpg://postgres:postgres@localhost:5432/api` | asyncpg driver required at runtime |
-| `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` | `10` / `20` | per process |
+| `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` | `10` / `20` | Per process: every API process and every taskiq worker process has its own pool. Size PostgreSQL's `max_connections` for both |
 | `CACHE_HOST` / `CACHE_PORT` / `CACHE_DB` / `CACHE_PASSWORD` | `localhost` / `6379` / `0` / empty | Redis for `RedisDep` and `@cached` (refresh tokens are not stored in Redis) |
 | `TASKIQ_BROKER_URL` / `TASKIQ_RESULT_BACKEND_URL` | Redis db 1 / db 2 | Task stream and retry schedules / task results (1 h TTL). The broker's Redis must not evict keys (`noeviction`) |
 | `TASKIQ_WORKERS` | `2` | `1..64`. Processes of `taskiq worker` started by `run.py dev` (on Windows always one) |
@@ -410,11 +412,12 @@ All settings are environment variables read by `Settings` (`src/common/config.py
 | `ARGON2_TIME_COST` / `ARGON2_MEMORY_KIB` / `ARGON2_PARALLELISM` | `3` / `65536` / `4` | Argon2id parameters. Minimums `≥2` / `≥19456` / `≥1` (OWASP minimum), validated in every environment; lower values stop startup |
 | `LOGIN_MAX_ATTEMPTS` / `LOGIN_LOCKOUT_SECONDS` | `5` / `900` | Consecutive failed password logins that set a timed lock, and its length. Bounds `1..100` (NIST SP 800-63B-4 3.2.2) / `1..86400` |
 | `PASSWORD_HASH_CONCURRENCY` | `4` | `≥1`, validated in every environment. Maximum concurrent Argon2 operations and concurrent login credential checks per process (the bound is N × this value with N processes); each Argon2 operation needs `ARGON2_MEMORY_KIB` of RAM |
-| `MAIL_*` | unset | mail is skipped when incomplete |
+| `MAIL_*` | unset | Without username, password, sender and server the mail task sends nothing and logs `email.not_sent` (`reason=mail_not_configured`) |
 | `LOG_LEVEL` / `ACCESS_LOG_ENABLED` / `METRICS_ENABLED` | `INFO` / `true` / `true` | Logs go to stdout only; `METRICS_ENABLED` mounts `/metrics` |
 | `READINESS_TIMEOUT_SECONDS` | `2` | Per check of `GET /health/ready` (`>0`, `≤30`) |
 | `API_PREFIX` | `/api/v1` | Path prefix of every module router (the API version) and of the refresh cookie path (`<API_PREFIX>/auth`). Empty, or segments of `[A-Za-z0-9._~-]` without a trailing slash. `/`, `/health`, `/health/ready` and `/metrics` stay unprefixed |
-| `FRONTEND_URL` | `http://localhost:3000` | used in email links |
+| `FRONTEND_URL` | `http://localhost:5173` | Base of the links in emails (the frontend's dev server by default): `http(s)://host[:port][/path]`, no userinfo, query or fragment; a trailing slash is ignored. Startup guard outside `dev`/`unittest`: must use `https` and must not be the default |
+| `FRONTEND_VERIFY_EMAIL_PATH` / `FRONTEND_RESET_PASSWORD_PATH` | `/user/email-bestaetigen` / `/user/passwort-zuruecksetzen` | Frontend pages of the verification and email-change links and of the password-reset link, appended to `FRONTEND_URL` with `?token=<url-encoded token>`. Absolute paths of non-empty segments only: no scheme, host, query or fragment |
 | `CORS_ORIGINS` | `["http://localhost:5173"]` | JSON list of browser origins allowed with credentials. `*` and values with a path are refused in every environment |
 | `HOST` / `PORT` | `0.0.0.0` / `8000` | |
 | `FORWARDED_ALLOW_IPS` | `127.0.0.1` | Comma-separated proxy addresses whose `X-Forwarded-For`/`-Proto` uvicorn trusts (`run.py` enables proxy headers). Set it to the reverse proxy's addresses, or every client IP is the proxy's |
@@ -475,9 +478,9 @@ This is the original implementation plan. The re-prioritised plan from the Novem
 
 - [x] Startup guard: refuse to boot outside `dev`/`unittest` when `JWT_SECRET_KEY` (or, with the admin panel enabled, `ADMIN_PASSWORD`/`ADMIN_SECRET_KEY`) carries a default; require `len(JWT_SECRET_KEY) >= 32` (and, with the admin panel enabled, 32 characters for both admin secrets). Partly: `DATABASE_URL` defaults are not checked.
 - [ ] Pin the JWT algorithm allowlist in code; add `iss`, `aud`, `typ=access`; verify `type` on decode; reject tokens without `jti`. *RFC 8725 checklist satisfied.* Partly done: algorithm pinned, claims `exp`/`iat`/`nbf`/`sub`/`jti` required, `type=access` verified, `sub` must be a UUID. `iss` and `aud` are still missing.
-- [ ] Refresh cookie: `Secure=True` outside `dev`, `SameSite=Strict` where the frontend allows it, `__Host-` prefix, explicit `max_age`.
+- [ ] Refresh cookie: `Secure=True` outside `dev`, `SameSite=Strict` where the frontend allows it, `__Secure-` prefix (`__Host-` requires `Path=/` and would widen the cookie's path), explicit `max_age`. The deletion (`_delete_refresh_cookie`) must carry the same attributes.
 - [x] Revoke all sessions on password reset and password change; add `POST /auth/logout-all`. (Password change keeps the caller's session.)
-- [x] Complete the email-change flow: `PUT /users/me/email` creates a pending change, `POST /auth/email/verify` consumes the `CHANGE_EMAIL` token (no separate confirm endpoint), dedicated template (`confirm_email_change.html`), `EMAIL_CHANGED` audit event; confirming invalidates open password-reset tokens. The `FRONTEND_URL` in the reset link is tracked in the email-links item below (Known issue 7).
+- [x] Complete the email-change flow: `PUT /users/me/email` creates a pending change, `POST /auth/email/verify` consumes the `CHANGE_EMAIL` token (no separate confirm endpoint), dedicated template (`confirm_email_change.html`), `EMAIL_CHANGED` audit event; confirming invalidates open password-reset tokens.
 - [ ] Rate limiting with `limits` + Redis: per IP on `/auth/*`, per account on login; return `429` with `Retry-After`. Decouple lockout from DoS by lockout-by-IP-window instead of hard account locks. Partly mitigated in Phase 0b: the timed account lock blocks only password login and leaves existing sessions valid, and a per-process admission limiter bounds login bursts; both remain no substitute for rate limits.
 - [x] Uniform credential error (`Invalid username or password`, code `invalid_credentials`) for locked, inactive and unknown accounts; the real reason is logged and audited server-side only.
 - [ ] Security headers: add HSTS (behind TLS), `Cache-Control: no-store` on authenticated responses, `Content-Security-Policy: frame-ancestors 'none'`; drop `X-XSS-Protection`. Partly done: `X-XSS-Protection` is gone and every response under `API_PREFIX` gets `Cache-Control: no-store`; HSTS belongs to the TLS proxy; the CSP is still open.
@@ -488,8 +491,8 @@ This is the original implementation plan. The re-prioritised plan from the Novem
 - [ ] Request limits: `max_body_size`, per-request timeout, `strict_content_type` kept on.
 - [x] Pydantic request models with `extra="forbid"`; separate create/update/response schemas (OWASP API3). Every request model of the `auth` and `users` modules forbids extra fields (`schemas.py`); the login form is OAuth2 form data.
 - [ ] `SECURITY.md` with disclosure process and supported versions.
-- [ ] Email links to the frontend routes (requested by the frontend, [task 2](../frontend/documentation/backend-contract.md#backend-task-2-email-links-to-the-frontend-routes)): absolute URLs from `FRONTEND_URL` to `/user/email-bestaetigen?token=`, `/user/passwort-zuruecksetzen?token=` and `/user/einladung?token=` (`/en/user/…` when the user's locale is known); URL-encoded token; fix the `FRONTEND_URL` default (frontend dev server runs on 5173). Fixes Known issue 7.
-- [ ] `POST /auth/password/forgot`: return 200 even when the email task fails (log internally) and equalise response times for known and unknown addresses (requested by the frontend, [task 3](../frontend/documentation/backend-contract.md#backend-task-3-distinct-error-codes-and-a-consistent-forgot-password-answer); OWASP Forgot Password Cheat Sheet).
+- [ ] Email links to the frontend routes (requested by the frontend, [task 2](../frontend/documentation/backend-contract.md#backend-task-2-email-links-to-the-frontend-routes)). Done: absolute URLs from `FRONTEND_URL` to `/user/email-bestaetigen?token=` and `/user/passwort-zuruecksetzen?token=` (paths are settings), URL-encoded token, `FRONTEND_URL` default `http://localhost:5173`; fixes Known issue 7. Open: `/en/user/…` once the user's locale is stored (user settings), and `/user/einladung?token=` with the invitation flow (task 1).
+- [ ] `POST /auth/password/forgot` (requested by the frontend, [task 3](../frontend/documentation/backend-contract.md#backend-task-3-distinct-error-codes-and-a-consistent-forgot-password-answer); OWASP Forgot Password Cheat Sheet). Done: the answer is always 202, also when enqueueing the mail fails (logged as `auth.email_enqueue_failed`) and for an inactive or admin-locked account (no token, no mail, an audit row). Open: equal response times for known and unknown addresses (Known issue 23, with rate limiting).
 
 ### Phase 2: API contract
 
@@ -562,18 +565,18 @@ Fixed in Phase 0:
 - ~~13~~ `ruff format --check` passes.
 - ~~14~~ Not reproducible: the virtualenv runs Python 3.14.4.
 
-Fixed in the 2026-11 cleanup (S1.3, S1.4, S1.5):
+Fixed in the 2026-11 cleanup (S1.3, S1.4, S1.5, S2.2):
 
 - ~~6~~ The email-change token is consumed by `POST /auth/email/verify`; `PUT /users/me/email` replaces the email part of `PATCH /user/me`, and a dedicated template is sent to the new address.
 - ~~4~~ `/metrics` is served at the exact path and never counted as a request.
 - ~~12~~ The `Dockerfile` healthcheck targets `/health`, which works with `METRICS_ENABLED=false`.
+- ~~7~~ The password-reset email link is absolute (`FRONTEND_URL` + `FRONTEND_RESET_PASSWORD_PATH`), and every token link URL-encodes the token (S2.2).
 - ~~15~~ Admin CSRF: sqladmin runs custom actions as `GET` requests. The admin session cookie is now `SameSite=Strict`, `HttpOnly`, `Secure` outside `dev`/`unittest`, and expires 8 hours after login. A fail-safe Fetch Metadata guard answers 403 to every state-changing admin request (unsafe methods and actions) that does not carry `Sec-Fetch-Site: same-origin`, a missing header included ([OWASP CSRF cheat sheet, Fetch Metadata headers](https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html)). Browsers without the header (before the March 2023 baseline) cannot log in to the admin or run actions.
 
 Open:
 
 2. `tests/conftest.py` runs `alembic upgrade head` and `Base.metadata.create_all` on the same database, and `asyncio.run()` shares the application's `AsyncEngine` across event loops. [Phase 0]
-7. The password-reset email link is relative (`/auth/reset-password?token=`) and lacks `FRONTEND_URL`. [Phase 1]
-8. Refresh cookie is set without `Secure`. [Phase 1]
+8. Refresh cookie is set without `Secure`. When `Secure` or a name prefix is added, `_delete_refresh_cookie` in `modules/auth/router.py` must send the same name and attributes, or browsers keep the old cookie. Use `__Secure-`, not `__Host-`: `__Host-` requires `Path=/`, which conflicts with the narrow `<API_PREFIX>/auth` path. [Phase 1]
 9. `pytest` `--cov-fail-under=80` and `[tool.coverage.report] fail_under = 85` conflict. [Phase 0]
 10. Partly fixed: `BCRYPT_ROUNDS`, `CACHE_KEY_PREFIX`, `ROUTE_CACHE_*`, `DEBUG` and `OTLP_*` are removed. Still unused settings: `REDIS_URL` (set by tests). `MAIL_*` values are read through `os.getenv` rather than `Settings`. [Phase 0]
 11. Partly fixed: `alembic/env.py` no longer overrides injected variables, but it still loads `.env.local` in dev. [Phase 4]
@@ -584,6 +587,9 @@ Open:
 20. On a Linux host shared by several users, the worker's default `PROMETHEUS_MULTIPROC_DIR` (`/tmp/taskiq-metrics`) is a predictable path in the shared `/tmp`: another local user can create it first, plant symlinks or alter the metric files. Containers, Windows and macOS (per-user temp directories) are not affected. The deploy round sets an explicit directory on a tmpfs. [deploy round]
 21. **Accepted for now:** there is no dead-letter queue and no delivery cap. A message whose worker dies on every attempt (for example a crash after the mail was sent but before the acknowledgement) is redelivered every 10 minutes without end.
 22. **Accepted for now:** when the scheduler fails to send a due retry (a short Redis outage during the send), taskiq's scheduler does not try that retry again until the scheduler restarts.
+23. `POST /auth/password/forgot` answers an unknown address at once, a known inactive or admin-locked account after an audit row, and a known active account after a token, an audit row and the enqueue: three timing classes, so the response time tells whether an address is registered and roughly in which state. The answer itself is always 202. Like Known issue 17, the control is rate limiting ([D4](#open-decisions)); equal timing is not attempted before it. [D4, review plan Phase 4]
+24. Retry schedules (`taskiq_retry:*`) never expire: while the scheduler is down they pile up, and the scheduler sends every overdue one when it starts again. For the token mails this is harmless (the schedule holds only the token's id, and a run after the link's expiry sends nothing); a future task with time-sensitive effects must check its own deadline. [Phase 3]
+25. **Accepted:** a refresh that fails with 401 clears the refresh cookie (same name and path). If that 401 reaches the browser after the response of a login made in parallel, it deletes the new login's cookie, and the user has to sign in again. This affects availability only.
 
 ---
 

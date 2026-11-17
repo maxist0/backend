@@ -24,8 +24,8 @@ os.environ["ADMIN_ENABLED"] = "true"
 # points at a closed port, so nothing imported early can reach a developer's
 # own Postgres or Redis on the default ports. Unit tests keep these addresses
 # for the whole run: they never connect. In the integration suite the app
-# lifespan builds the taskiq broker from the wired settings; tests that
-# register users use `captured_emails`, so no mail task is enqueued.
+# lifespan builds the taskiq broker from the wired settings; the `app`
+# fixture replaces it with an in-process broker, so tasks run in the test.
 _UNREACHABLE = "127.0.0.1:1"
 os.environ["DATABASE_URL"] = f"postgresql+psycopg://x:x@{_UNREACHABLE}/unconfigured"
 os.environ["CACHE_HOST"] = "127.0.0.1"

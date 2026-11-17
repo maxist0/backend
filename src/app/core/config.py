@@ -39,6 +39,18 @@ _DISTRIBUTION_NAME = "api"
 _UNKNOWN_VERSION = "0.0.0+unknown"
 # A browser `Origin` value: scheme and host with an optional port, no path.
 _ORIGIN = re.compile(r"https?://[^/\s]+")
+# An absolute URL path of non-empty segments of RFC 3986 `pchar`s: no scheme,
+# no host (`//host` has an empty first segment), no query or fragment.
+_FRONTEND_PATH = r"^(/[A-Za-z0-9._~!$&'()*+,;=:@%-]+)+$"
+# The base of the email links: http(s), a host name (ASCII, IDNs in punycode)
+# or a bracketed IPv6 address, an optional port and an optional path of RFC
+# 3986 `pchar`s. Nothing else: no userinfo (`user@host` disguises the real
+# host), no query or fragment (the link appends `?token=`).
+_FRONTEND_URL = (
+    r"^https?://([A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(:[0-9]{1,5})?"
+    r"(/[A-Za-z0-9._~!$&'()*+,;=:@%-]*)*$"
+)
+_DEFAULT_FRONTEND_URL = "http://localhost:5173"
 # RFC 1123 hostname: dot-separated labels of letters, digits and inner hyphens.
 _HOSTNAME = re.compile(
     r"(?=.{1,253}$)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
@@ -197,8 +209,17 @@ class Settings(BaseSettings):
     # the health endpoints stay unprefixed. Empty, or segments without a
     # trailing slash.
     API_PREFIX: str = Field(default="/api/v1", pattern=r"^(/[A-Za-z0-9._~-]+)*$")
-    FRONTEND_URL: str = (
-        "http://localhost:3000"  # used for email links; override in production
+    # Base of the links in emails (scheme, host, optional port and path);
+    # the default is the frontend's dev server. The startup guard requires an
+    # https value other than the default outside dev and unittest.
+    FRONTEND_URL: str = Field(default=_DEFAULT_FRONTEND_URL, pattern=_FRONTEND_URL)
+    # Frontend pages the email links open, appended to FRONTEND_URL: absolute
+    # paths only, so a value cannot point the link at another host.
+    FRONTEND_VERIFY_EMAIL_PATH: str = Field(
+        default="/user/email-bestaetigen", pattern=_FRONTEND_PATH
+    )
+    FRONTEND_RESET_PASSWORD_PATH: str = Field(
+        default="/user/passwort-zuruecksetzen", pattern=_FRONTEND_PATH
     )
 
     # Browser origins allowed to call the API with credentials (CORS). A JSON
@@ -272,10 +293,12 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _refuse_insecure_defaults(self) -> Self:
-        """Startup guard: no public default secrets outside dev and unittest.
+        """Startup guard: no public defaults outside dev and unittest.
 
-        Admin secrets are only checked when the admin panel is enabled, because
-        they are not used otherwise.
+        Covers the secrets and `FRONTEND_URL`, which must be an https URL
+        other than the dev server: email links carry tokens. Admin secrets
+        are only checked when the admin panel is enabled, because they are
+        not used otherwise.
         """
         if self.ENVIRONMENT in (Environment.DEV, Environment.UNITTEST):
             return self
@@ -288,6 +311,10 @@ class Settings(BaseSettings):
             problems.append(
                 f"JWT_SECRET_KEY is shorter than {_MIN_JWT_SECRET_LENGTH} characters"
             )
+        if self.FRONTEND_URL == _DEFAULT_FRONTEND_URL:
+            problems.append("FRONTEND_URL is the development default")
+        elif not self.FRONTEND_URL.startswith("https://"):
+            problems.append("FRONTEND_URL must use https")
         if self.admin_enabled:
             admin_secrets = (
                 ("ADMIN_PASSWORD", self.ADMIN_PASSWORD, _DEFAULT_ADMIN_PASSWORD),

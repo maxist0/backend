@@ -105,7 +105,7 @@ class TestLifespan:
 
     def test_lifespan_starts_and_stops_the_taskiq_broker(self, monkeypatch):
         """The broker is started, used for `.kiq()` and shut down on exit."""
-        from app.modules.auth.tasks import send_verification_email_task
+        from app.modules.auth.tasks import send_token_email_task
 
         events: list[str] = []
         real_build_broker = main.build_broker
@@ -131,7 +131,7 @@ class TestLifespan:
         with new_test_client(app):
             assert events == ["startup"]
             broker = app.state.broker
-            assert send_verification_email_task.kicker().broker is broker
+            assert send_token_email_task.kicker().broker is broker
 
         assert events == ["startup", "shutdown"]
 

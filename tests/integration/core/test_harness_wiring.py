@@ -10,9 +10,9 @@ class TestHarness:
         assert kwargs["port"] == int(os.environ["CACHE_PORT"])
         assert kwargs["port"] != 6379
 
-    def test_taskiq_broker_uses_the_redis_container(self, client):
+    def test_taskiq_broker_uses_the_redis_container(self, redis_broker_client):
         """The lifespan builds the broker from the wired settings."""
-        broker = client.app.state.broker
+        broker = redis_broker_client.app.state.broker
         redis_port = int(os.environ["CACHE_PORT"])
         broker_kwargs = broker.connection_pool.connection_kwargs
         backend_kwargs = broker.result_backend.redis_pool.connection_kwargs

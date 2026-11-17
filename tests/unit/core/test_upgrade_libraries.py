@@ -64,17 +64,11 @@ class TestSqlAlchemy21:
 
 class TestTaskiqBroker:
     def test_tasks_are_registered_on_the_broker(self):
-        """0.13: broker API unchanged; both mail tasks are registered."""
+        """0.13: broker API unchanged; the mail task is registered."""
         from app.core.config import get_settings
         from app.core.tasks import build_broker
-        from app.modules.auth.tasks import (
-            send_password_reset_email_task,
-            send_verification_email_task,
-        )
+        from app.modules.auth.tasks import send_token_email_task
 
         names = set(build_broker(get_settings()).get_all_tasks())
 
-        assert {
-            send_verification_email_task.task_name,
-            send_password_reset_email_task.task_name,
-        } <= names
+        assert send_token_email_task.task_name in names

@@ -17,6 +17,7 @@ STRONG = {
     "JWT_SECRET_KEY": "k" * 48,
     "ADMIN_PASSWORD": "a-long-random-admin-password-1234",
     "ADMIN_SECRET_KEY": "s" * 48,
+    "FRONTEND_URL": "https://app.example.com",
 }
 
 

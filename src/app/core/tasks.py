@@ -15,25 +15,45 @@ a task can run twice, so every task must be idempotent. A task that raises
 after a delay; the delayed retry is a schedule in Redis that the scheduler
 sends, so retries need a running scheduler.
 
+A task gets a database session with a `TaskDbSession` parameter. A worker
+process opens the engine at `WORKER_STARTUP` and disposes it at
+`WORKER_SHUTDOWN`; the API and the scheduler fire the client events only,
+so they never open a database pool for tasks.
+
 This module must not import module tasks: the composition roots do.
 """
 
 import asyncio
+import functools
 import time
-from collections.abc import AsyncGenerator, Awaitable, Callable
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Coroutine,
+)
+from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Annotated, Any
 
+import psycopg
 import redis.exceptions
 from redis.asyncio import Redis
+from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import OperationalError as SAOperationalError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from taskiq import (
     AckableMessage,
     AsyncBroker,
     ScheduleSource,
+    TaskiqDepends,
     TaskiqEvents,
     TaskiqScheduler,
     TaskiqState,
     async_shared_broker,
 )
+from taskiq.decor import AsyncTaskiqDecoratedTask
 from taskiq.middlewares import PrometheusMiddleware, SmartRetryMiddleware
 from taskiq.schedule_sources import LabelScheduleSource
 from taskiq.serializers import JSONSerializer
@@ -44,16 +64,17 @@ from taskiq_redis import (
 )
 
 from app.core.config import Settings, get_settings
+from app.core.database import (
+    build_engine,
+    close_db,
+    create_session_factory,
+    ensure_supported_event_loop,
+    init_db,
+)
+from app.core.errors import sqlstate
 from app.core.logging import get_logger, setup_logging
 
 logger = get_logger(__name__)
-
-task = async_shared_broker.task
-"""Declare a background task: `@task(task_name="area.action")`.
-
-Enqueue it with `await my_task.kiq(...)`; that needs a default broker, which
-the API lifespan and the worker set.
-"""
 
 # Not the former list key `taskiq`: XADD on an existing list key fails with
 # WRONGTYPE, and a Redis that still holds old list messages would refuse
@@ -99,6 +120,113 @@ class TransientTaskError(Exception):
     at once. taskiq logs the exception with its message, so the message must
     not contain personal data.
     """
+
+
+class TaskDatabaseError(RuntimeError):
+    """A task failed on a database error; carries only its types and SQLSTATE.
+
+    The `task` decorator raises it instead of the driver's error: PostgreSQL
+    messages can quote row values (`DETAIL: Key (email)=(...)`), and taskiq
+    logs a failed task's exception and stores it as the task result.
+    """
+
+
+class TransientTaskDatabaseError(TaskDatabaseError, TransientTaskError):
+    """A database error that may pass (lost connection, deadlock); retried."""
+
+
+# PostgreSQL error codes (Appendix A of the PostgreSQL documentation):
+# 40001 serialization_failure and 40P01 deadlock_detected ask the client to
+# retry the transaction; 57P01 admin_shutdown ends the connection on a
+# server restart; class 08 is connection_exception.
+_TRANSIENT_SQLSTATES = frozenset({"40001", "40P01", "57P01"})
+_TRANSIENT_SQLSTATE_CLASS = "08"
+
+
+def task_database_error(exc: DBAPIError | psycopg.Error) -> TaskDatabaseError:
+    """Replace a database error by one without the server's message.
+
+    Args:
+        exc: The SQLAlchemy-wrapped or raw psycopg error.
+
+    Returns:
+        `TransientTaskDatabaseError` for a lost or refused connection, a
+        deadlock, a serialization failure or an admin shutdown, otherwise
+        `TaskDatabaseError`. The message is `<type> (<driver type>,
+        SQLSTATE <code>)`.
+    """
+    if isinstance(exc, DBAPIError):
+        code = sqlstate(exc)
+        driver = type(exc.orig).__name__
+        # An error raised before the server answered (refused connection,
+        # timeout) has no SQLSTATE; SQLAlchemy reports it as OperationalError.
+        no_answer = code is None and isinstance(exc, SAOperationalError)
+        transient = no_answer or exc.connection_invalidated
+    else:
+        code = exc.sqlstate
+        driver = type(exc).__name__
+        transient = code is None and isinstance(exc, psycopg.OperationalError)
+    if code is not None:
+        transient = (
+            transient
+            or code in _TRANSIENT_SQLSTATES
+            or code.startswith(_TRANSIENT_SQLSTATE_CLASS)
+        )
+    message = f"{type(exc).__name__} ({driver}, SQLSTATE {code or 'none'})"
+    if transient:
+        return TransientTaskDatabaseError(message)
+    return TaskDatabaseError(message)
+
+
+def task[**P, R](
+    task_name: str | None = None,
+    # Any: taskiq labels are arbitrary JSON values (`retry_on_error`,
+    # `schedule`, ...).
+    **labels: Any,
+) -> Callable[
+    [Callable[P, Coroutine[Any, Any, R]]],
+    AsyncTaskiqDecoratedTask[P, Coroutine[Any, Any, R]],
+]:
+    """Declare a background task: `@task(task_name="area.action")`.
+
+    taskiq's shared task decorator (`async_shared_broker.task`) around a
+    wrapper that turns database errors into `TaskDatabaseError`, so neither
+    taskiq's log nor the stored result holds the server's message. Lost
+    connections, deadlocks and serialization failures become the transient
+    subclass and are retried when the task sets `retry_on_error=True`.
+    Every other exception passes through unchanged. The wrapper keeps the
+    function's signature (`functools.wraps`), so `TaskiqDepends` parameters
+    and `kiq()` typing work as without it.
+
+    Enqueue the task with `await my_task.kiq(...)`; that needs a default
+    broker, which the API lifespan and the worker set.
+
+    Args:
+        task_name: The task's name in messages; renaming it strands queued
+            messages.
+        **labels: taskiq labels, for example `retry_on_error=True` or
+            `schedule=[{"cron": "*/5 * * * *"}]`.
+
+    Returns:
+        The decorator.
+    """
+
+    def decorate(
+        func: Callable[P, Coroutine[Any, Any, R]],
+    ) -> AsyncTaskiqDecoratedTask[P, Coroutine[Any, Any, R]]:
+        @functools.wraps(func)
+        async def run(*args: P.args, **kwargs: P.kwargs) -> R:
+            try:
+                return await func(*args, **kwargs)
+            except (DBAPIError, psycopg.Error) as exc:
+                error = task_database_error(exc)
+            # Raised outside the handler, so the replacement has no
+            # `__context__` that a traceback could print.
+            raise error
+
+        return async_shared_broker.task(task_name, **labels)(run)
+
+    return decorate
 
 
 class ReconnectingStreamBroker(RedisStreamBroker):
@@ -191,6 +319,88 @@ async def configure_worker_logging(state: TaskiqState) -> None:
     setup_logging(get_settings())
 
 
+_STATE_ENGINE = "db_engine"
+_STATE_SESSION_FACTORY = "db_session_factory"
+
+
+async def open_task_db(state: TaskiqState) -> None:
+    """Open the database for the tasks of a worker process (`WORKER_STARTUP`).
+
+    The engine uses the same settings as the API's (`build_engine`), so each
+    worker process has its own pool of `DB_POOL_SIZE` + `DB_MAX_OVERFLOW`
+    connections. Fails at startup, like the API, when the database is
+    unreachable or the event loop cannot run psycopg.
+    """
+    settings = get_settings()
+    ensure_supported_event_loop()
+    engine = build_engine(settings)
+    try:
+        await init_db(engine, settings)
+    except BaseException:
+        await engine.dispose()
+        raise
+    state[_STATE_ENGINE] = engine
+    state[_STATE_SESSION_FACTORY] = create_session_factory(engine)
+
+
+async def close_task_db(state: TaskiqState) -> None:
+    """Dispose the worker's engine (`WORKER_SHUTDOWN`)."""
+    state.pop(_STATE_SESSION_FACTORY, None)
+    engine = state.pop(_STATE_ENGINE, None)
+    if engine is not None:
+        await close_db(engine)
+
+
+def add_task_db_hooks(broker: AsyncBroker) -> None:
+    """Open the task database at `WORKER_STARTUP`, close it at `WORKER_SHUTDOWN`.
+
+    Args:
+        broker: A broker whose tasks use `TaskDbSession`.
+    """
+    broker.add_event_handler(TaskiqEvents.WORKER_STARTUP, open_task_db)
+    broker.add_event_handler(TaskiqEvents.WORKER_SHUTDOWN, close_task_db)
+
+
+# A context manager, not a bare async generator: taskiq-dependencies 1.5.7
+# throws a task's error into generator dependencies with the three-argument
+# `athrow()` (deprecated since Python 3.12) and logs whatever comes back out,
+# message included (taskiq_dependencies/ctx.py, `close`). It passes the error
+# to a context manager's `__aexit__`, and contextlib re-raises nothing.
+@asynccontextmanager
+async def get_task_db(
+    state: Annotated[TaskiqState, TaskiqDepends()],
+) -> AsyncIterator[AsyncSession]:
+    """Provide a session from the worker's session factory for one task run.
+
+    Closing the session rolls back a transaction the task left open.
+
+    Raises:
+        RuntimeError: The process is not a worker (no `WORKER_STARTUP`).
+    """
+    session_factory: async_sessionmaker[AsyncSession] | None = state.get(
+        _STATE_SESSION_FACTORY
+    )
+    if session_factory is None:
+        raise RuntimeError(
+            "TaskDbSession needs a worker process: the database is opened at "
+            "WORKER_STARTUP."
+        )
+    async with session_factory() as session:
+        yield session
+
+
+TaskDbSession = Annotated[AsyncSession, TaskiqDepends(get_task_db)]
+"""A database session for a task, injected by taskiq.
+
+    async def my_task(user_id: str, db: TaskDbSession = TaskiqDepends()) -> None
+
+The `TaskiqDepends()` default only lets `my_task.kiq(user_id)` type-check
+without the session; the dependency in the annotation wins. One session per
+task run, closed when the task ends; the task's service owns the
+transaction and commits.
+"""
+
+
 def build_broker(settings: Settings) -> AsyncBroker:
     """Build the Redis stream broker and result backend; opens no connection.
 
@@ -201,7 +411,8 @@ def build_broker(settings: Settings) -> AsyncBroker:
         settings: Process settings with the `TASKIQ_*` URLs.
 
     Returns:
-        The broker, with the worker logging hook registered.
+        The broker, with the worker hooks for logging and the task database
+        registered; only a worker process fires them.
     """
     broker = ReconnectingStreamBroker(
         settings.TASKIQ_BROKER_URL,
@@ -226,6 +437,7 @@ def build_broker(settings: Settings) -> AsyncBroker:
         )
     )
     broker.add_event_handler(TaskiqEvents.WORKER_STARTUP, configure_worker_logging)
+    add_task_db_hooks(broker)
     return broker
 
 

@@ -26,7 +26,7 @@ import app.core.tasks as app_tasks
 import app.modules  # noqa: F401  (registers the module tasks)
 from app.core.config import get_settings
 from app.core.mail import MailDeliveryError, TransientMailDeliveryError
-from app.modules.auth.tasks import send_verification_email_task
+from app.modules.auth.tasks import send_token_email_task
 from tests.helpers import BACKEND_DIR, run_async
 
 
@@ -49,12 +49,12 @@ def _fail(exc: BaseException, retries: int = 0) -> tuple[RecordingSource, Taskiq
     source = RecordingSource()
     middleware = app_tasks.build_retry_middleware(settings, source)
     middleware.set_broker(app_tasks.build_broker(settings))
-    labels = dict(send_verification_email_task.labels)
+    labels = dict(send_token_email_task.labels)
     if retries:
         labels["_retries"] = retries
     message = TaskiqMessage(
         task_id="task-1",
-        task_name=send_verification_email_task.task_name,
+        task_name=send_token_email_task.task_name,
         labels=labels,
         args=[],
         kwargs={},
@@ -112,7 +112,7 @@ class TestRetries:
         [scheduled] = source.added
         delay = (scheduled.time - before).total_seconds()
         assert 42 <= delay <= 42 + 1 + 5  # jitter adds up to 1 s
-        assert scheduled.task_name == "email.send_verification_email"
+        assert scheduled.task_name == "email.send_token_email"
         assert scheduled.task_id == "task-1"
         assert int(scheduled.labels["_retries"]) == 1
         # The failed attempt stores no result.
@@ -347,7 +347,7 @@ logging.getLogger("taskiq").setLevel(logging.DEBUG)
 
 import app.worker as w
 from app.core.tasks import ReconnectingStreamBroker
-from app.modules.auth.tasks import send_verification_email_task
+from app.modules.auth.tasks import send_token_email_task
 
 async def no_group(self):
     return None
@@ -358,7 +358,7 @@ w.broker.is_scheduler_process = True
 async def main():
     await w.broker.startup()
     try:
-        await send_verification_email_task.kiq("MARKER-a@example.com", "MARKER", "MARKER")
+        await send_token_email_task.kiq("MARKER-token-id")
     except Exception as exc:
         print("KICK-FAILED", type(exc).__name__)
 
@@ -389,3 +389,83 @@ asyncio.run(main(), loop_factory=asyncio.SelectorEventLoop)
     assert "KICK-FAILED" in output
     # ... and its arguments were never logged.
     assert "MARKER" not in output.replace("KICK-FAILED", "")
+
+
+def test_scheduler_process_opens_no_task_database(tmp_path):
+    """The scheduler builds the worker broker but fires CLIENT_STARTUP only.
+
+    It must not open a database pool for `TaskDbSession`; a worker process
+    must. `build_engine` is replaced by a probe, so nothing connects.
+    """
+    code = """
+import asyncio
+
+import app.core.tasks as core_tasks
+import app.worker as w
+from app.core.tasks import ReconnectingStreamBroker
+
+class Opened(Exception):
+    pass
+
+def probe(settings):
+    raise Opened()
+
+async def no_group(self):
+    return None
+
+core_tasks.build_engine = probe
+ReconnectingStreamBroker._declare_consumer_group = no_group
+
+async def main():
+    w.scheduler.broker.is_scheduler_process = True
+    await w.scheduler.startup()
+    print("SCHEDULER_STATE", sorted(w.broker.state.keys()))
+    await w.broker.shutdown()
+    w.broker.is_scheduler_process = False
+    w.broker.is_worker_process = True
+    try:
+        await w.broker.startup()
+    except Opened:
+        print("WORKER_OPENS_DB")
+
+asyncio.run(main(), loop_factory=asyncio.SelectorEventLoop)
+"""
+    env = {
+        **os.environ,
+        "PROMETHEUS_MULTIPROC_DIR": str(tmp_path),
+        "TASKIQ_BROKER_URL": "redis://127.0.0.1:1/1",
+        "TASKIQ_RESULT_BACKEND_URL": "redis://127.0.0.1:1/2",
+    }
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=BACKEND_DIR,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    output = proc.stdout + proc.stderr
+    assert proc.returncode == 0, output[-2000:]
+    assert "SCHEDULER_STATE []" in proc.stdout
+    assert "WORKER_OPENS_DB" in proc.stdout
+
+
+def test_built_broker_opens_the_task_database_in_worker_events_only():
+    broker = app_tasks.build_broker(get_settings())
+
+    assert (
+        app_tasks.open_task_db
+        in broker.event_handlers[app_tasks.TaskiqEvents.WORKER_STARTUP]
+    )
+    assert (
+        app_tasks.close_task_db
+        in broker.event_handlers[app_tasks.TaskiqEvents.WORKER_SHUTDOWN]
+    )
+    for event in (
+        app_tasks.TaskiqEvents.CLIENT_STARTUP,
+        app_tasks.TaskiqEvents.CLIENT_SHUTDOWN,
+    ):
+        handlers = broker.event_handlers.get(event, [])
+        assert app_tasks.open_task_db not in handlers
+        assert app_tasks.close_task_db not in handlers

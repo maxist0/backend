@@ -80,6 +80,16 @@ def _delete_refresh_cookie(response: Response, settings: Settings) -> None:
     response.delete_cookie(key=REFRESH_COOKIE, path=_cookie_path(settings))
 
 
+def _delete_refresh_cookie_on(
+    exc: InvalidRefreshTokenError, settings: Settings
+) -> None:
+    # The error response replaces the injected `response`, so the deletion
+    # travels in the error's headers.
+    cleared = Response()
+    _delete_refresh_cookie(cleared, settings)
+    exc.headers["Set-Cookie"] = cleared.headers["set-cookie"]
+
+
 def _accepted() -> Response:
     # FastAPI would render `None` as a `null` body; a 202 here has none.
     return Response(status_code=status.HTTP_202_ACCEPTED)
@@ -168,10 +178,7 @@ async def logout(
     try:
         await service.logout_session(db, raw_token, request)
     except InvalidRefreshTokenError as exc:
-        # The error response replaces `response`, so it carries the deletion.
-        cleared = Response()
-        _delete_refresh_cookie(cleared, settings)
-        exc.headers["Set-Cookie"] = cleared.headers["set-cookie"]
+        _delete_refresh_cookie_on(exc, settings)
         raise
     _delete_refresh_cookie(response, settings)
 
@@ -216,11 +223,16 @@ async def refresh_tokens(
 
     The refresh token is rotated: the cookie is replaced and the old token
     stops working. Presenting a rotated token again revokes all sessions of
-    its family. No access token is needed.
+    its family. No access token is needed. A refused cookie (unknown,
+    expired, revoked or reused) is cleared with the 401.
     """
-    access_token, new_raw_refresh = await service.refresh_session(
-        db, raw_token, request
-    )
+    try:
+        access_token, new_raw_refresh = await service.refresh_session(
+            db, raw_token, request
+        )
+    except InvalidRefreshTokenError as exc:
+        _delete_refresh_cookie_on(exc, settings)
+        raise
     _set_refresh_cookie(response, new_raw_refresh, settings)
     return _token_response(access_token, settings)
 
