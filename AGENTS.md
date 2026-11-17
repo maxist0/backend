@@ -2,7 +2,7 @@
 
 Guidance for coding agents (Claude Code, Codex, Cursor, Copilot) and humans working in this repository. This file is the single source for backend conventions. Human-facing docs, architecture and the roadmap are in [README.md](README.md); link to them, do not duplicate them here. Decisions are recorded as ADRs in [documentation/adr/](documentation/adr/README.md).
 
-> **Target state.** Sections marked *(target)* describe the layout and rules decided on 2026-11-16 and implemented in steps S1–S3 of the 2026-11 cleanup (S1 structure, S2 taskiq reliability, S3 style pass, strict ruff/mypy, docs). Until they land, the code still uses `src/app/common/`, `src/app/api/` and the response envelope. New code follows the target.
+> **Target state.** Sections marked *(target)* describe the layout and rules decided on 2026-11-16 and implemented in steps S1–S3 of the 2026-11 cleanup (S1 structure, S2 taskiq reliability, S3 style pass, strict ruff/mypy, docs). S0 and S1 are done; the remaining steps (frontend migration, S2, S3) and the working rules for them are in [documentation/review-2026-11/cleanup-plan.md](documentation/review-2026-11/cleanup-plan.md). New code follows the target.
 
 ## Project in one paragraph
 

@@ -1,5 +1,7 @@
 # Backend-Review 2026-11: konsolidierte Befunde und Umsetzungsplan
 
+> **Aktueller Stand und nächste Schritte:** Phase 0, 0b und Phase 1 bis Schritt 1.4 sind umgesetzt. Danach wurde das Cleanup S0–S3 eingeschoben (Core/Module, RFC 9457, `/api/v1`). S0 und S1 sind abgeschlossen. Plan, Arbeitsweise und Aufgaben für Frontend-Umstellung, S2 und S3 stehen in [cleanup-plan.md](cleanup-plan.md). Mit diesem Dokument beginnt jede neue Session.
+
 Stand: 2026-11-16 · Status: **Phase 0 + 0b umgesetzt (uncommitted), verifiziert: 223 Tests grün**; D1–D12 werden vor Phase 2/3 einzeln besprochen; entschieden: N1 = psycopg 3, N2 = keine Echtdaten → neue Baseline, N3 = Postgres 18 überall, D6 = mypy strict als Gate + ty advisory · Scope: App-Code und DB, Tests, Observability (Docker/Swarm/CI nicht im Scope, außer kritisch)
 
 Sechs Agents haben das Backend nur gelesen und nichts geändert: `backend-engineer`, `db-engineer`, `security-auditor`, `backend-tester`, `observability-engineer` und `researcher`. Die Einzelberichte mit Datei:Zeile, Belegen und Fix-Skizzen liegen unter [agent-reports/](agent-reports/). Die Berichte `review-security.md` und `review-researcher.md` sind verdichtet, weil diese beiden Agents keine Dateien schreiben dürfen.
