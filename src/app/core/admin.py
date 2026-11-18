@@ -16,6 +16,7 @@ import hmac
 import re
 import uuid
 from collections.abc import Iterable
+from typing import override
 
 from fastapi import FastAPI
 from sqladmin import Admin, ModelView
@@ -60,6 +61,7 @@ class FetchMetadataGuard:
         self.app = app
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """Answer 403 to a cross-site state change, else pass the request on."""
         if scope["type"] == "http" and _changes_state(scope):
             fetch_site = Headers(scope=scope).get("sec-fetch-site")
             if fetch_site != "same-origin":
@@ -160,6 +162,7 @@ class AdminAuth(AuthenticationBackend):
         self._username = settings.ADMIN_USERNAME
         self._password = settings.ADMIN_PASSWORD
 
+    @override
     async def login(self, request: Request) -> bool:
         form = await request.form()
         username, password = form.get("username"), form.get("password")
@@ -182,10 +185,12 @@ class AdminAuth(AuthenticationBackend):
         logger.warning("admin.login_failed", client_ip=client_ip)
         return False
 
+    @override
     async def logout(self, request: Request) -> bool:
         request.session.clear()
         return True
 
+    @override
     async def authenticate(self, request: Request) -> bool:
         return bool(request.session.get("admin"))
 

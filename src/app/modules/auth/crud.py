@@ -62,8 +62,11 @@ async def lock_and_get_user(db: AsyncSession, user_id: uuid.UUID) -> User | None
 async def get_lock_state(
     db: AsyncSession, user_id: uuid.UUID
 ) -> tuple[bool, datetime | None] | None:
-    """Read `(is_locked, locked_until)` from the database, bypassing the
-    identity map (a cached User would show the state of the first read)."""
+    """Read `(is_locked, locked_until)` from the database.
+
+    Bypasses the identity map: a cached `User` would show the state of the
+    first read.
+    """
     result = await db.execute(
         select(User.is_locked, User.locked_until).where(User.id == user_id)
     )
@@ -195,6 +198,7 @@ async def register_failed_login(
 async def create_password_credential(
     db: AsyncSession, credential: PasswordCredential
 ) -> PasswordCredential:
+    """Insert a password credential and commit."""
     db.add(credential)
     await db.commit()
     return credential
@@ -203,6 +207,7 @@ async def create_password_credential(
 async def get_password_credential(
     db: AsyncSession, user_id: uuid.UUID
 ) -> PasswordCredential | None:
+    """Return the user's password credential, or None."""
     result = await db.execute(
         select(PasswordCredential).where(PasswordCredential.user_id == user_id)
     )
@@ -212,6 +217,7 @@ async def get_password_credential(
 async def update_password_hash(
     db: AsyncSession, user_id: uuid.UUID, new_hash: str
 ) -> None:
+    """Replace the user's password hash and commit."""
     await db.execute(
         update(PasswordCredential)
         .where(PasswordCredential.user_id == user_id)
@@ -235,6 +241,7 @@ async def set_password_must_change(db: AsyncSession, user_id: uuid.UUID) -> bool
 
 
 async def create_session(db: AsyncSession, session: Session) -> Session:
+    """Insert a refresh-token session and commit."""
     db.add(session)
     await db.commit()
     return session
@@ -261,6 +268,7 @@ async def get_session_owner(
 async def get_session_by_token_hash(
     db: AsyncSession, token_hash: str
 ) -> Session | None:
+    """Return the session of a token hash in any state, or None."""
     result = await db.execute(select(Session).where(Session.token_hash == token_hash))
     return result.scalars().first()
 
@@ -518,8 +526,8 @@ async def invalidate_tokens_for_user_purpose(
             and_(
                 EmailToken.user_id == user_id,
                 EmailToken.purpose == purpose,
-                EmailToken.used_at == None,  # noqa: E711
-                EmailToken.invalidated_at == None,  # noqa: E711
+                EmailToken.used_at.is_(None),
+                EmailToken.invalidated_at.is_(None),
             )
         )
         .values(invalidated_at=utcnow())
@@ -586,9 +594,9 @@ async def audit_event_since(
 async def delete_ended_sessions(
     db: AsyncSession, retention: timedelta, limit: int
 ) -> int:
-    """Delete up to `limit` sessions that expired and were last changed
-    longer than `retention` ago.
+    """Delete up to `limit` sessions ended longer than `retention` ago.
 
+    Ended means expired, and also last changed (revoked) before the cutoff.
     A revoked session is kept until it has also expired for `retention`:
     until then its token could still be presented, and a rotated token that
     comes back must be found to revoke its family (reuse detection).
@@ -623,12 +631,12 @@ async def delete_ended_sessions(
 async def delete_closed_email_tokens(
     db: AsyncSession, retention: timedelta, limit: int
 ) -> int:
-    """Delete up to `limit` email tokens that expired and were last changed
-    longer than `retention` ago.
+    """Delete up to `limit` email tokens closed longer than `retention` ago.
 
-    Every token expires within a day of its request, so this removes used,
-    invalidated and never redeemed tokens alike, together with their
-    `new_email` and `previous_email`. Rows locked by another transaction are
+    Closed means expired, and also last changed (used or invalidated)
+    before the cutoff. Every token expires within a day of its request, so
+    this removes used, invalidated and never redeemed tokens alike, together
+    with their `new_email` and `previous_email`. Rows locked by another transaction are
     skipped (`SKIP LOCKED`). Does not commit.
 
     Returns:

@@ -4,13 +4,15 @@
 and metrics routes, the routers of every module in `MODULES` under
 `API_PREFIX`, the problem-details error handlers, optional admin) without
 any I/O. The lifespan opens the resources (logging, DB engine, Redis, cache,
-taskiq broker) and closes them again, also when startup fails half-way. `app = create_app()` is the entrypoint for uvicorn, `fastapi run`
-and `run.py`; importing this module requires `ENVIRONMENT` to be set.
+taskiq broker) and closes them again, also when startup fails half-way.
+`app = create_app()` is the entrypoint for uvicorn, `fastapi run` and
+`run.py`; importing this module requires `ENVIRONMENT` to be set.
 """
 
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from contextlib import AsyncExitStack, asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -46,7 +48,7 @@ def _unbind_session_factory(
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     """Open the app's resources on startup and close them on shutdown.
 
     Every resource registers its cleanup on an `AsyncExitStack` right after
@@ -60,7 +62,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger.info(
         "app.startup",
         pid=os.getpid(),
-        cwd=os.getcwd(),
+        cwd=str(Path.cwd()),
         app_name=app.title,
         app_version=app.version,
         app_description=app.description,

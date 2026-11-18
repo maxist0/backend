@@ -30,15 +30,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import set_committed_value
 from taskiq.exceptions import SendTaskError
 
-from app.core import get_logger, get_settings, utcnow
-from app.core.errors import constraint_name
-from app.core.security import (
+from app.core import (
+    constraint_name,
     create_access_token,
     equalize_password_timing,
+    get_logger,
+    get_settings,
     hash_password,
     hash_token,
     login_admission_limiter,
     password_needs_rehash,
+    utcnow,
     verify_password,
     wait_like_password_verify,
 )
@@ -130,7 +132,7 @@ CLEANUP_MAX_BATCHES = 100
 
 
 def _bounded_header(request: Request | None, name: str, max_length: int) -> str | None:
-    """Return a request header cut to *max_length* characters (or None)."""
+    """Return a request header cut to `max_length` characters (or None)."""
     if request is None:
         return None
     value = request.headers.get(name)
@@ -289,7 +291,6 @@ async def register_user(
 
     password_hash = await hash_password(password)
 
-    # Create user
     user = User(
         username=username,
         email=email,
@@ -308,7 +309,6 @@ async def register_user(
         logger.info("auth.register_conflict", constraint=constraint)
         raise UserExistsError(message) from None
 
-    # Create password credential
     credential = PasswordCredential(
         user_id=user.id,
         password_hash=password_hash,
@@ -371,7 +371,7 @@ async def _refuse_locked_login() -> NoReturn:
     raise InvalidCredentialsError()
 
 
-async def authenticate_user(
+async def authenticate_user(  # noqa: PLR0912, PLR0915 - the lock checks, their order and the timing equalisation stay reviewable in one place
     db: AsyncSession,
     username: str,
     password: str,
@@ -404,7 +404,7 @@ async def authenticate_user(
             await _record_locked_login(db, user.id, user.locked_until, request)
             await _refuse_locked_login()
 
-        # Timed lock expired → unlock
+        # The timed lock has expired: clear it.
         user.is_locked = False
         user.failed_login_attempts = 0
         user.locked_until = None
@@ -478,7 +478,7 @@ async def authenticate_user(
         await _audit(db, AuditEventType.LOGIN_FAILED, user.id, request)
         raise InvalidCredentialsError()
 
-    # Success → reset counters, unless a parallel guess locked the account
+    # Success: reset the counters, unless a parallel guess locked the account
     # while this password was being verified (conditional UPDATE).
     last_login_at = await crud.record_successful_login(db, user.id)
     if last_login_at is None:
@@ -496,7 +496,6 @@ async def authenticate_user(
     set_committed_value(user, "locked_until", None)
     set_committed_value(user, "last_login_at", last_login_at)
 
-    # Upgrade the hash if the Argon2 parameters in Settings changed.
     if password_needs_rehash(credential.password_hash):
         await crud.update_password_hash(db, user.id, await hash_password(password))
         logger.info("auth.password_rehashed", user_id=str(user.id))
@@ -520,7 +519,7 @@ async def create_session_tokens(
     fam_id = family_id or uuid.uuid4()
     access_token = create_access_token(user.username, str(user.id), str(fam_id))
 
-    # Generate opaque refresh token; only its SHA-256 hash is stored.
+    # The raw token goes to the client only; the session stores its hash.
     raw_refresh = secrets.token_urlsafe(32)
     session = Session(
         user_id=user.id,
@@ -635,7 +634,9 @@ async def _revoke_reused_family(
         f"Token reuse detected, revoked {revoked} session(s) "
         f"in family {sess.family_id}",
     )
-    raise InvalidRefreshTokenError("Token reuse detected – all sessions revoked")
+    raise InvalidRefreshTokenError(
+        "Token reuse detected – all sessions revoked"  # noqa: RUF001 - response text, unchanged
+    )
 
 
 async def logout_session(

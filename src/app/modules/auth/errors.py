@@ -36,8 +36,10 @@ class SessionNotFoundError(BadRequest):
 
 
 class InvalidTokenError(BadRequest):
-    """An email token (verification, email change, password reset) is
-    unknown, used, invalidated or expired."""
+    """An email token is unknown, used, invalidated or expired.
+
+    Covers verification, email-change and password-reset tokens.
+    """
 
     code = "invalid_token"
     detail = "Invalid or expired token"

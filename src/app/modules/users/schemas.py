@@ -1,6 +1,7 @@
 """Request and response schemas of the users module."""
 
 from datetime import datetime
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -31,4 +32,6 @@ class UserResponse(BaseModel):
     is_email_verified: bool
     created_at: datetime
     last_login_at: datetime | None = None
-    preferences: dict | None = None  # Placeholder for user preferences
+    # Placeholder until user preferences exist. Any keeps the published schema
+    # an open object (`additionalProperties: true`).
+    preferences: dict[str, Any] | None = None

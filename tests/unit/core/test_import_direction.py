@@ -93,3 +93,34 @@ def test_modules_import_only_modules_listed_before_them():
                     violations.append(f"{name}/{path.name}:{line}: {imported}")
 
     assert violations == []
+
+
+def _core_submodule_imports(path: Path) -> list[tuple[int, str]]:
+    """`app.core.<submodule>` imports in `path`; `from app.core import X` is fine."""
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    found: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.level == 0:
+            names = [node.module or ""]
+        elif isinstance(node, ast.Import):
+            names = [alias.name for alias in node.names]
+        else:
+            continue
+        found.extend(
+            (node.lineno, name) for name in names if name.startswith("app.core.")
+        )
+    return found
+
+
+def test_modules_import_the_core_only_through_its_facade() -> None:
+    """Modules use `from app.core import ...`; the submodules are internals."""
+    files = sorted(MODULES_DIR.rglob("*.py"))
+    assert files, f"no module files found under {MODULES_DIR}"
+
+    violations = [
+        f"{path.relative_to(MODULES_DIR)}:{line}: {name}"
+        for path in files
+        for line, name in _core_submodule_imports(path)
+    ]
+
+    assert violations == []

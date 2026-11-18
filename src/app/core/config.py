@@ -10,7 +10,7 @@ Routes receive the settings through `SettingsDep`.
 import ipaddress
 import os
 import re
-from enum import Enum
+from enum import StrEnum
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as distribution_version
@@ -24,9 +24,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # Public code defaults. They are fine for local development and the test suite,
 # but the startup guard (Settings._refuse_insecure_defaults) refuses them in
 # every other environment.
-_DEFAULT_JWT_SECRET_KEY = "your-super-secret-jwt-key-change-in-production"
-_DEFAULT_ADMIN_PASSWORD = "admin"
-_DEFAULT_ADMIN_SECRET_KEY = "admin-secret-key-change-in-production"
+_DEFAULT_JWT_SECRET_KEY = "your-super-secret-jwt-key-change-in-production"  # noqa: S105 - public dev default, refused by the guard
+_DEFAULT_ADMIN_PASSWORD = "admin"  # noqa: S105 - public dev default, refused by the guard
+_DEFAULT_ADMIN_SECRET_KEY = "admin-secret-key-change-in-production"  # noqa: S105 - public dev default, refused by the guard
 # RFC 7518 section 3.2: an HS256 key must have at least 256 bits.
 _MIN_JWT_SECRET_LENGTH = 32
 # The admin password guards every account; ADMIN_SECRET_KEY signs the admin
@@ -73,7 +73,7 @@ _GENERIC_POSTGRES_SCHEMES = frozenset({"postgresql", "postgres"})
 
 
 def normalize_database_url(url: str) -> str:
-    """Return *url* with the `postgresql+psycopg` scheme.
+    """Return `url` with the `postgresql+psycopg` scheme.
 
     `postgresql://` and `postgres://` are rewritten (they name no driver,
     so the meaning does not change). Any other driver is refused instead of
@@ -106,7 +106,9 @@ class ConfigurationError(RuntimeError):
     """
 
 
-class Environment(str, Enum):
+class Environment(StrEnum):
+    """Deployment environment, set through `ENVIRONMENT`."""
+
     DEV = "dev"
     TEST = "test"
     STAGE = "stage"
@@ -115,7 +117,9 @@ class Environment(str, Enum):
 
 
 class Settings(BaseSettings):
-    # Environment: required, never defaulted (no silent fallback to dev).
+    """Process configuration from environment variables; see `get_settings`."""
+
+    # Required, never defaulted: no silent fallback to dev.
     ENVIRONMENT: Environment
 
     # Database (psycopg 3; postgresql:// and postgres:// are normalised)
@@ -233,7 +237,7 @@ class Settings(BaseSettings):
     CORS_ORIGINS: list[str] = ["http://localhost:5173"]
 
     # Server
-    HOST: str = "0.0.0.0"
+    HOST: str = "0.0.0.0"  # noqa: S104 - a container must accept the proxy's connections
     PORT: int = 8000
     # Proxy addresses whose X-Forwarded-For/-Proto uvicorn trusts for the
     # client address and scheme (comma-separated). Set it to the reverse

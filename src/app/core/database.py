@@ -87,7 +87,7 @@ def ensure_supported_event_loop() -> None:
 
 
 def build_engine(settings: Settings) -> AsyncEngine:
-    """Create the async SQLAlchemy engine from *settings* (no I/O yet).
+    """Create the async SQLAlchemy engine from `settings` (no I/O yet).
 
     Driver: psycopg 3 (`postgresql+psycopg`; SQLAlchemy picks the async
     variant for `create_async_engine`). psycopg prepares a statement on the
@@ -148,7 +148,7 @@ async def init_db(engine: AsyncEngine, settings: Settings) -> None:
             "db.pool_init",
             url=make_url(settings.DATABASE_URL).render_as_string(hide_password=True),
         )
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - every failure is re-raised without the DSN
         error = _redact_db_secrets(str(e), settings.DATABASE_URL)
         logger.error("db.pool_init_failed", error_type=type(e).__name__, error=error)
         # `from None`: the chained original exception could print the raw DSN.

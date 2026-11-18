@@ -25,6 +25,9 @@ dependencies = [
     "structlog>=26.1.0",
     "rich>=15.0.0",
     "fastapi-mail>=1.6.8",
+    # Imported directly by core/mail.py (template rendering); fastapi-mail also
+    # pulls it in, but a direct import needs a direct dependency.
+    "jinja2>=3.1.6",
     "taskiq>=0.13.0",
     "taskiq-redis>=1.2.4",
     "cashews>=7.6.0",
@@ -87,7 +90,9 @@ test = [
     "time-machine>=3.6.0",
 ]
 lint = [
-    "ruff>=0.15.0",
+    # Exact pin: ruff adds rules and changes defaults in minor releases, so a
+    # new version is an explicit lint-config change, not a side effect of a relock.
+    "ruff==0.17.5",
     "mypy>=1.19.1",
     # Informational only (open decision D6); mypy is the gate.
     "ty>=0.0.104",
@@ -105,13 +110,106 @@ dev = [
 # Import string for `fastapi dev` / `fastapi run` (requires ENVIRONMENT).
 entrypoint = "app.main:app"
 
-[[tool.mypy.overrides]]
-module = [
-    "alembic.*",
-    "sqlalchemy.*",
-    "redis.*"
+[tool.ruff]
+target-version = "py314"
+line-length = 88
+# First-party roots for isort. Not ".": the root's alembic/ directory would
+# shadow the alembic package.
+src = ["src"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W", "F", "I", "B", "UP", "S", "ASYNC", "N", "D", "ANN", "RUF", "PL",
+    "PT", "SIM", "T20", "ERA", "TRY", "FAST", "C4", "DTZ", "EM", "LOG", "G",
+    "PTH", "RET", "ARG", "TC", "BLE", "FBT", "A", "ISC", "PIE", "PERF", "FURB",
+    "SLF", "TID", "ICN", "INP", "PGH",
 ]
-ignore_missing_imports = true
+
+ignore = [
+    # Google style documents constructor arguments in the class docstring
+    # (Napoleon's Google example: one place, not both); the classes here do.
+    "D107",
+    # The `AppError` family passes the RFC 9457 `detail` of each occurrence
+    # at the raise site (ADR 0002), and a Pydantic validator's ValueError
+    # text is the client's 422 message. A class per message (TRY003) or a
+    # `msg` variable before every raise (EM101, EM102) adds lines, not
+    # clarity; the traceback duplication EM avoids does not arise for
+    # handled errors.
+    "TRY003", "EM101", "EM102",
+    # TRY400 asks for `logger.exception`, which logs the exception message
+    # and traceback. The security rules forbid that (database and SMTP
+    # errors quote personal data): handlers log `error_type` or use
+    # `log_unexpected_error`.
+    "TRY400",
+    # TC001-TC003 move imports used only in annotations under
+    # `if TYPE_CHECKING:`. FastAPI, Pydantic, SQLAlchemy and taskiq resolve
+    # annotations at runtime, also with deferred annotations (PEP 649). Ruff
+    # recognises route decorators and model base classes, but not a plain
+    # dependency function: FastAPI then falls back to a ForwardRef, drops
+    # the `Depends` metadata and fails on the first request, not at import.
+    # The only gain is import time. TC004-TC010 stay on.
+    "TC001", "TC002", "TC003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = [
+    "S101",     # pytest asserts are the test mechanism
+    # A test's module docstring states what it covers; the test names say
+    # the rest (owner decision 2026-11-18).
+    "D101", "D102", "D103", "D107",
+    "PLR2004",  # expected values in assertions are the point of a test
+    "S105", "S106",  # fixed test credentials, never real secrets
+]
+"alembic/**" = [
+    "INP001",  # Alembic loads env.py and revisions by path; not packages
+]
+"alembic/versions/**" = [
+    "D103",    # upgrade()/downgrade() are Alembic's fixed entry points
+    "D415",    # the first docstring line is the revision message
+    "S608",    # DDL built from fixed enum labels in the file, no input
+]
+# Applied migration written with the old template; applied migrations are
+# never edited (AGENTS.md, Database and migrations).
+"alembic/versions/20260226_2120_37a0d49f8bbc_add_auth_user_tables.py" = [
+    "I001", "UP007", "UP035",
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.isort]
+known-first-party = ["tests"]
+
+[tool.ruff.lint.pep8-naming]
+# The core's HTTP error classes are named after their status (ADR 0002);
+# module errors keep the `Error` suffix.
+extend-ignore-names = [
+    "BadRequest", "Unauthorized", "Forbidden", "NotFound", "Conflict",
+]
+
+[tool.ruff.lint.pylint]
+# Services take the unit of work, the domain values and the audit context
+# (`request`, an option) as plain parameters instead of a parameter object.
+max-args = 7
+
+[tool.ruff.lint.flake8-bugbear]
+# taskiq's documented way to inject a dependency is a `TaskiqDepends()`
+# default; it is evaluated once and never mutated.
+extend-immutable-calls = ["taskiq.TaskiqDepends"]
+
+[tool.ruff.lint.flake8-boolean-trap]
+# SQLAlchemy's API takes the attribute value positionally.
+extend-allowed-calls = ["sqlalchemy.orm.attributes.set_committed_value"]
+
+[tool.mypy]
+python_version = "3.14"
+strict = true
+# "tests" joins once the tests are fully annotated.
+files = ["src"]
+# Beyond strict: every `# type: ignore` names its error code (house rule),
+# and calls to APIs marked deprecated (PEP 702) fail like deprecation
+# warnings do in pytest.
+enable_error_code = ["ignore-without-code", "deprecated"]
 
 [tool.pytest.ini_options]
 # The coverage threshold lives only in [tool.coverage.report].fail_under.

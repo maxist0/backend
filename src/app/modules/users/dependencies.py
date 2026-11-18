@@ -6,7 +6,7 @@ needs nothing from the auth module.
 """
 
 import uuid
-from typing import Annotated, Any
+from typing import Annotated
 
 import structlog
 from fastapi import Depends
@@ -14,8 +14,14 @@ from fastapi.openapi.models import OAuth2 as OAuth2Model
 from fastapi.openapi.models import OAuthFlowPassword, OAuthFlows
 from fastapi.security import OAuth2PasswordBearer
 
-from app.core import DbSession, Unauthorized, get_logger, get_settings
-from app.core.security import TokenData, decode_token
+from app.core import (
+    DbSession,
+    TokenData,
+    Unauthorized,
+    decode_token,
+    get_logger,
+    get_settings,
+)
 from app.modules.users import crud
 from app.modules.users.models import User
 
@@ -37,9 +43,7 @@ class _PasswordBearer(OAuth2PasswordBearer):
             auto_error=auto_error,
         )
 
-    # `SecurityBase` declares `model` as a plain attribute; a property with a
-    # setter is the same interface at runtime, mypy only rejects the form.
-    @property  # type: ignore[override]
+    @property
     def model(self) -> OAuth2Model:
         prefix = get_settings().API_PREFIX
         password = OAuthFlowPassword(
@@ -48,7 +52,7 @@ class _PasswordBearer(OAuth2PasswordBearer):
         return OAuth2Model(flows=OAuthFlows(password=password))
 
     @model.setter
-    def model(self, value: Any) -> None:
+    def model(self, value: object) -> None:
         """Ignore the model `OAuth2PasswordBearer.__init__` assigns."""
 
 
@@ -57,7 +61,7 @@ optional_oauth2_scheme = _PasswordBearer(auto_error=False)
 
 
 async def get_current_token_data(
-    token: str = Depends(oauth2_scheme),
+    token: Annotated[str, Depends(oauth2_scheme)],
 ) -> TokenData:
     """Decode the Bearer token and return its payload."""
     token_data = decode_token(token)
@@ -68,7 +72,7 @@ async def get_current_token_data(
 
 async def get_current_user(
     db: DbSession,
-    token_data: TokenData = Depends(get_current_token_data),
+    token_data: Annotated[TokenData, Depends(get_current_token_data)],
 ) -> User:
     """Return the full User ORM object for the currently authenticated user.
 
@@ -91,7 +95,7 @@ async def get_current_user(
 
 async def get_optional_user(
     db: DbSession,
-    token: str | None = Depends(optional_oauth2_scheme),
+    token: Annotated[str | None, Depends(optional_oauth2_scheme)],
 ) -> User | None:
     """Return User if a valid token is present, None otherwise."""
     if not token:
@@ -101,12 +105,12 @@ async def get_optional_user(
         if not token_data:
             return None
         user = await crud.get_user_by_id(db, uuid.UUID(token_data.user_id))
-        if user is None or not user.is_active or user.is_admin_locked():
-            return None
-        return user
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - an optional user never fails the request
         logger.warning("auth.optional_auth_failed", error_type=type(e).__name__)
         return None
+    if user is None or not user.is_active or user.is_admin_locked():
+        return None
+    return user
 
 
 # The authenticated, active, not admin-locked user; 401 otherwise.

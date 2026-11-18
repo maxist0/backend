@@ -59,7 +59,7 @@ class AppError(Exception):
         detail: str | None = None,
         *,
         headers: dict[str, str] | None = None,
-        **extensions: Any,
+        **extensions: object,
     ) -> None:
         if detail is not None:
             self.detail = detail
@@ -88,7 +88,7 @@ class Unauthorized(AppError):
         detail: str | None = None,
         *,
         headers: dict[str, str] | None = None,
-        **extensions: Any,
+        **extensions: object,
     ) -> None:
         super().__init__(
             detail,
@@ -167,7 +167,11 @@ def problem_responses(
     for error in errors:
         if isinstance(error, int):
             status = error
-            code = "validation_error" if error == 422 else _code_for_status(error)
+            code = (
+                "validation_error"
+                if error == HTTPStatus.UNPROCESSABLE_CONTENT
+                else _code_for_status(error)
+            )
         else:
             status, code = error.status, error.code
         codes.setdefault(status, [])
@@ -247,7 +251,7 @@ def field_errors(errors: Sequence[Any]) -> list[dict[str, str]]:
     return result
 
 
-async def _app_error_handler(request: Request, exc: AppError) -> Response:
+async def _app_error_handler(_request: Request, exc: AppError) -> Response:
     return problem_response(
         exc.status,
         exc.code,
@@ -259,7 +263,7 @@ async def _app_error_handler(request: Request, exc: AppError) -> Response:
 
 
 async def _validation_error_handler(
-    request: Request, exc: RequestValidationError
+    _request: Request, exc: RequestValidationError
 ) -> Response:
     return problem_response(
         422,
@@ -270,7 +274,7 @@ async def _validation_error_handler(
 
 
 async def _http_exception_handler(
-    request: Request, exc: StarletteHTTPException
+    _request: Request, exc: StarletteHTTPException
 ) -> Response:
     # Same rule as Starlette's own handler: these statuses carry no body.
     if exc.status_code in {204, 304}:
@@ -344,7 +348,7 @@ def sqlstate(exc: DBAPIError) -> str | None:
 
 
 def find_db_error(exc: BaseException) -> DBAPIError | None:
-    """Return the first database error in *exc*'s cause/context chain."""
+    """Return the first database error in `exc`'s cause/context chain."""
     seen: set[int] = set()
     current: BaseException | None = exc
     while current is not None and id(current) not in seen:
@@ -368,7 +372,7 @@ def log_unexpected_error(
     """
     db_error = find_db_error(exc)
     if db_error is None:
-        log.error(event, error_type=type(exc).__name__, exc_info=True)
+        log.error(event, error_type=type(exc).__name__, exc_info=exc)
         return
     log.error(
         event,

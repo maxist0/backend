@@ -16,11 +16,11 @@ from app.core import (
     DbSession,
     Settings,
     SettingsDep,
+    TokenData,
     Unauthorized,
     get_logger,
     problem_responses,
 )
-from app.core.security import TokenData
 from app.modules.auth import service
 from app.modules.auth.dependencies import (
     REFRESH_COOKIE,

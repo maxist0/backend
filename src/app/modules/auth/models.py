@@ -19,6 +19,8 @@ from app.modules.users import User
 
 
 class PasswordCredential(Base):
+    """The Argon2 password hash of a user (one per user)."""
+
     __tablename__ = "password_credentials"
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -41,12 +43,15 @@ class PasswordCredential(Base):
     )
 
     def __str__(self) -> str:
+        """Label in the admin panel, without the hash."""
         return f"PasswordCredential(user_id={self.user_id})"
 
     user: Mapped[User] = relationship()
 
 
 class AuditEventType(PyEnum):
+    """Kind of an audit-log entry; PostgreSQL stores the member names."""
+
     REGISTER = "register"
     LOGIN_SUCCESS = "login_success"
     LOGIN_FAILED = "login_failed"
@@ -55,18 +60,20 @@ class AuditEventType(PyEnum):
     EMAIL_VERIFICATION_SENT = "email_verification_sent"
     EMAIL_VERIFIED = "email_verified"
     EMAIL_CHANGED = "email_changed"
-    PASSWORD_CHANGED = "password_changed"
-    PASSWORD_RESET_REQUESTED = "password_reset_requested"
-    PASSWORD_RESET_COMPLETED = "password_reset_completed"
+    PASSWORD_CHANGED = "password_changed"  # noqa: S105 - audit event name, not a secret
+    PASSWORD_RESET_REQUESTED = "password_reset_requested"  # noqa: S105 - audit event name, not a secret
+    PASSWORD_RESET_COMPLETED = "password_reset_completed"  # noqa: S105 - audit event name, not a secret
     SESSION_REVOKED = "session_revoked"
     ACCOUNT_DEACTIVATED = "account_deactivated"
     ACCOUNT_REACTIVATED = "account_reactivated"
-    PASSWORD_CHANGE_FORCED = "password_change_forced"
+    PASSWORD_CHANGE_FORCED = "password_change_forced"  # noqa: S105 - audit event name, not a secret
     # Written when the account-locked mail went out; it throttles that mail.
     ACCOUNT_LOCKED_NOTICE_SENT = "account_locked_notice_sent"
 
 
 class AuthAuditLog(Base):
+    """An append-only record of a security-relevant event of an account."""
+
     __tablename__ = "auth_audit_log"
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -89,6 +96,7 @@ class AuthAuditLog(Base):
     )
 
     def __str__(self) -> str:
+        """Label in the admin panel."""
         return f"{self.event_type.value} @ {self.created_at}"
 
     user: Mapped[User | None] = relationship()
@@ -101,12 +109,16 @@ class AuthAuditLog(Base):
 
 
 class EmailTokenPurpose(PyEnum):
+    """What an email token proves; PostgreSQL stores the member names."""
+
     VERIFY_EMAIL = "verify_email"
     CHANGE_EMAIL = "change_email"
-    RESET_PASSWORD = "reset_password"
+    RESET_PASSWORD = "reset_password"  # noqa: S105 - token purpose, not a secret
 
 
 class EmailToken(Base):
+    """A single-use token mailed to the user; only its SHA-256 hash is stored."""
+
     __tablename__ = "email_tokens"
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -141,6 +153,7 @@ class EmailToken(Base):
     )
 
     def __str__(self) -> str:
+        """Label in the admin panel, without the hash."""
         return f"{self.purpose.value} (user_id={self.user_id})"
 
     user: Mapped[User] = relationship()
@@ -153,7 +166,7 @@ class EmailToken(Base):
 
 
 class Session(Base):
-    """Refresh-token sessions – persisted for audit & rotation-chain tracking."""
+    """A refresh-token session; rotated tokens stay for reuse detection."""
 
     __tablename__ = "sessions"
 
@@ -187,8 +200,10 @@ class Session(Base):
     )
 
     def __str__(self) -> str:
+        """Label in the admin panel, without the hash."""
         status = "revoked" if self.is_revoked else "active"
-        return f"Session({status}, device={self.device_name or 'unknown'}, ip={self.ip_address})"
+        device = self.device_name or "unknown"
+        return f"Session({status}, device={device}, ip={self.ip_address})"
 
     user: Mapped[User] = relationship()
 

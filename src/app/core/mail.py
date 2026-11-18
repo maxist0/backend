@@ -34,6 +34,10 @@ logger = get_logger(__name__)
 
 CORE_TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
 
+# SMTP reply codes 4yz: "transient negative completion" (RFC 5321 section
+# 4.2.1); 5yz replies are permanent.
+_SMTP_TRANSIENT_REPLIES = range(400, 500)
+
 
 class MailDeliveryError(RuntimeError):
     """Sending a mail failed for good; carries only the type of the cause.
@@ -59,9 +63,8 @@ def _is_transient(cause: BaseException) -> bool:
     """Tell whether a failed send may succeed when tried again.
 
     Transient: network errors and timeouts, and SMTP replies in the 4xx
-    range ("transient negative completion", RFC 5321 section 4.2.1). A 5xx
-    reply (unknown mailbox, bad credentials) and every other exception
-    (template errors, programming errors) are permanent.
+    range. A 5xx reply (unknown mailbox, bad credentials) and every other
+    exception (template errors, programming errors) are permanent.
     """
     # fastapi-mail turns every error of connect and login into its own
     # ConnectionErrors, raised inside the `except` block, so the aiosmtplib
@@ -69,9 +72,11 @@ def _is_transient(cause: BaseException) -> bool:
     if isinstance(cause, ConnectionErrors) and cause.__context__ is not None:
         cause = cause.__context__
     if isinstance(cause, SMTPResponseException):
-        return 400 <= cause.code < 500
+        return cause.code in _SMTP_TRANSIENT_REPLIES
     if isinstance(cause, SMTPRecipientsRefused):
-        return all(400 <= refused.code < 500 for refused in cause.recipients)
+        return all(
+            refused.code in _SMTP_TRANSIENT_REPLIES for refused in cause.recipients
+        )
     # aiosmtplib raises connection failures and disconnects as
     # ConnectionError subclasses and timeouts as TimeoutError subclasses.
     return isinstance(cause, (ConnectionError, TimeoutError))

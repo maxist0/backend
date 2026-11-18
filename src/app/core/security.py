@@ -42,7 +42,7 @@ class TokenData(BaseModel):
 JWT_ALGORITHM: Final = "HS256"
 # Claims every access token must carry; PyJWT rejects tokens without them.
 _REQUIRED_CLAIMS: Final = ["exp", "iat", "nbf", "sub", "jti"]
-_ACCESS_TOKEN_TYPE: Final = "access"
+_ACCESS_TOKEN_TYPE: Final = "access"  # noqa: S105 - the `type` claim, not a secret
 
 
 def create_access_token(
@@ -88,10 +88,14 @@ def _parse_uuid(value: object) -> str | None:
         return None
 
 
-def decode_token(token: str) -> TokenData | None:
-    """
-    Decode and validate a JWT access token.
-    Returns TokenData if valid, None for any invalid, expired or malformed token.
+def decode_token(token: str) -> TokenData | None:  # noqa: PLR0911 - one exit per rejected claim, each logged
+    """Decode and validate a JWT access token.
+
+    Args:
+        token: The raw bearer token.
+
+    Returns:
+        The payload, or None for any invalid, expired or malformed token.
     """
     try:
         payload = jwt.decode(
@@ -243,14 +247,14 @@ def _burn_verify_sync(password: str) -> float:
 
 
 async def hash_password(password: str) -> str:
-    """Return an argon2id hash of *password* (computed in a worker thread)."""
+    """Return an argon2id hash of `password` (computed in a worker thread)."""
     return await anyio.to_thread.run_sync(
         _password_hasher().hash, password, limiter=_password_hash_limiter()
     )
 
 
 async def verify_password(password: str, password_hash: str) -> bool:
-    """Return True if *password* matches *password_hash* (worker thread)."""
+    """Return True if `password` matches `password_hash` (worker thread)."""
     valid, seconds = await anyio.to_thread.run_sync(
         _timed_verify_sync,
         password,
@@ -262,7 +266,7 @@ async def verify_password(password: str, password_hash: str) -> bool:
 
 
 def password_needs_rehash(password_hash: str) -> bool:
-    """True if *password_hash* was made with other parameters than configured."""
+    """True if `password_hash` was made with other parameters than configured."""
     return _password_hasher().check_needs_rehash(password_hash)
 
 

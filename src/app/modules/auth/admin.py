@@ -7,15 +7,14 @@ and touch credentials, which belong to auth, and users must not import auth.
 """
 
 import uuid
-from typing import Protocol
+from typing import ClassVar, Protocol
 
 from sqladmin import ModelView, action
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.requests import Request
 from starlette.responses import Response
 
-from app.core import get_settings
-from app.core.admin import back_to_list, selected_ids, session_factory
+from app.core import back_to_list, get_settings, selected_ids, session_factory
 from app.modules.auth import service
 from app.modules.auth.models import AuthAuditLog, Session
 from app.modules.users import User
@@ -46,6 +45,8 @@ async def _run_for_selected(
 
 
 class UserAdmin(ModelView, model=User):
+    """Users, read-only; lock, unlock, deactivate and reactivate as actions."""
+
     name_plural = "Users"
     icon = "fa-solid fa-users"
 
@@ -53,7 +54,7 @@ class UserAdmin(ModelView, model=User):
     can_edit = False
     can_delete = False
 
-    column_list = [
+    column_list: ClassVar = [
         User.id,
         User.username,
         User.email,
@@ -65,8 +66,8 @@ class UserAdmin(ModelView, model=User):
         User.created_at,
         User.last_login_at,
     ]
-    column_searchable_list = [User.username, User.email, User.display_name]
-    column_sortable_list = [
+    column_searchable_list: ClassVar = [User.username, User.email, User.display_name]
+    column_sortable_list: ClassVar = [
         User.username,
         User.email,
         User.is_active,
@@ -75,9 +76,9 @@ class UserAdmin(ModelView, model=User):
         User.last_login_at,
         User.failed_login_attempts,
     ]
-    column_default_sort = [(User.created_at, True)]
+    column_default_sort: ClassVar = [(User.created_at, True)]
     page_size = 25
-    page_size_options = [10, 25, 50, 100]
+    page_size_options: ClassVar = [10, 25, 50, 100]
 
     @action(
         name="lock_users",
@@ -85,6 +86,7 @@ class UserAdmin(ModelView, model=User):
         confirmation_message="Lock the selected users and end all their sessions?",
     )
     async def lock_users(self, request: Request) -> Response:
+        """Lock the selected users indefinitely and end their sessions."""
         return await _run_for_selected(self, request, service.admin_lock_user)
 
     @action(
@@ -93,14 +95,18 @@ class UserAdmin(ModelView, model=User):
         confirmation_message="Unlock the selected users and reset failed logins?",
     )
     async def unlock_users(self, request: Request) -> Response:
+        """Unlock the selected users and reset their failed logins."""
         return await _run_for_selected(self, request, service.admin_unlock_user)
 
     @action(
         name="deactivate_users",
         label="Deactivate selected",
-        confirmation_message="Deactivate the selected users and end all their sessions?",
+        confirmation_message=(
+            "Deactivate the selected users and end all their sessions?"
+        ),
     )
     async def deactivate_users(self, request: Request) -> Response:
+        """Deactivate the selected users and end their sessions."""
         return await _run_for_selected(self, request, service.admin_deactivate_user)
 
     @action(
@@ -109,6 +115,7 @@ class UserAdmin(ModelView, model=User):
         confirmation_message="Reactivate the selected users?",
     )
     async def reactivate_users(self, request: Request) -> Response:
+        """Reactivate the selected users."""
         return await _run_for_selected(self, request, service.admin_reactivate_user)
 
     @action(
@@ -117,12 +124,15 @@ class UserAdmin(ModelView, model=User):
         confirmation_message="Flag the selected users' passwords for a change?",
     )
     async def force_password_change(self, request: Request) -> Response:
+        """Flag the selected users' passwords for a change."""
         return await _run_for_selected(
             self, request, service.admin_force_password_change
         )
 
 
 class AuthAuditLogAdmin(ModelView, model=AuthAuditLog):
+    """The audit log, read-only."""
+
     name = "Audit Log"
     name_plural = "Audit Logs"
     icon = "fa-solid fa-clipboard-list"
@@ -131,7 +141,7 @@ class AuthAuditLogAdmin(ModelView, model=AuthAuditLog):
     can_edit = False
     can_delete = False
 
-    column_list = [
+    column_list: ClassVar = [
         AuthAuditLog.id,
         AuthAuditLog.user_id,
         AuthAuditLog.event_type,
@@ -140,14 +150,16 @@ class AuthAuditLogAdmin(ModelView, model=AuthAuditLog):
         AuthAuditLog.detail,
         AuthAuditLog.created_at,
     ]
-    column_searchable_list = [AuthAuditLog.ip_address, AuthAuditLog.detail]
-    column_sortable_list = [AuthAuditLog.created_at, AuthAuditLog.event_type]
-    column_default_sort = [(AuthAuditLog.created_at, True)]
+    column_searchable_list: ClassVar = [AuthAuditLog.ip_address, AuthAuditLog.detail]
+    column_sortable_list: ClassVar = [AuthAuditLog.created_at, AuthAuditLog.event_type]
+    column_default_sort: ClassVar = [(AuthAuditLog.created_at, True)]
     page_size = 50
-    page_size_options = [25, 50, 100, 200]
+    page_size_options: ClassVar = [25, 50, 100, 200]
 
 
 class SessionAdmin(ModelView, model=Session):
+    """Refresh-token sessions, read-only; revoking is an action."""
+
     name_plural = "Sessions"
     icon = "fa-solid fa-terminal"
 
@@ -155,7 +167,7 @@ class SessionAdmin(ModelView, model=Session):
     can_edit = False
     can_delete = False
 
-    column_list = [
+    column_list: ClassVar = [
         Session.id,
         Session.user_id,
         Session.is_revoked,
@@ -167,27 +179,30 @@ class SessionAdmin(ModelView, model=Session):
         Session.created_at,
         Session.revoked_at,
     ]
-    column_searchable_list = [
+    column_searchable_list: ClassVar = [
         Session.ip_address,
         Session.device_name,
         Session.device_id,
     ]
-    column_sortable_list = [
+    column_sortable_list: ClassVar = [
         Session.is_revoked,
         Session.expires_at,
         Session.created_at,
         Session.revoked_at,
     ]
-    column_default_sort = [(Session.created_at, True)]
+    column_default_sort: ClassVar = [(Session.created_at, True)]
     page_size = 50
-    page_size_options = [25, 50, 100, 200]
+    page_size_options: ClassVar = [25, 50, 100, 200]
 
     @action(
         name="revoke_sessions",
         label="Revoke selected",
-        confirmation_message="Revoke the selected sessions? Their users must log in again.",
+        confirmation_message=(
+            "Revoke the selected sessions? Their users must log in again."
+        ),
     )
     async def revoke_sessions(self, request: Request) -> Response:
+        """Revoke the selected sessions."""
         return await _run_for_selected(self, request, service.admin_revoke_session)
 
 

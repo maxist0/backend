@@ -106,9 +106,9 @@ The dev launcher also starts a `taskiq` worker and the `taskiq` scheduler as chi
 
 ```bash
 # Lint, format check, types
-uvx ruff@0.15.0 check src tests
-uvx ruff@0.15.0 format --check src tests
-uv run mypy src
+uv run ruff check src tests run.py alembic
+uv run ruff format --check src tests run.py alembic
+uv run mypy
 
 # Tests (needs a running Docker daemon; the suite starts Postgres and Redis containers)
 uv run pytest

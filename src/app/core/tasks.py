@@ -28,14 +28,13 @@ import functools
 import time
 from collections.abc import (
     AsyncGenerator,
-    AsyncIterator,
     Awaitable,
     Callable,
     Coroutine,
 )
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, override
 
 import psycopg
 import redis.exceptions
@@ -180,9 +179,7 @@ def task_database_error(exc: DBAPIError | psycopg.Error) -> TaskDatabaseError:
 
 def task[**P, R](
     task_name: str | None = None,
-    # Any: taskiq labels are arbitrary JSON values (`retry_on_error`,
-    # `schedule`, ...).
-    **labels: Any,
+    **labels: object,
 ) -> Callable[
     [Callable[P, Coroutine[Any, Any, R]]],
     AsyncTaskiqDecoratedTask[P, Coroutine[Any, Any, R]],
@@ -240,10 +237,12 @@ class ReconnectingStreamBroker(RedisStreamBroker):
     waits and reads again instead.
     """
 
+    @override
     def _ack_generator(self, id: str, queue_name: str) -> Callable[[], Awaitable[None]]:
         # taskiq-redis builds the ack of every message here, for newly read
-        # and for reclaimed (XAUTOCLAIM) entries alike. Redis 7 has no
-        # XACKDEL, so XACK and XDEL run in one MULTI/EXEC transaction.
+        # and for reclaimed (XAUTOCLAIM) entries alike, and passes `id=` as a
+        # keyword, so the parameter keeps its name. Redis 7 has no XACKDEL,
+        # so XACK and XDEL run in one MULTI/EXEC transaction.
         async def _ack() -> None:
             async with (
                 Redis(connection_pool=self.connection_pool) as redis_conn,
@@ -308,7 +307,7 @@ class ReconnectingStreamBroker(RedisStreamBroker):
                 await asyncio.sleep(BROKER_RECONNECT_SECONDS)
 
 
-async def configure_worker_logging(state: TaskiqState) -> None:
+async def configure_worker_logging(_state: TaskiqState) -> None:
     """Set up structured logging once per worker or scheduler process.
 
     Logging is not configured at import. A worker process configures it in
@@ -369,7 +368,7 @@ def add_task_db_hooks(broker: AsyncBroker) -> None:
 @asynccontextmanager
 async def get_task_db(
     state: Annotated[TaskiqState, TaskiqDepends()],
-) -> AsyncIterator[AsyncSession]:
+) -> AsyncGenerator[AsyncSession]:
     """Provide a session from the worker's session factory for one task run.
 
     Closing the session rolls back a transaction the task left open.
@@ -417,9 +416,9 @@ def build_broker(settings: Settings) -> AsyncBroker:
     broker = ReconnectingStreamBroker(
         settings.TASKIQ_BROKER_URL,
         queue_name=TASK_STREAM,
-        # "0": a new group reads the whole stream. With taskiq-redis' "$",
-        # entries added before the group exists (for example after Redis
-        # lost its data) would never be delivered.
+        # A new group starts at the first entry. With taskiq-redis' default
+        # `$`, entries added before the group exists (for example after
+        # Redis lost its data) would never be delivered.
         consumer_id="0",
         xread_block=XREAD_BLOCK_MS,
         maxlen=TASK_STREAM_MAXLEN,

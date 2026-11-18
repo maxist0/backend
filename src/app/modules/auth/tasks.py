@@ -21,8 +21,16 @@ import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 from taskiq import TaskiqDepends
 
-from app.core import Settings, TaskDbSession, get_logger, get_settings, task
-from app.core.mail import get_mailer, mail_delivery_error, send_templated_email
+from app.core import (
+    Settings,
+    TaskDbSession,
+    get_logger,
+    get_mailer,
+    get_settings,
+    mail_delivery_error,
+    send_templated_email,
+    task,
+)
 from app.modules.auth.models import EmailTokenPurpose
 
 logger = get_logger(__name__)
@@ -132,7 +140,7 @@ async def _send(
             context=context,
             template_dir=TEMPLATE_DIR,
         )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - every failure leaves as MailDeliveryError
         # Only the exception type, in the log and in what taskiq logs: SMTP
         # errors can echo the recipient address.
         log.error("email.send_failed", error_type=type(exc).__name__)
@@ -164,8 +172,7 @@ async def send_token_email_task(
         MailDeliveryError: Rendering or sending failed; the transient
             subclass is retried.
     """
-    # The service enqueues this task, so it is imported when the task runs.
-    from app.modules.auth import service
+    from app.modules.auth import service  # noqa: PLC0415 - service imports tasks
 
     log = logger.bind(token_id=token_id)
     if get_mailer() is None:
@@ -206,7 +213,7 @@ async def send_account_locked_notice_task(
         MailDeliveryError: Rendering or sending failed; the transient
             subclass is retried.
     """
-    from app.modules.auth import service
+    from app.modules.auth import service  # noqa: PLC0415 - service imports tasks
 
     log = logger.bind(user_id=user_id, purpose="account_locked")
     if get_mailer() is None:
@@ -232,7 +239,7 @@ async def _send_email_change_notice(
     db: AsyncSession, token_id: str, *, completed: bool
 ) -> None:
     """Send the requested or the completed notice of one email change."""
-    from app.modules.auth import service
+    from app.modules.auth import service  # noqa: PLC0415 - service imports tasks
 
     if completed:
         purpose, subject, template_name = (
@@ -325,7 +332,7 @@ async def cleanup_task(db: TaskDbSession = TaskiqDepends()) -> None:
     Args:
         db: The task's database session.
     """
-    from app.modules.auth import service
+    from app.modules.auth import service  # noqa: PLC0415 - service imports tasks
 
     retention_days = get_settings().AUTH_CLEANUP_RETENTION_DAYS
     result = await service.cleanup_ended_auth_records(

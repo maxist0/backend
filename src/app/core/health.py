@@ -57,13 +57,13 @@ async def liveness() -> LivenessResponse:
 
 
 async def _check(
-    name: str, probe: Callable[[], Awaitable[object]], timeout: float
+    name: str, probe: Callable[[], Awaitable[object]], seconds: float
 ) -> CheckStatus:
     """Run one readiness probe with a timeout; log a failure by type only."""
     try:
-        async with asyncio.timeout(timeout):
+        async with asyncio.timeout(seconds):
             await probe()
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - any failure means "not ready" (503)
         logger.warning("health.check_failed", check=name, error_type=type(exc).__name__)
         return "error"
     return "ok"

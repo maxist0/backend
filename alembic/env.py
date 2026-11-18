@@ -1,9 +1,8 @@
-"""
-Alembic environment for async migrations.
+"""Alembic environment for async migrations.
 
-The database URL comes from ``DATABASE_URL`` only. With ``ENVIRONMENT=dev``
-a missing variable is filled from ``.env.local`` (``override=False``: injected
-variables always win). No fallback to dev: without ``ENVIRONMENT=dev`` the
+The database URL comes from `DATABASE_URL` only. With `ENVIRONMENT=dev` a
+missing variable is filled from `.env.local` (`override=False`: injected
+variables always win). No fallback to dev: without `ENVIRONMENT=dev` the
 file is never read. The application settings are not built here, so a
 migration job needs no application secrets.
 
@@ -14,8 +13,8 @@ Apply migrations:
     ENVIRONMENT=dev alembic upgrade head
     DATABASE_URL=postgresql+psycopg://... alembic upgrade head
 
-The URL is normalised like the application's (``postgresql://`` and
-``postgres://`` become ``postgresql+psycopg://``; other drivers are refused).
+The URL is normalised like the application's (`postgresql://` and
+`postgres://` become `postgresql+psycopg://`; other drivers are refused).
 
 Downgrade one step:
     ENVIRONMENT=dev alembic downgrade -1
@@ -36,7 +35,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 # Importing app.modules imports every registered module (MODULES), and with
 # it each module's models, so the metadata holds all tables (autogenerate
 # must never see an empty metadata). It reads no settings.
-import app.modules  # noqa: F401
+import app.modules  # noqa: F401 - registers every module's tables on Base.metadata
 from app.core import Base
 from app.core.config import LOCAL_ENV_FILE, Environment, normalize_database_url
 
@@ -45,12 +44,11 @@ class MigrationConfigError(RuntimeError):
     """The environment does not name a database to migrate."""
 
 
-# ---------------------------------------------------------------------------
-# Alembic Config object – gives access to values in alembic.ini
-# ---------------------------------------------------------------------------
 config = context.config
 
-# Set up Python logging from alembic.ini [loggers] section
+# fileConfig() disables every logger that exists when it runs. An in-process
+# caller that must keep its loggers passes `Config()` without a file;
+# `setup_logging` re-enables uvicorn's loggers.
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
@@ -81,12 +79,7 @@ logger.info(
     "Using DATABASE_URL %s", make_url(_url).render_as_string(hide_password=True)
 )
 
-# Metadata that Alembic inspects for autogenerate
 target_metadata = Base.metadata
-
-# ---------------------------------------------------------------------------
-# Offline migrations (no live DB connection)
-# ---------------------------------------------------------------------------
 
 
 def run_migrations_offline() -> None:
@@ -103,12 +96,8 @@ def run_migrations_offline() -> None:
         context.run_migrations()
 
 
-# ---------------------------------------------------------------------------
-# Online migrations (async engine)
-# ---------------------------------------------------------------------------
-
-
 def do_run_migrations(connection: Connection) -> None:
+    """Run the migrations on a connection (sync side of `run_sync`)."""
     context.configure(
         connection=connection,
         target_metadata=target_metadata,
@@ -133,14 +122,12 @@ async def run_async_migrations() -> None:
 
 
 def run_migrations_online() -> None:
+    """Run the migrations against the database."""
     # psycopg (async) cannot use Windows' default ProactorEventLoop.
     loop_factory = asyncio.SelectorEventLoop if sys.platform == "win32" else None
     asyncio.run(run_async_migrations(), loop_factory=loop_factory)
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 if context.is_offline_mode():
     run_migrations_offline()
 else:

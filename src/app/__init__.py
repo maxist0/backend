@@ -1,6 +1,5 @@
-"""
-API - Main application package.
+"""The API application package.
 
-The version is read from the installed distribution metadata
-(``importlib.metadata.version("api")``); see ``app.common.config``.
+The version comes from the installed distribution's metadata
+(`importlib.metadata.version("api")`); see `app.core.config`.
 """

@@ -53,6 +53,7 @@ class RegisterRequest(BaseModel):
     @field_validator("username")
     @classmethod
     def validate_username(cls, v: str) -> str:
+        """Allow ASCII letters, digits, hyphens and underscores only."""
         if not _USERNAME_RE.match(v):
             raise ValueError(
                 "Username may only contain letters, digits, hyphens, and underscores"
@@ -107,7 +108,7 @@ class TokenResponse(BaseModel):
     """A new access token (RFC 6749 section 5.1)."""
 
     access_token: str
-    token_type: Literal["bearer"] = "bearer"
+    token_type: Literal["bearer"] = "bearer"  # noqa: S105 - RFC 6749 token type
     expires_in: int = Field(description="Lifetime of the access token in seconds.")
 
 

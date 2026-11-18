@@ -13,6 +13,7 @@ are answered by `CORSMiddleware` itself and do not reach this middleware.
 import re
 import time
 import uuid
+from collections.abc import Iterable
 
 import structlog
 from fastapi.routing import iter_route_contexts
@@ -66,7 +67,8 @@ def metric_method(method: str) -> str:
 
 def request_id_from(scope: Scope) -> str:
     """Return the client's `X-Request-ID` if it is a safe token, else a new UUID."""
-    for name, value in scope["headers"]:
+    headers: Iterable[tuple[bytes, bytes]] = scope["headers"]
+    for name, value in headers:
         if name == b"x-request-id":
             candidate = value.decode("latin-1")
             if _REQUEST_ID.fullmatch(candidate):
@@ -100,6 +102,7 @@ class RequestMiddleware:
         self._templates: dict[int, str] | None = None
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """Handle one ASGI connection; only HTTP requests are instrumented."""
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
@@ -129,7 +132,7 @@ class RequestMiddleware:
 
         try:
             await self.app(scope, receive, send_with_headers)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - this is the app's last error boundary
             # Not re-raised: the server would log it a second time, with the
             # database error text that log_unexpected_error leaves out.
             log_unexpected_error(logger, "app.unhandled_exception", exc)

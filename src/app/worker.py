@@ -16,14 +16,21 @@ Windows, where the `taskiq worker` CLI runs on the ProactorEventLoop that
 psycopg cannot use.
 """
 
+import asyncio
+import contextlib
 import os
 import tempfile
 from pathlib import Path
+
+from taskiq import AcknowledgeType, async_shared_broker
+from taskiq.api import run_receiver_task
 
 # prometheus_client decides once, when it is first imported, whether metric
 # values live in memory or in files of PROMETHEUS_MULTIPROC_DIR. The taskiq
 # metrics server reads only those files (one per worker process), so the
 # directory must be set before `app.modules` imports prometheus_client.
+# taskiq imports prometheus_client only inside its middleware, so the taskiq
+# imports above are safe.
 METRICS_DIR = Path(
     os.environ.setdefault(
         "PROMETHEUS_MULTIPROC_DIR",
@@ -32,15 +39,9 @@ METRICS_DIR = Path(
 )
 METRICS_DIR.mkdir(parents=True, exist_ok=True)
 
-import asyncio  # noqa: E402
-import contextlib  # noqa: E402
-
-from taskiq import AcknowledgeType, async_shared_broker  # noqa: E402
-from taskiq.api import run_receiver_task  # noqa: E402
-
-import app.modules  # noqa: E402, F401  (registers every module's tasks)
-from app.core import get_settings  # noqa: E402
-from app.core.tasks import (  # noqa: E402
+import app.modules  # noqa: E402, F401 - after the env var; registers every module's tasks
+from app.core import get_settings  # noqa: E402 - after PROMETHEUS_MULTIPROC_DIR
+from app.core.tasks import (  # noqa: E402 - after PROMETHEUS_MULTIPROC_DIR
     build_retry_source,
     build_scheduler,
     build_worker_broker,

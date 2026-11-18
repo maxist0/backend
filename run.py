@@ -16,6 +16,10 @@ import os
 import subprocess
 import sys
 
+import uvicorn
+
+from app.core.config import ConfigurationError, get_settings
+
 # psycopg (async) cannot run on Windows' default ProactorEventLoop, which
 # uvicorn picks for a single process there. An import string is used as the
 # loop factory directly (uvicorn >= 0.36, "--loop <module>:<attr>"). Other
@@ -81,6 +85,7 @@ def stop_process(process: subprocess.Popen[bytes]) -> None:
 
 
 def main() -> None:
+    """Parse the command line, select the environment and start the processes."""
     parser = argparse.ArgumentParser(description="Run the API server")
     parser.add_argument(
         "env",
@@ -118,14 +123,10 @@ def main() -> None:
             "or run 'python run.py dev' for local development."
         )
 
-    from app.core.config import ConfigurationError, get_settings
-
     try:
         settings = get_settings()
     except ConfigurationError as exc:
         parser.error(str(exc))
-
-    import uvicorn
 
     host = args.host if args.host is not None else settings.HOST
     port = args.port if args.port is not None else settings.PORT
@@ -136,10 +137,9 @@ def main() -> None:
     # retries of failed tasks need the scheduler.
     if settings.is_development:
         log_level = settings.LOG_LEVEL.upper()
-        children.append(
-            subprocess.Popen(worker_command(settings.TASKIQ_WORKERS, log_level))
-        )
-        children.append(subprocess.Popen(scheduler_command(log_level)))
+        worker = worker_command(settings.TASKIQ_WORKERS, log_level)
+        children.append(subprocess.Popen(worker))  # noqa: S603 - fixed argv
+        children.append(subprocess.Popen(scheduler_command(log_level)))  # noqa: S603 - fixed argv
 
     try:
         uvicorn.run(

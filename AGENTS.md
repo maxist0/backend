@@ -31,13 +31,14 @@ A **module boilerplate** on FastAPI: async SQLAlchemy 2 on PostgreSQL 18, Redis 
 uv python install 3.14 && uv sync          # install (creates .venv with dev group)
 uv run alembic upgrade head                 # migrate local DB (reads .env.local)
 uv run python run.py dev                    # API on :8000 + taskiq worker + scheduler, reads .env.local
-uvx ruff@0.15.0 check src tests             # lint (S3 switches to `uv run ruff`, lint group)
-uvx ruff@0.15.0 format src tests            # format
-uv run mypy src                             # types (strict mode arrives in S3)
+uv run ruff check src tests run.py alembic   # lint (ruff pinned in the lint group)
+uv run ruff format src tests run.py alembic  # format; explicit paths, ruff would also format Markdown code blocks
+uv run mypy                                 # types, strict; paths come from [tool.mypy] in pyproject.toml
+uv run ty check                             # informational only (open decision D6), not a gate
 uv run pytest tests/unit --no-cov           # fast loop, no Docker; the coverage gate applies only to the full run
 uv run pytest                               # full suite (unit + integration, coverage gate); needs a running Docker daemon
 uv run pytest tests/integration -k "refresh" -x
-uv run alembic revision --autogenerate -m "describe_change"   # after model changes, then review the file
+uv run alembic revision --autogenerate -m "describe_change"   # after model changes; ruff fixes and formats it (alembic.ini hooks), then review the file
 docker build -t api:latest .                # image
 ```
 
@@ -71,7 +72,15 @@ docker build -t api:latest .                # image
 - `src/app/core/` is the infrastructure. `src/app/modules/` holds the modules. Two modules are built in: `users` (the `User` entity, profile, later settings) and `auth` (how a user proves identity: credentials, sessions, tokens, audit log). See [ADR 0008](documentation/adr/0008-module-layout-and-users-auth-split.md).
 - **Imports point one way: `core ← users ← auth ← app modules`.** The core never imports from `app.modules`; `users` never imports `auth`; a module never imports a module that depends on it. Modules import infrastructure from `app.core`, and `CurrentUser`, `OptionalUser`, `User` from `app.modules.users`.
 - **URLs follow the resource, code follows the responsibility.** Endpoints for the signed-in user live under `/users/me/...`; flows for signed-out users live under `/auth/...`. `PUT /users/me/password` and `PUT /users/me/email` need credentials and verification, so the `auth` module serves them (OpenAPI tag `users`).
-- `app.core` is a facade. It exports `Settings`, `DbSession`, `SettingsDep`, `get_settings`, `Base`, `utcnow`, `get_logger`, `log_unexpected_error`, the `AppError` family, `cached`, `invalidate`, `RedisDep`, `task` (taskiq's shared task decorator with database errors sanitized), `TaskDbSession` (a task's database session), `TransientTaskError` and `Module`. Import from `app.core`, not from its submodules.
+- `app.core` is a facade; `__all__` in `src/app/core/__init__.py` is the full list. It exports:
+  - settings and infrastructure: `Settings`, `SettingsDep`, `get_settings`, `DbSession`, `Base`, `utcnow`, `RedisDep`, `cached`, `invalidate`, `get_logger`, `Module`;
+  - errors: the `AppError` family, `ProblemDetail`, `problem_responses`, `log_unexpected_error`, `constraint_name` (the violated constraint of a database error);
+  - tasks: `task` (taskiq's shared task decorator with database errors sanitized), `TaskDbSession` (a task's database session), `TransientTaskError`;
+  - email: `send_templated_email`, `get_mailer`, `mail_delivery_error`;
+  - security: `TokenData`, `create_access_token`, `decode_token`, `hash_password`, `verify_password`, `password_needs_rehash`, `equalize_password_timing`, `wait_like_password_verify`, `login_admission_limiter`, `hash_token`;
+  - admin actions: `selected_ids`, `session_factory`, `back_to_list`.
+
+  Modules import only from `app.core`, never from its submodules; `tests/unit/core/test_import_direction.py` enforces it. Importing `app.core` reads no settings and opens no connection.
 - An app built on this boilerplate adds modules. If a task seems to need a core edit, stop and ask: either the core has a gap (a core change with an ADR) or the code belongs in a module.
 
 ## Module layout *(target)*
@@ -226,8 +235,8 @@ async def revoke_user_sessions(
 
 ## Definition of done
 
-- [ ] `uvx ruff@0.15.0 check src tests` and `format --check` pass
-- [ ] `uv run mypy src` passes
+- [ ] `uv run ruff check src tests run.py alembic` and `uv run ruff format --check src tests run.py alembic` pass
+- [ ] `uv run mypy` passes
 - [ ] `uv run pytest` passes locally with Docker running
 - [ ] New settings added to `src/app/core/config.py`, the `.env` template and the README configuration table
 - [ ] Migration generated and reviewed if models changed; command listed in the PR description

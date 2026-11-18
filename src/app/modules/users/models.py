@@ -17,7 +17,9 @@ from app.core import Base, utcnow
 
 
 def lock_is_active(
-    is_locked: bool, locked_until: datetime | None, now: datetime | None = None
+    is_locked: bool,  # noqa: FBT001 - callers unpack the `(is_locked, locked_until)` row
+    locked_until: datetime | None,
+    now: datetime | None = None,
 ) -> bool:
     """Lock rule shared by `User.is_lock_active` and fresh column reads.
 
@@ -32,6 +34,8 @@ def lock_is_active(
 
 
 class User(Base):
+    """A user account; credentials and sessions belong to the auth module."""
+
     __tablename__ = "users"
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -64,6 +68,7 @@ class User(Base):
     )
 
     def __str__(self) -> str:
+        """Label of the user in the admin panel."""
         return f"{self.username} ({self.email})"
 
     def is_lock_active(self, now: datetime | None = None) -> bool:

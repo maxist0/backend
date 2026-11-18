@@ -113,7 +113,7 @@ Agents: backend-engineer (Code und Tests), danach docs-writer.
 5. **Kleinkram:**
    - `jinja2` als direkte Abhängigkeit eintragen;
    - das Alembic-Template `script.py.mako` auf moderne Typen umstellen;
-   - `DEBUG` aus `.env.unittest` entfernen;
+   - `.env.unittest` löschen (wird von nichts gelesen, Owner-Entscheidung vom 18.11.2026);
    - `core/admin.py`-Helfer bei Bedarf in die Facade aufnehmen.
 6. **Doku (docs-writer):**
    - Backend-`README.md` neu: Layout, Quick Start mit `compose.dev.yaml`, Windows-Start, Konfiguration, Known issues aktualisieren. Dazu gehören die veraltete Statuszeile oben und Known issue 10 zu `MAIL_*`.
@@ -147,9 +147,9 @@ Agents: backend-engineer (Code und Tests), danach docs-writer.
 ```bash
 uv run pytest                                                          # volle Suite, Coverage-Gate 85, braucht Docker
 DOCKER_HOST=tcp://127.0.0.1:1 uv run pytest tests/unit --no-cov -p no:cacheprovider   # Unit ohne Docker (bash)
-uvx ruff@0.15.0 check src tests run.py alembic                         # ab S3: uv run ruff check ...
-uvx ruff@0.15.0 format --check src tests run.py alembic
-uv run mypy src
+uv run ruff check src tests run.py alembic                             # tests/ erst nach S3.2 grün
+uv run ruff format --check src tests run.py alembic
+uv run mypy                                                            # strict, Pfade aus [tool.mypy]
 uv audit --frozen
 ```
 
