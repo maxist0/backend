@@ -62,6 +62,8 @@ class AuditEventType(PyEnum):
     ACCOUNT_DEACTIVATED = "account_deactivated"
     ACCOUNT_REACTIVATED = "account_reactivated"
     PASSWORD_CHANGE_FORCED = "password_change_forced"
+    # Written when the account-locked mail went out; it throttles that mail.
+    ACCOUNT_LOCKED_NOTICE_SENT = "account_locked_notice_sent"
 
 
 class AuthAuditLog(Base):
@@ -120,6 +122,9 @@ class EmailToken(Base):
     )
     token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     new_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # The address an email change replaced, set when the change is
+    # confirmed, so the worker can notify the old address afterwards.
+    previous_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     expires_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
@@ -190,4 +195,5 @@ class Session(Base):
     __table_args__ = (
         Index("ix_sessions_user_id", "user_id"),
         Index("ix_sessions_family_id", "family_id"),
+        Index("ix_sessions_expires_at", "expires_at"),
     )

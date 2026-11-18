@@ -16,6 +16,10 @@ from tests.helpers import BACKEND_DIR
 
 # Queued messages carry these names; renaming one strands messages in Redis.
 TASK_NAMES = {
+    "auth.cleanup",
+    "email.send_account_locked_notice",
+    "email.send_email_change_completed_notice",
+    "email.send_email_change_requested_notice",
     "email.send_token_email",
     "maintenance.taskiq_heartbeat",
 }
@@ -89,8 +93,9 @@ def test_scheduler_finds_the_shared_heartbeat_schedule():
     schedules = asyncio.run(_schedules())
 
     assert scheduler.broker is broker
-    assert [(s.task_name, s.cron) for s in schedules] == [
-        ("maintenance.taskiq_heartbeat", "*/5 * * * *")
+    assert sorted((s.task_name, s.cron) for s in schedules) == [
+        ("auth.cleanup", "0 3 * * *"),
+        ("maintenance.taskiq_heartbeat", "*/5 * * * *"),
     ]
 
 

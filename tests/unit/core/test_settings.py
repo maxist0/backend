@@ -186,3 +186,23 @@ class TestProxyAndLockoutSettings:
     def test_removed_settings_are_gone(self):
         for name in ("DEBUG", "ROUTE_CACHE_ENABLED", "OTLP_LOGS_ENABLED"):
             assert name not in Settings.model_fields
+
+
+class TestCleanupRetention:
+    def test_default_is_thirty_days(self, settings_factory):
+        assert settings_factory().AUTH_CLEANUP_RETENTION_DAYS == 30
+
+    @pytest.mark.parametrize("days", [0, 366, -1])
+    def test_values_outside_the_bounds_are_rejected(self, settings_factory, days):
+        with pytest.raises(ValidationError):
+            settings_factory(AUTH_CLEANUP_RETENTION_DAYS=days)
+
+    @pytest.mark.parametrize("days", [1, 365])
+    def test_the_bounds_themselves_are_accepted(self, settings_factory, days):
+        """GUARD (control): the rejections above are caused by the bound only."""
+        assert (
+            settings_factory(
+                AUTH_CLEANUP_RETENTION_DAYS=days
+            ).AUTH_CLEANUP_RETENTION_DAYS
+            == days
+        )

@@ -10,11 +10,15 @@ Email tokens are issued in two steps. The request stores the token row
 with the hash of a random value that is never sent, commits, and enqueues
 the mail task with the token's id only. The worker (`prepare_token_email`)
 gives that token a fresh value, commits, and mails it. No token, address
-or username passes through Redis.
+or username passes through Redis. The security notices (account locked,
+email change requested or completed) are enqueued the same way, with a
+user's or a token's id, and the worker reads the rest
+(`prepare_account_locked_notice`, `prepare_email_change_notice`).
 """
 
 import secrets
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import NoReturn
@@ -58,7 +62,12 @@ from app.modules.auth.models import (
     PasswordCredential,
     Session,
 )
-from app.modules.auth.tasks import send_token_email_task
+from app.modules.auth.tasks import (
+    send_account_locked_notice_task,
+    send_email_change_completed_notice_task,
+    send_email_change_requested_notice_task,
+    send_token_email_task,
+)
 from app.modules.users import User
 from app.modules.users import crud as users_crud
 from app.modules.users.models import lock_is_active
@@ -102,6 +111,22 @@ _EMAIL_TOKEN_LIFETIME = timedelta(hours=24)
 # Audit details are written when the mail is requested; whether it was sent
 # is logged by the worker (`email.sent`, `email.not_sent`).
 _VERIFICATION_REQUESTED = "Verification email requested"
+
+# At most one account-locked mail per user in this time. A guessing attack
+# can lock an account again every `LOGIN_LOCKOUT_SECONDS` (default 15 min,
+# at least 1 s); one mail a day tells the user without flooding the inbox or
+# letting anyone who knows a username send that user mail at will.
+_LOCK_NOTICE_INTERVAL = timedelta(hours=24)
+
+# Rows per delete statement of the cleanup, each batch its own transaction:
+# short row locks and a bounded amount of WAL per commit, also when a large
+# backlog is cleaned up the first time.
+CLEANUP_BATCH_SIZE = 1_000
+# Batches per table and run (100,000 rows). Each batch takes milliseconds,
+# so a run stays far below the broker's 600 s redelivery idle time, after
+# which another worker would start the same run; a larger backlog is
+# finished by the following nights.
+CLEANUP_MAX_BATCHES = 100
 
 
 def _bounded_header(request: Request | None, name: str, max_length: int) -> str | None:
@@ -173,27 +198,69 @@ async def _open_email_token(
     return token_id
 
 
-async def _enqueue_token_email(
-    token_id: uuid.UUID, user_id: uuid.UUID, purpose: EmailTokenPurpose
+async def _enqueue_email(
+    kiq: Callable[[str], Awaitable[object]],
+    row_id: uuid.UUID,
+    *,
+    user_id: uuid.UUID,
+    purpose: str,
 ) -> None:
-    """Enqueue the mail of one email token.
+    """Enqueue a mail task with one row id.
 
-    Call it after the commit: the worker must find the token row. A broker
-    that cannot take the task is logged, not raised: the request has
-    succeeded, the token row stays, and the user can ask for a new mail.
-    Only the token's id is enqueued; `user_id` and `purpose` are for the
-    log.
+    Call it after the commit: the worker must find the row. A broker that
+    cannot take the task is logged, not raised: the request has succeeded,
+    and its answer must not depend on the mail. Only `row_id` is enqueued;
+    `user_id` and `purpose` are for the log.
+
+    Args:
+        kiq: The task's `kiq` method.
+        row_id: The email token's id, or the user's id for the lock notice.
+        user_id: The account the mail is about.
+        purpose: The mail's purpose, for the log.
     """
     try:
-        await send_token_email_task.kiq(str(token_id))
+        await kiq(str(row_id))
     except SendTaskError as exc:
         cause = exc.__cause__ or exc
         logger.error(
             "auth.email_enqueue_failed",
             user_id=str(user_id),
-            purpose=purpose.value,
+            purpose=purpose,
             error_type=type(cause).__name__,
         )
+
+
+async def _enqueue_token_email(
+    token_id: uuid.UUID, user_id: uuid.UUID, purpose: EmailTokenPurpose
+) -> None:
+    """Enqueue the mail of one email token; see `_enqueue_email`."""
+    await _enqueue_email(
+        send_token_email_task.kiq, token_id, user_id=user_id, purpose=purpose.value
+    )
+
+
+async def _record_lockout(
+    db: AsyncSession,
+    user_id: uuid.UUID,
+    attempts: int,
+    request: Request | None,
+    detail: str,
+) -> None:
+    """Audit, log and count a lock set by failed passwords; notify the user.
+
+    Called by the one request whose failure reached `LOGIN_MAX_ATTEMPTS`.
+    The audit row commits before the notice is enqueued, and the caller
+    answers the same way whether the enqueue worked or not.
+    """
+    LOCKOUTS.inc()
+    await _audit(db, AuditEventType.ACCOUNT_LOCKED, user_id, request, detail)
+    logger.warning("auth.account_locked", user_id=str(user_id), attempts=attempts)
+    await _enqueue_email(
+        send_account_locked_notice_task.kiq,
+        user_id,
+        user_id=user_id,
+        purpose="account_locked",
+    )
 
 
 async def register_user(
@@ -398,16 +465,12 @@ async def authenticate_user(
         if is_locked:
             # Exactly one request reaches the threshold; it records the lock.
             if attempts == settings.LOGIN_MAX_ATTEMPTS:
-                LOCKOUTS.inc()
-                await _audit(
+                await _record_lockout(
                     db,
-                    AuditEventType.ACCOUNT_LOCKED,
                     user.id,
+                    attempts,
                     request,
                     f"Locked after {attempts} failed attempts",
-                )
-                logger.warning(
-                    "auth.account_locked", user_id=str(user.id), attempts=attempts
                 )
             else:
                 await _audit(db, AuditEventType.LOGIN_FAILED, user.id, request)
@@ -706,7 +769,7 @@ async def reset_password(
     )
     if consumed is None:
         raise InvalidTokenError("Invalid or expired reset token")
-    user_id, _purpose, _new_email = consumed
+    _token_id, user_id, _purpose, _new_email = consumed
 
     # Fail closed: end tokens and sessions first, in one commit with the
     # redemption (lock order email_tokens -> users -> sessions), then change
@@ -756,7 +819,7 @@ async def verify_email(
     )
     if consumed is None:
         raise InvalidTokenError("Invalid or expired verification token")
-    user_id, purpose, new_email = consumed
+    token_id, user_id, purpose, new_email = consumed
     # Parallel requests can leave a second open token of this purpose; it
     # ends with this redemption (email_tokens first in the lock order).
     await crud.invalidate_tokens_for_user_purpose(db, user_id, purpose, commit=False)
@@ -774,7 +837,7 @@ async def verify_email(
         if not new_email:
             await db.rollback()
             raise InvalidTokenError("Invalid or expired verification token")
-        await _apply_email_change(db, user, new_email, request)
+        await _apply_email_change(db, user, token_id, new_email, request)
         return
 
     user.is_email_verified = True
@@ -784,14 +847,20 @@ async def verify_email(
 
 
 async def _apply_email_change(
-    db: AsyncSession, user: User, new_email: str, request: Request | None
+    db: AsyncSession,
+    user: User,
+    token_id: uuid.UUID,
+    new_email: str,
+    request: Request | None,
 ) -> None:
     """Switch `user` to the confirmed `new_email`; commits the redemption.
 
     Uniqueness is checked again because the address may have been taken
     since the change was requested; the unique constraint decides a race.
     Reset links mailed to the old address stop working in the same commit.
-    A conflict rolls everything back.
+    If the old address was verified, the token keeps it (`previous_email`)
+    for the notice to it, enqueued after the commit; an address nobody
+    confirmed gets no mail. A conflict rolls everything back.
     """
     existing = await users_crud.get_user_by_email(db, new_email)
     if existing is not None and existing.id != user.id:
@@ -802,6 +871,8 @@ async def _apply_email_change(
     await crud.invalidate_tokens_for_user_purpose(
         db, user.id, EmailTokenPurpose.RESET_PASSWORD, commit=False
     )
+    if user.is_email_verified:
+        await crud.set_email_token_previous_email(db, token_id, user.email)
     user.email = new_email
     user.is_email_verified = True
     try:
@@ -816,6 +887,12 @@ async def _apply_email_change(
         raise EmailTakenError() from None
     await _audit(db, AuditEventType.EMAIL_CHANGED, user.id, request)
     logger.info("auth.email_changed", user_id=str(user.id))
+    await _enqueue_email(
+        send_email_change_completed_notice_task.kiq,
+        token_id,
+        user_id=user.id,
+        purpose="email_change_completed",
+    )
 
 
 async def resend_verification_email(
@@ -927,6 +1004,218 @@ async def prepare_token_email(
     )
 
 
+@dataclass(frozen=True)
+class AccountLockedNotice:
+    """What the lock notice task needs to tell a user about a timed lock."""
+
+    user_id: uuid.UUID
+    recipient: str
+    username: str
+    locked_until: datetime
+
+
+async def prepare_account_locked_notice(
+    db: AsyncSession, user_id: uuid.UUID
+) -> AccountLockedNotice | None:
+    """Decide whether to tell a user that failed passwords locked the account.
+
+    The worker side of the lock notice; it only reads. Nothing is sent, and
+    None returned, when the account is gone or inactive, when its address
+    was never verified (it may not belong to the user), when the timed lock
+    has ended (expired, or lifted by an admin), when an admin lock replaced
+    it (the mail would state a wrong end), or when a lock notice was sent to
+    this user within `_LOCK_NOTICE_INTERVAL`. The interval counts the
+    `account_locked_notice_sent` audit rows, which only a sent notice
+    writes, so admin locks and notices that were never sent do not count.
+
+    Args:
+        db: The task's session; its read transaction ends here.
+        user_id: The account a failed password locked.
+
+    Returns:
+        Recipient (the account's address), username and the end of the
+        lock, or None if nothing must be sent.
+    """
+    user = await users_crud.get_user_by_id(db, user_id)
+    skip_reason: str | None = None
+    if user is None:
+        skip_reason = "no_user"
+    elif not user.is_active:
+        skip_reason = "account_inactive"
+    elif not user.is_email_verified:
+        skip_reason = "unverified_address"
+    elif user.is_admin_locked():
+        skip_reason = "admin_locked"
+    elif not user.is_lock_active():
+        skip_reason = "not_locked"
+    elif await crud.audit_event_since(
+        db,
+        user_id,
+        AuditEventType.ACCOUNT_LOCKED_NOTICE_SENT,
+        utcnow() - _LOCK_NOTICE_INTERVAL,
+    ):
+        skip_reason = "recently_notified"
+    notice: AccountLockedNotice | None = None
+    if user is not None and user.locked_until is not None and skip_reason is None:
+        notice = AccountLockedNotice(
+            user_id=user.id,
+            recipient=user.email,
+            username=user.username,
+            locked_until=user.locked_until,
+        )
+    # After reading the user: a rollback expires loaded rows.
+    await db.rollback()
+    if notice is None:
+        logger.info(
+            "email.not_sent",
+            user_id=str(user_id),
+            purpose="account_locked",
+            reason=skip_reason,
+        )
+    return notice
+
+
+async def record_account_locked_notice(
+    db: AsyncSession, notice: AccountLockedNotice
+) -> None:
+    """Audit a sent lock notice; the row throttles the next one. Commits."""
+    await _audit(
+        db,
+        AuditEventType.ACCOUNT_LOCKED_NOTICE_SENT,
+        notice.user_id,
+        detail=f"Lock notice sent, locked until {notice.locked_until.isoformat()}",
+    )
+
+
+@dataclass(frozen=True)
+class EmailChangeNotice:
+    """What a notice task needs to tell the old address about an email change."""
+
+    user_id: uuid.UUID
+    recipient: str
+    username: str
+
+
+async def prepare_email_change_notice(
+    db: AsyncSession, token_id: uuid.UUID, *, completed: bool
+) -> EmailChangeNotice | None:
+    """Find the old address to tell about an email change.
+
+    The worker side of the two notices; it only reads. The completed notice
+    goes to the token's `previous_email`. The requested notice goes to the
+    address the account had when the change was requested: the token's
+    `previous_email` once this change is confirmed, otherwise the current
+    address. Only verified addresses get a notice: `previous_email` is
+    stored only for a verified old address, and an unverified current
+    address is skipped (`unverified_address`). Nothing is sent either when
+    the token or the account is gone, the account is inactive, or a
+    completed notice finds no confirmed change. A pending, expired or
+    replaced token does not stop the requested notice: the request happened
+    all the same.
+
+    Args:
+        db: The task's session; its read transaction ends here.
+        token_id: The email-change token the request created.
+        completed: True for the notice after the confirmation.
+
+    Returns:
+        Owner, recipient and username, or None if nothing must be sent.
+    """
+    token = await crud.get_email_token(db, token_id)
+    user = await users_crud.get_user_by_id(db, token.user_id) if token else None
+    skip_reason: str | None = None
+    notice: EmailChangeNotice | None = None
+    if token is None or token.purpose is not EmailTokenPurpose.CHANGE_EMAIL:
+        skip_reason = "no_token"
+    elif user is None:
+        skip_reason = "no_user"
+    elif not user.is_active:
+        skip_reason = "account_inactive"
+    elif token.used_at is not None and (
+        token.previous_email is not None or user.email == token.new_email
+    ):
+        # This change was confirmed. Without `previous_email` the replaced
+        # address was unverified, and the current one is the new address.
+        if token.previous_email is None:
+            skip_reason = "unverified_address"
+        else:
+            notice = EmailChangeNotice(
+                user_id=user.id,
+                recipient=token.previous_email,
+                username=user.username,
+            )
+    elif completed:
+        skip_reason = "not_completed"
+    elif not user.is_email_verified:
+        skip_reason = "unverified_address"
+    else:
+        notice = EmailChangeNotice(
+            user_id=user.id, recipient=user.email, username=user.username
+        )
+    # After reading the rows: a rollback expires loaded rows.
+    await db.rollback()
+    if notice is None:
+        logger.info(
+            "email.not_sent",
+            token_id=str(token_id),
+            purpose="email_change_completed" if completed else "email_change_requested",
+            reason=skip_reason,
+        )
+    return notice
+
+
+@dataclass(frozen=True)
+class CleanupResult:
+    """What one cleanup run deleted, and whether it stopped at the cap."""
+
+    sessions_deleted: int
+    email_tokens_deleted: int
+    capped: bool
+
+
+async def cleanup_ended_auth_records(
+    db: AsyncSession,
+    retention: timedelta,
+    *,
+    batch_size: int = CLEANUP_BATCH_SIZE,
+    max_batches: int = CLEANUP_MAX_BATCHES,
+) -> CleanupResult:
+    """Delete ended sessions and closed email tokens older than `retention`.
+
+    Sessions first, then email tokens, each in batches of `batch_size` rows
+    with one transaction per batch, until a batch comes back short or
+    `max_batches` batches ran; the next run continues. No user row is
+    locked, and rows locked by others are skipped, so the cleanup never
+    waits on a request; a skipped row goes in the next run. The audit log
+    is not touched.
+
+    Args:
+        db: The task's session; committed after every batch.
+        retention: How long a row is kept after its last change.
+        batch_size: Rows per delete statement.
+        max_batches: Batches per table in this run.
+
+    Returns:
+        The deleted rows per table, and whether a table hit `max_batches`.
+    """
+    totals: list[int] = []
+    capped = False
+    for delete_batch in (crud.delete_ended_sessions, crud.delete_closed_email_tokens):
+        total = 0
+        for _ in range(max_batches):
+            deleted = await delete_batch(db, retention, batch_size)
+            await db.commit()
+            total += deleted
+            if deleted < batch_size:
+                break
+        else:
+            capped = True
+        totals.append(total)
+    return CleanupResult(
+        sessions_deleted=totals[0], email_tokens_deleted=totals[1], capped=capped
+    )
+
+
 async def _confirm_password(
     db: AsyncSession,
     user_id: uuid.UUID,
@@ -973,16 +1262,12 @@ async def _confirm_password(
         )
         # Exactly one request reaches the threshold; it records the lock.
         if is_locked and attempts == settings.LOGIN_MAX_ATTEMPTS:
-            LOCKOUTS.inc()
-            await _audit(
+            await _record_lockout(
                 db,
-                AuditEventType.ACCOUNT_LOCKED,
                 user_id,
+                attempts,
                 request,
                 f"Locked after {attempts} failed attempts (password confirmation)",
-            )
-            logger.warning(
-                "auth.account_locked", user_id=str(user_id), attempts=attempts
             )
         else:
             await _audit(
@@ -1051,7 +1336,8 @@ async def request_email_change(
     """Start an email change: mail a confirmation link to the new address.
 
     The account keeps its current address until the link is redeemed
-    (`verify_email`). A new request invalidates the previous link. The
+    (`verify_email`); that address gets a notice that a change was
+    requested. A new request invalidates the previous link. The
     password is checked first, so only the account holder learns whether an
     address is registered.
 
@@ -1082,6 +1368,12 @@ async def request_email_change(
         "Email change requested",
     )
     await _enqueue_token_email(token_id, user.id, EmailTokenPurpose.CHANGE_EMAIL)
+    await _enqueue_email(
+        send_email_change_requested_notice_task.kiq,
+        token_id,
+        user_id=user.id,
+        purpose="email_change_requested",
+    )
     logger.info("auth.email_change_requested", user_id=str(user.id))
 
 

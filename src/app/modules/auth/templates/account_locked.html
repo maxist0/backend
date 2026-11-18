@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+
+{% block title %}Your account has been locked{% endblock %}
+
+{% block header %}Your account has been locked{% endblock %}
+
+{% block content %}
+<p>Hi <strong>{{ username }}</strong>,</p>
+<p>The password for your account was entered wrongly several times in a row, so we have locked password sign-in until <strong>{{ locked_until }}</strong>. You stay signed in on devices where you are signed in already.</p>
+<p>If this was you, you can sign in again after that time.</p>
+<p>If this wasn't you, someone may be trying to guess your password. Reset your password, and choose one you do not use anywhere else.</p>
+<a class="btn" href="{{ frontend_url }}">Open {{ app_name }}</a>
+<p style="margin-top: 24px; font-size: 13px; color: #888;">We send this notice at most once a day.</p>
+{% endblock %}

@@ -8,11 +8,12 @@ of truth for sessions (refresh tokens); nothing is cached in Redis.
 import uuid
 from datetime import datetime, timedelta
 
-from sqlalchemy import and_, case, func, not_, or_, select, update
+from sqlalchemy import and_, case, delete, func, not_, null, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import get_logger, utcnow
 from app.modules.auth.models import (
+    AuditEventType,
     AuthAuditLog,
     EmailToken,
     EmailTokenPurpose,
@@ -141,21 +142,43 @@ async def register_failed_login(
     parallel failures cannot overwrite each other (no lost update). A timed
     lock (`locked_until`) is only set when the account is not locked yet,
     so an indefinite admin lock (`locked_until IS NULL`) is never weakened.
+
+    An expired timed lock counts as no lock, and the failure is the first of
+    a new series: only a successful login clears an expired lock, so without
+    this, wrong password confirmations after a lock ran out would count on
+    past the threshold with the old `locked_until` and never lock again.
+    The request whose failure reaches `max_attempts` is still exactly one.
+
     Returns `(failed_login_attempts, is_locked, locked_until)` or None if
     the user does not exist. Commits.
     """
-    reaches_threshold = User.failed_login_attempts + 1 >= max_attempts
+    # All SET expressions read the row as it was before this UPDATE.
+    lock_expired = and_(
+        User.is_locked.is_(True),
+        User.locked_until.is_not(None),
+        User.locked_until <= func.now(),
+    )
+    attempts = case((lock_expired, 1), else_=User.failed_login_attempts + 1)
+    reaches_threshold = attempts >= max_attempts
     result = await db.execute(
         update(User)
         .where(User.id == user_id)
         .values(
-            failed_login_attempts=User.failed_login_attempts + 1,
-            is_locked=case((reaches_threshold, True), else_=User.is_locked),
+            failed_login_attempts=attempts,
+            is_locked=case(
+                (reaches_threshold, True),
+                (lock_expired, False),
+                else_=User.is_locked,
+            ),
             locked_until=case(
                 (
-                    and_(reaches_threshold, User.is_locked.is_(False)),
+                    and_(
+                        reaches_threshold,
+                        or_(User.is_locked.is_(False), lock_expired),
+                    ),
                     func.now() + timedelta(seconds=lock_seconds),
                 ),
+                (lock_expired, null()),
                 else_=User.locked_until,
             ),
             updated_at=func.now(),
@@ -282,13 +305,23 @@ async def revoke_user_sessions(
 ) -> int:
     """Revoke every active session of a user, optionally keeping one family.
 
+    Active means not revoked and not expired. An expired session cannot be
+    refreshed any more, and leaving it alone keeps its `revoked_at` empty,
+    so the cleanup's retention still counts from its expiry. Reuse
+    detection is unaffected: it looks only for sessions revoked as
+    `rotated`.
+
     Takes the user lock first, so a refresh rotating a session of this user
     right now finishes before, and its successor is revoked as well.
     Returns the number of revoked sessions. Commits, unless `commit=False`:
     then the caller's next commit includes the revocation.
     """
     await lock_user(db, user_id)
-    conditions = [Session.user_id == user_id, Session.is_revoked.is_(False)]
+    conditions = [
+        Session.user_id == user_id,
+        Session.is_revoked.is_(False),
+        Session.expires_at > func.now(),
+    ]
     if except_family is not None:
         conditions.append(Session.family_id != except_family)
     result = await db.execute(
@@ -419,13 +452,13 @@ async def invalidate_email_token(db: AsyncSession, token_id: uuid.UUID) -> None:
 
 async def consume_email_token(
     db: AsyncSession, token_hash: str, *purposes: EmailTokenPurpose
-) -> tuple[uuid.UUID, EmailTokenPurpose, str | None] | None:
+) -> tuple[uuid.UUID, uuid.UUID, EmailTokenPurpose, str | None] | None:
     """Atomically redeem a single-use email token of one of `purposes`.
 
     `UPDATE ... SET used_at = now() WHERE <still valid> RETURNING`: of
     several concurrent redemptions exactly one gets a row. Returns
-    `(user_id, purpose, new_email)` or None if the token is unknown, used,
-    invalidated, expired or of another purpose.
+    `(token_id, user_id, purpose, new_email)` or None if the token is
+    unknown, used, invalidated, expired or of another purpose.
 
     Does NOT commit: the caller's next write commits it together with the
     effect of the token (a failure before that rolls the redemption back).
@@ -440,12 +473,32 @@ async def consume_email_token(
             EmailToken.expires_at > func.now(),
         )
         .values(used_at=func.now())
-        .returning(EmailToken.user_id, EmailToken.purpose, EmailToken.new_email)
+        .returning(
+            EmailToken.id, EmailToken.user_id, EmailToken.purpose, EmailToken.new_email
+        )
     )
     row = result.first()
     if row is None:
         return None
-    return row[0], row[1], row[2]
+    return row[0], row[1], row[2], row[3]
+
+
+async def set_email_token_previous_email(
+    db: AsyncSession, token_id: uuid.UUID, previous_email: str
+) -> None:
+    """Store the address an email change replaces. Does not commit."""
+    await db.execute(
+        update(EmailToken)
+        .where(EmailToken.id == token_id)
+        .values(previous_email=previous_email)
+        .execution_options(synchronize_session=False)
+    )
+
+
+async def get_email_token(db: AsyncSession, token_id: uuid.UUID) -> EmailToken | None:
+    """Return an email token in any state, without locking it."""
+    result = await db.execute(select(EmailToken).where(EmailToken.id == token_id))
+    return result.scalars().first()
 
 
 async def invalidate_tokens_for_user_purpose(
@@ -505,3 +558,100 @@ async def create_audit_log(
     if commit:
         await db.commit()
     return log
+
+
+async def audit_event_since(
+    db: AsyncSession, user_id: uuid.UUID, event: AuditEventType, since: datetime
+) -> bool:
+    """Tell whether the user has an audit row of `event` newer than `since`."""
+    result = await db.execute(
+        select(AuthAuditLog.id)
+        .where(
+            AuthAuditLog.user_id == user_id,
+            AuthAuditLog.event_type == event,
+            AuthAuditLog.created_at > since,
+        )
+        .limit(1)
+    )
+    return result.first() is not None
+
+
+# PostgreSQL's GREATEST ignores NULL arguments, so these are the latest of
+# the row's timestamps: when it expired, or a later revocation, use or
+# invalidation. `expires_at` is NOT NULL, so the value is never NULL. The
+# extra `expires_at < cutoff` is implied by it, but lets the planner use
+# the `expires_at` index, oldest rows first.
+
+
+async def delete_ended_sessions(
+    db: AsyncSession, retention: timedelta, limit: int
+) -> int:
+    """Delete up to `limit` sessions that expired and were last changed
+    longer than `retention` ago.
+
+    A revoked session is kept until it has also expired for `retention`:
+    until then its token could still be presented, and a rotated token that
+    comes back must be found to revoke its family (reuse detection).
+
+    Rows locked by another transaction (a revocation, a second cleanup run)
+    are skipped (`SKIP LOCKED`), so this never waits on a row lock and never
+    joins a deadlock. Takes no user lock. Does not commit.
+
+    Returns:
+        The number of deleted sessions.
+    """
+    cutoff = func.now() - retention
+    batch = (
+        select(Session.id)
+        .where(
+            Session.expires_at < cutoff,
+            func.greatest(Session.expires_at, Session.revoked_at) < cutoff,
+        )
+        .order_by(Session.expires_at)
+        .limit(limit)
+        .with_for_update(skip_locked=True)
+    )
+    result = await db.execute(
+        delete(Session)
+        .where(Session.id.in_(batch.scalar_subquery()))
+        .returning(Session.id)
+        .execution_options(synchronize_session=False)
+    )
+    return len(result.all())
+
+
+async def delete_closed_email_tokens(
+    db: AsyncSession, retention: timedelta, limit: int
+) -> int:
+    """Delete up to `limit` email tokens that expired and were last changed
+    longer than `retention` ago.
+
+    Every token expires within a day of its request, so this removes used,
+    invalidated and never redeemed tokens alike, together with their
+    `new_email` and `previous_email`. Rows locked by another transaction are
+    skipped (`SKIP LOCKED`). Does not commit.
+
+    Returns:
+        The number of deleted tokens.
+    """
+    cutoff = func.now() - retention
+    batch = (
+        select(EmailToken.id)
+        .where(
+            EmailToken.expires_at < cutoff,
+            func.greatest(
+                EmailToken.expires_at, EmailToken.used_at, EmailToken.invalidated_at
+            )
+            < cutoff,
+        )
+        .order_by(EmailToken.expires_at)
+        .limit(limit)
+        .with_for_update(skip_locked=True)
+    )
+    result = await db.execute(
+        delete(EmailToken)
+        .where(EmailToken.id.in_(batch.scalar_subquery()))
+        .returning(EmailToken.id)
+        .execution_options(synchronize_session=False)
+    )
+    return len(result.all())

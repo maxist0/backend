@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+
+{% block title %}Your email address was changed{% endblock %}
+
+{% block header %}Your email address was changed{% endblock %}
+
+{% block content %}
+<p>Hi <strong>{{ username }}</strong>,</p>
+<p>The email address of your account was changed, and this address is no longer used for it. Password reset links now go to the new address.</p>
+<p>If this was you, there is nothing to do.</p>
+<p>If this wasn't you, someone has taken over your account, and changing the password alone does not get it back: whoever controls the new address can reset the password again. If you can still sign in, do both of these at once:</p>
+<ol>
+  <li>Change your password.</li>
+  <li>Change the account's email address back to this one. The confirmation link for that is sent to this address.</li>
+</ol>
+<p>If you cannot sign in any more, contact the support of {{ app_name }} from this address.</p>
+<a class="btn" href="{{ frontend_url }}">Open {{ app_name }}</a>
+{% endblock %}

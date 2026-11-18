@@ -154,6 +154,7 @@ class TestChangeMyEmail:
 
         assert r.status_code == 202
         assert r.content == b""
+        # The old address was never verified, so it gets no notice.
         [mail] = captured_emails
         assert (mail.to, mail.kind) == ("new.alice@example.com", "change_email")
 

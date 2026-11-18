@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+
+{% block title %}A change of your email address was requested{% endblock %}
+
+{% block header %}Email address change requested{% endblock %}
+
+{% block content %}
+<p>Hi <strong>{{ username }}</strong>,</p>
+<p>Someone signed in to your account and asked to change its email address. The change takes effect only after the new address is confirmed; until then, your account keeps this address.</p>
+<p>If this was you, there is nothing to do.</p>
+<p>If this wasn't you, someone knows your password. Reset your password now: that also cancels the pending change and signs out every device.</p>
+<a class="btn" href="{{ frontend_url }}">Open {{ app_name }}</a>
+{% endblock %}

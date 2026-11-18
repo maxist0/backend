@@ -178,6 +178,12 @@ class Settings(BaseSettings):
     LOGIN_MAX_ATTEMPTS: int = Field(default=5, ge=1, le=100)
     LOGIN_LOCKOUT_SECONDS: int = Field(default=900, ge=1, le=86_400)
 
+    # Days that ended refresh sessions and closed email tokens are kept
+    # before the nightly cleanup task deletes them. They hold IP addresses,
+    # user agents and old or requested email addresses, so they are not
+    # kept for good; at least a day, so a recent incident can be inspected.
+    AUTH_CLEANUP_RETENTION_DAYS: int = Field(default=30, ge=1, le=365)
+
     # Logging (stdout only)
     LOG_LEVEL: str = "INFO"
     ACCESS_LOG_ENABLED: bool = True

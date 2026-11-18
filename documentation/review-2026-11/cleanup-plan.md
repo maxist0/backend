@@ -34,9 +34,11 @@ Dieses Dokument enthält alles, was eine neue Session braucht, um das Backend-Cl
 | S1.3 | RFC 9457, Plain-Responses, `/api/v1`, `/users/me`, ausstehender E-Mail-Wechsel, einheitliche Login-Fehler | `f94ed50` |
 | S1.4 | Eine ASGI-Middleware, `/health` + `/health/ready`, `/metrics`, `@cached` (JSON), Logging nur über stdout, Config bereinigt | `7b8a506` |
 | S1.5 | Admin nur lesend und über Services, Admin-CSRF, Fixes aus dem Security-Review (H1, M1, M2, L3–L5) | `adf8b66` |
-| **Frontend** | Umstellung auf den S1.3-Vertrag | **offen, nächster Schritt** |
-| **S2** | taskiq und Mails | offen |
-| **S3** | Stil, strikte Checks, Doku | offen |
+| S2.1 | Redis-Stream-Broker mit Acks, verzögerte Retries, Worker-Metriken, Windows-Worker, ADR 0009 | `326cb15` |
+| S2.2 | Tokens im Worker neu gesetzt (Task bekommt nur die `token_id`), `TaskDbSession`, bereinigte DB-Fehler in Tasks, absolute Mail-Links, ADR 0010 | `14aae6e` |
+| S2.3 | Sperr-Mail, Hinweise an die alte Adresse, nächtlicher Cleanup, Neusperre nach abgelaufener Sperre (Migration `14e82733e84f`) | Commit durch den Owner |
+| **S3** | Stil, strikte Checks, Doku | **nächster Schritt** |
+| **Frontend** | Umstellung auf den S1.3-Vertrag (plus S2: absolute Links, Refresh-401 löscht das Cookie) | offen |
 
 Stand nach S1.5: 587 Tests grün, Coverage 95,2 %, 271 Unit-Tests ohne Docker. ruff (0.15), mypy und `uv audit` sind sauber.
 

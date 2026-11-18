@@ -494,7 +494,11 @@ class TestEnqueueFailure:
         assert r.status_code == 202
 
         events = _events(caplog, ENQUEUE_FAILED)
-        assert [e["purpose"] for e in events] == ["verify_email", "change_email"]
+        assert [e["purpose"] for e in events] == [
+            "verify_email",
+            "change_email",
+            "email_change_requested",
+        ]
         assert len(_open_tokens(db, "alice", "verify_email")) == 1
         assert len(_open_tokens(db, "alice", "change_email")) == 1
 

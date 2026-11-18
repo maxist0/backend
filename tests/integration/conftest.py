@@ -240,6 +240,9 @@ _KIND_BY_SUBJECT = {
     "Verify your email address": "verify",
     "Reset your password": "reset",
     "Confirm your new email address": "change_email",
+    "Your account has been locked": "account_locked",
+    "A change of your email address was requested": "email_change_requested",
+    "Your email address was changed": "email_change_completed",
 }
 _LINK = re.compile(r'href="([^"]+)"')
 
@@ -247,8 +250,10 @@ _LINK = re.compile(r'href="([^"]+)"')
 @dataclass(frozen=True)
 class CapturedEmail:
     to: str
-    kind: str  # "verify" | "reset" | "change_email"
-    token: str  # read from the link in the body
+    # "verify" | "reset" | "change_email" (token mails) or "account_locked" |
+    # "email_change_requested" | "email_change_completed" (notices)
+    kind: str
+    token: str | None  # read from the link in the body; None in a notice
     username: str
     link: str
     html: str
@@ -257,7 +262,7 @@ class CapturedEmail:
     def from_message(cls, message) -> "CapturedEmail":
         [recipient] = message.recipients
         link = html.unescape(_LINK.search(message.body).group(1))
-        [token] = parse_qs(urlsplit(link).query)["token"]
+        [token] = parse_qs(urlsplit(link).query).get("token", [None])
         return cls(
             to=recipient.email,
             kind=_KIND_BY_SUBJECT[message.subject],
@@ -282,7 +287,12 @@ class CapturedEmails(list):
         return [m for m in self if m.kind == kind]
 
     def latest_token(self, address: str, kind: str | None = None) -> str:
-        mails = [m for m in self.to(address) if kind is None or m.kind == kind]
+        """The token of the latest token mail to `address`; notices are skipped."""
+        mails = [
+            m
+            for m in self.to(address)
+            if m.token is not None and (kind is None or m.kind == kind)
+        ]
         if not mails:
             raise KeyError(address)
         return mails[-1].token
