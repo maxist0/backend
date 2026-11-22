@@ -1,16 +1,21 @@
-"""RFC 9457 problem details: `AppError` rendering, the 422 field mapping and
-every handler path through the real middleware stack (no Docker: the probe
-routes touch neither the database nor Redis)."""
+"""RFC 9457 problem details: `AppError`, the 422 field mapping, every handler.
+
+The handlers run through the real middleware stack. No Docker: the probe
+routes touch neither the database nor Redis.
+"""
 
 import logging
+from typing import Annotated, Any
 
 import pytest
 import structlog
 from fastapi import APIRouter, Header, Query
+from fastapi.testclient import TestClient
+from httpx2 import Response
 from prometheus_client import REGISTRY
 from pydantic import BaseModel
 
-import app.main as main
+from app import main
 from app.core import AppError, BadRequest, Conflict, Forbidden, NotFound, Unauthorized
 from app.core.errors import (
     PROBLEM_JSON,
@@ -18,7 +23,7 @@ from app.core.errors import (
     problem_response,
     problem_responses,
 )
-from tests.helpers import new_test_client
+from tests.helpers import SettingsFactory, log_events, new_test_client
 
 
 class _ProbeConflict(Conflict):
@@ -52,10 +57,10 @@ def _probe_router() -> APIRouter:
     @router.post("/items")
     async def items(
         body: _ProbeBody,
-        limit: int = Query(le=100),
-        x_probe: int = Header(),
-    ) -> None:
-        return None
+        limit: Annotated[int, Query(le=100)],
+        x_probe: Annotated[int, Header()],
+    ) -> dict[str, int]:
+        return {"items": len(body.items), "limit": limit, "x_probe": x_probe}
 
     @router.get("/crash")
     async def crash() -> None:
@@ -65,25 +70,26 @@ def _probe_router() -> APIRouter:
 
 
 @pytest.fixture
-def probe_client(settings_factory):
+def probe_client(settings_factory: SettingsFactory) -> TestClient:
     app = main.create_app(settings_factory())
     app.include_router(_probe_router())
     return new_test_client(app, raise_server_exceptions=False)
 
 
-def _assert_problem(response, status: int, code: str) -> dict:
+def _assert_problem(response: Response, status: int, code: str) -> dict[str, Any]:
     assert response.status_code == status, response.text
     assert response.headers["content-type"] == PROBLEM_JSON
-    body = response.json()
+    body: dict[str, Any] = response.json()
     assert body["type"] == "about:blank"
     assert body["status"] == status
     assert body["code"] == code
-    assert body["title"] and body["detail"]
+    assert body["title"]
+    assert body["detail"]
     return body
 
 
 class TestAppError:
-    def test_class_defaults(self):
+    def test_class_defaults(self) -> None:
         error = NotFound()
 
         assert (error.status, error.code, error.detail) == (
@@ -94,7 +100,7 @@ class TestAppError:
         assert error.headers == {}
         assert error.extensions == {}
 
-    def test_detail_headers_and_extensions_per_instance(self):
+    def test_detail_headers_and_extensions_per_instance(self) -> None:
         error = _ProbeConflict("Taken.", headers={"Retry-After": "3"}, retry_after=3)
 
         assert error.detail == "Taken."
@@ -102,7 +108,7 @@ class TestAppError:
         assert error.headers == {"Retry-After": "3"}
         assert error.extensions == {"retry_after": 3}
 
-    def test_unauthorized_always_sends_www_authenticate(self):
+    def test_unauthorized_always_sends_www_authenticate(self) -> None:
         assert Unauthorized().headers == {"WWW-Authenticate": "Bearer"}
         assert Unauthorized(headers={"X-Extra": "1"}).headers == {
             "WWW-Authenticate": "Bearer",
@@ -119,13 +125,13 @@ class TestAppError:
             (Conflict, 409, "conflict"),
         ],
     )
-    def test_base_classes(self, error, status, code):
+    def test_base_classes(self, error: type[AppError], status: int, code: str) -> None:
         assert issubclass(error, AppError)
         assert (error.status, error.code) == (status, code)
 
 
 class TestProblemResponse:
-    def test_renders_the_rfc_9457_members(self):
+    def test_renders_the_rfc_9457_members(self) -> None:
         response = problem_response(409, "user_exists", "Taken.")
 
         assert response.media_type == PROBLEM_JSON
@@ -134,7 +140,7 @@ class TestProblemResponse:
             b'"detail":"Taken.","code":"user_exists"}'
         )
 
-    def test_request_id_comes_from_the_structlog_context(self):
+    def test_request_id_comes_from_the_structlog_context(self) -> None:
         structlog.contextvars.bind_contextvars(request_id="req-42")
         try:
             response = problem_response(400, "bad_request", "x")
@@ -143,7 +149,7 @@ class TestProblemResponse:
 
         assert b'"request_id":"req-42"' in response.body
 
-    def test_extensions_cannot_replace_standard_members(self):
+    def test_extensions_cannot_replace_standard_members(self) -> None:
         response = problem_response(
             400, "bad_request", "x", extensions={"status": 200, "code": "ok", "n": 1}
         )
@@ -154,7 +160,7 @@ class TestProblemResponse:
 
 
 class TestFieldErrors:
-    def test_body_fields_drop_the_source_other_sources_keep_it(self):
+    def test_body_fields_drop_the_source_other_sources_keep_it(self) -> None:
         errors = [
             {"loc": ("body", "email"), "type": "value_error", "msg": "bad"},
             {"loc": ("body", "items", 0, "name"), "type": "missing", "msg": "m"},
@@ -175,7 +181,7 @@ class TestFieldErrors:
             "path.item_id",
         ]
 
-    def test_only_field_code_and_message_are_kept(self):
+    def test_only_field_code_and_message_are_kept(self) -> None:
         """`input` and `ctx` can carry what the client sent (a password)."""
         [entry] = field_errors(
             [
@@ -198,7 +204,7 @@ class TestFieldErrors:
 
 
 class TestProblemResponsesHelper:
-    def test_groups_codes_per_status(self):
+    def test_groups_codes_per_status(self) -> None:
         responses = problem_responses(_ProbeConflict, Conflict, Unauthorized, 422)
 
         assert list(responses) == [401, 409, 422]
@@ -212,7 +218,7 @@ class TestProblemResponsesHelper:
 
 
 class TestHandlers:
-    def test_app_error(self, probe_client):
+    def test_app_error(self, probe_client: TestClient) -> None:
         r = probe_client.post("/probe/conflict")
 
         body = _assert_problem(r, 409, "probe_conflict")
@@ -222,13 +228,17 @@ class TestHandlers:
         assert r.headers["retry-after"] == "7"
         assert body["request_id"] == r.headers["x-request-id"]
 
-    def test_client_request_id_is_echoed_in_header_and_body(self, probe_client):
+    def test_client_request_id_is_echoed_in_header_and_body(
+        self, probe_client: TestClient
+    ) -> None:
         r = probe_client.post("/probe/conflict", headers={"X-Request-ID": "abc-123"})
 
         assert r.headers["x-request-id"] == "abc-123"
         assert r.json()["request_id"] == "abc-123"
 
-    def test_validation_error_maps_body_query_and_header_fields(self, probe_client):
+    def test_validation_error_maps_body_query_and_header_fields(
+        self, probe_client: TestClient
+    ) -> None:
         r = probe_client.post(
             "/probe/items?limit=500",
             json={"items": [{"name": "a", "size": "big"}, {"size": 1}]},
@@ -244,28 +254,33 @@ class TestHandlers:
             ("header.x-probe", "int_parsing"),
         }
         assert all(set(e) == {"field", "code", "message"} for e in body["errors"])
-        assert "big" not in r.text and "not-a-number" not in r.text
+        assert "big" not in r.text
+        assert "not-a-number" not in r.text
 
-    def test_unknown_route_is_404_not_found(self, probe_client):
+    def test_unknown_route_is_404_not_found(self, probe_client: TestClient) -> None:
         r = probe_client.get("/no/such/route")
 
         body = _assert_problem(r, 404, "not_found")
         assert body["request_id"] == r.headers["x-request-id"]
 
-    def test_wrong_method_is_405_with_allow_header(self, probe_client):
+    def test_wrong_method_is_405_with_allow_header(
+        self, probe_client: TestClient
+    ) -> None:
         r = probe_client.get("/api/v1/auth/login")
 
         body = _assert_problem(r, 405, "method_not_allowed")
         assert r.headers["allow"] == "POST"
         assert body["request_id"] == r.headers["x-request-id"]
 
-    def test_missing_bearer_token_is_401_with_www_authenticate(self, probe_client):
+    def test_missing_bearer_token_is_401_with_www_authenticate(
+        self, probe_client: TestClient
+    ) -> None:
         r = probe_client.get("/api/v1/users/me")
 
         _assert_problem(r, 401, "unauthorized")
         assert r.headers["www-authenticate"] == "Bearer"
 
-    def test_unexpected_error_is_a_generic_500(self, probe_client):
+    def test_unexpected_error_is_a_generic_500(self, probe_client: TestClient) -> None:
         r = probe_client.get("/probe/crash", headers={"X-Request-ID": "crash-1"})
 
         body = _assert_problem(r, 500, "internal_error")
@@ -274,10 +289,12 @@ class TestHandlers:
         assert "_LeakyError" not in r.text
 
     def test_500_carries_request_id_headers_cors_metrics_and_access_log(
-        self, probe_client, caplog
-    ):
-        """The request middleware renders the 500 inside CORS, so it gets the
-        same treatment as every other response."""
+        self, probe_client: TestClient, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The 500 gets the same treatment as every other response.
+
+        The request middleware renders it inside CORS.
+        """
         labels = {"method": "GET", "route": "/probe/crash", "status": "500"}
         before = REGISTRY.get_sample_value("http_requests_total", labels) or 0
         caplog.set_level(logging.INFO)
@@ -295,10 +312,9 @@ class TestHandlers:
         assert r.headers["access-control-allow-origin"] == "http://localhost:5173"
         assert r.headers["access-control-allow-credentials"] == "true"
         assert REGISTRY.get_sample_value("http_requests_total", labels) == before + 1
-        events = [r.msg for r in caplog.records if isinstance(r.msg, dict)]
-        [unexpected] = [e for e in events if e["event"] == "app.unhandled_exception"]
+        [unexpected] = log_events(caplog, "app.unhandled_exception")
         assert unexpected["error_type"] == "_LeakyError"
         assert unexpected["request_id"] == "crash-2"
-        [access] = [e for e in events if e["event"] == "http.access"]
+        [access] = log_events(caplog, "http.access")
         assert (access["status"], access["route"]) == (500, "/probe/crash")
         assert access["request_id"] == "crash-2"

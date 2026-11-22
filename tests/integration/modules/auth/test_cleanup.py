@@ -1,5 +1,7 @@
-"""The nightly cleanup: ended sessions and closed email tokens go, after the
-retention period counted from the row's last change; nothing else goes.
+"""The nightly cleanup deletes ended sessions and closed email tokens only.
+
+They go after the retention period, counted from the row's last change;
+nothing else goes.
 
 Rows are written with SQL, with timestamps relative to `now()`. The task
 runs in-process (`run_task`) with the default retention of 30 days.
@@ -7,13 +9,30 @@ runs in-process (`run_task`) with the default retention of 30 days.
 
 import logging
 import uuid
+from collections.abc import Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import Engine
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.modules.auth import crud, service
 from app.modules.auth.tasks import cleanup_task
-from tests.helpers import bearer, login_tokens, register_ok, user_id_of
-from tests.integration.conftest import run_task
+from tests.helpers import (
+    Db,
+    app_of,
+    bearer,
+    call_in_app,
+    log_events,
+    login_tokens,
+    register_ok,
+    run_task,
+    user_id_of,
+)
+
+type _Delete = Callable[[AsyncSession, timedelta, int], Awaitable[int]]
 
 # Relative to now(); the retention is 30 days.
 OLD = "now() - interval '31 days'"
@@ -21,7 +40,7 @@ RECENT = "now() - interval '29 days'"
 FUTURE = "now() + interval '5 days'"
 
 
-def _session(db, user_id: str, *, expires: str, revoked: str | None = None) -> str:
+def _session(db: Db, user_id: str, *, expires: str, revoked: str | None = None) -> str:
     session_id = str(uuid.uuid4())
     db.execute(
         "INSERT INTO sessions (id, user_id, token_hash, family_id, is_revoked, "
@@ -38,7 +57,7 @@ def _session(db, user_id: str, *, expires: str, revoked: str | None = None) -> s
 
 
 def _token(
-    db,
+    db: Db,
     user_id: str,
     *,
     expires: str,
@@ -58,20 +77,14 @@ def _token(
     return token_id
 
 
-def _ids(db, table: str) -> set[str]:
-    return {str(row["id"]) for row in db.rows(f"SELECT id FROM {table}")}  # noqa: S608
-
-
-def _events(caplog, name: str) -> list[dict]:
-    return [
-        r.msg
-        for r in caplog.records
-        if isinstance(r.msg, dict) and r.msg.get("event") == name
-    ]
+def _ids(db: Db, table: str) -> set[str]:
+    return {str(row["id"]) for row in db.rows(f"SELECT id FROM {table}")}
 
 
 class TestCleanupTask:
-    def test_deletes_exactly_the_rows_past_retention(self, client, db, caplog):
+    def test_deletes_exactly_the_rows_past_retention(
+        self, client: TestClient, db: Db, caplog: pytest.LogCaptureFixture
+    ) -> None:
         register_ok(client, username="alice")
         user_id = user_id_of(db, "alice")
         db.execute("DELETE FROM sessions")
@@ -109,14 +122,17 @@ class TestCleanupTask:
 
         assert _ids(db, "sessions") == kept_sessions
         assert _ids(db, "email_tokens") == kept_tokens
-        assert audit_rows and _ids(db, "auth_audit_log") == audit_rows
+        assert audit_rows
+        assert _ids(db, "auth_audit_log") == audit_rows
         assert db.scalar("SELECT count(*) FROM users") == 1
-        [event] = _events(caplog, "auth.cleanup_done")
+        [event] = log_events(caplog, "auth.cleanup_done")
         assert event["sessions_deleted"] == len(gone_sessions)
         assert event["email_tokens_deleted"] == len(gone_tokens)
         assert event["retention_days"] == 30
 
-    def test_second_run_finds_nothing(self, client, db, caplog):
+    def test_second_run_finds_nothing(
+        self, client: TestClient, db: Db, caplog: pytest.LogCaptureFixture
+    ) -> None:
         register_ok(client, username="alice")
         user_id = user_id_of(db, "alice")
         _session(db, user_id, expires=OLD)
@@ -127,10 +143,12 @@ class TestCleanupTask:
 
         run_task(client, cleanup_task)
 
-        [event] = _events(caplog, "auth.cleanup_done")
+        [event] = log_events(caplog, "auth.cleanup_done")
         assert (event["sessions_deleted"], event["email_tokens_deleted"]) == (0, 0)
 
-    def test_retention_setting_moves_the_cutoff(self, client, db, monkeypatch):
+    def test_retention_setting_moves_the_cutoff(
+        self, client: TestClient, db: Db, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         register_ok(client, username="alice")
         user_id = user_id_of(db, "alice")
         db.execute("DELETE FROM email_tokens")
@@ -146,7 +164,9 @@ class TestCleanupTask:
 
         assert week_old not in _ids(db, "email_tokens")
 
-    def test_locked_rows_are_skipped_without_waiting(self, client, db, sync_engine):
+    def test_locked_rows_are_skipped_without_waiting(
+        self, client: TestClient, db: Db, sync_engine: Engine
+    ) -> None:
         """A row another transaction holds is left for the next run."""
         register_ok(client, username="alice")
         user_id = user_id_of(db, "alice")
@@ -169,8 +189,8 @@ class TestCleanupTask:
 
 class TestBatching:
     def test_each_batch_is_one_bounded_statement_and_commit(
-        self, client, db, monkeypatch
-    ):
+        self, client: TestClient, db: Db, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         register_ok(client, username="alice")
         user_id = user_id_of(db, "alice")
         db.execute("DELETE FROM email_tokens")
@@ -181,8 +201,10 @@ class TestBatching:
 
         calls: list[tuple[str, int, int]] = []
 
-        def _spy(name, real):
-            async def _wrapped(session, retention, limit):
+        def _spy(name: str, real: _Delete) -> _Delete:
+            async def _wrapped(
+                session: AsyncSession, retention: timedelta, limit: int
+            ) -> int:
                 deleted = await real(session, retention, limit)
                 calls.append((name, limit, deleted))
                 return deleted
@@ -202,7 +224,7 @@ class TestBatching:
         commits: list[int] = []
 
         async def _cleanup() -> service.CleanupResult:
-            async with client.app.state.session_factory() as session:
+            async with app_of(client).state.session_factory() as session:
                 real_commit = session.commit
 
                 async def _counting_commit() -> None:
@@ -214,7 +236,7 @@ class TestBatching:
                     session, timedelta(days=30), batch_size=2
                 )
 
-        totals = client.portal.call(_cleanup)
+        totals = call_in_app(client, _cleanup)
 
         assert totals == service.CleanupResult(5, 2, capped=False)
         assert calls == [
@@ -230,7 +252,9 @@ class TestBatching:
 
 
 class TestRunCap:
-    def test_a_run_stops_after_the_cap_and_the_next_one_continues(self, client, db):
+    def test_a_run_stops_after_the_cap_and_the_next_one_continues(
+        self, client: TestClient, db: Db
+    ) -> None:
         register_ok(client, username="alice")
         user_id = user_id_of(db, "alice")
         db.execute("DELETE FROM email_tokens")
@@ -238,26 +262,34 @@ class TestRunCap:
             _session(db, user_id, expires=OLD)
 
         async def _cleanup() -> service.CleanupResult:
-            async with client.app.state.session_factory() as session:
+            async with app_of(client).state.session_factory() as session:
                 return await service.cleanup_ended_auth_records(
                     session, timedelta(days=30), batch_size=2, max_batches=2
                 )
 
-        first = client.portal.call(_cleanup)
-        second = client.portal.call(_cleanup)
+        first = call_in_app(client, _cleanup)
+        second = call_in_app(client, _cleanup)
 
         assert (first.sessions_deleted, first.capped) == (4, True)
         assert (second.sessions_deleted, second.capped) == (1, False)
         assert db.scalar("SELECT count(*) FROM sessions") == 0
 
-    def test_cap_is_logged(self, client, db, caplog, monkeypatch):
+    def test_cap_is_logged(
+        self,
+        client: TestClient,
+        db: Db,
+        caplog: pytest.LogCaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         register_ok(client, username="alice")
         user_id = user_id_of(db, "alice")
         for _ in range(3):
             _session(db, user_id, expires=OLD)
         real = service.cleanup_ended_auth_records
 
-        async def _small_run(session, retention):
+        async def _small_run(
+            session: AsyncSession, retention: timedelta
+        ) -> service.CleanupResult:
             return await real(session, retention, batch_size=1, max_batches=2)
 
         monkeypatch.setattr(service, "cleanup_ended_auth_records", _small_run)
@@ -265,12 +297,14 @@ class TestRunCap:
 
         run_task(client, cleanup_task)
 
-        [event] = _events(caplog, "auth.cleanup_done")
+        [event] = log_events(caplog, "auth.cleanup_done")
         assert (event["sessions_deleted"], event["capped"]) == (2, True)
 
 
 class TestRevocationLeavesExpiredSessions:
-    def test_logout_all_does_not_touch_expired_sessions(self, client, db):
+    def test_logout_all_does_not_touch_expired_sessions(
+        self, client: TestClient, db: Db
+    ) -> None:
         """Their retention keeps counting from the expiry."""
         register_ok(client, username="alice")
         user_id = user_id_of(db, "alice")

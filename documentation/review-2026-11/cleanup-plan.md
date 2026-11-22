@@ -147,10 +147,12 @@ Agents: backend-engineer (Code und Tests), danach docs-writer.
 ```bash
 uv run pytest                                                          # volle Suite, Coverage-Gate 85, braucht Docker
 DOCKER_HOST=tcp://127.0.0.1:1 uv run pytest tests/unit --no-cov -p no:cacheprovider   # Unit ohne Docker (bash)
-uv run ruff check src tests run.py alembic                             # tests/ erst nach S3.2 grün
+uv run ruff check src tests run.py alembic
 uv run ruff format --check src tests run.py alembic
-uv run mypy                                                            # strict, Pfade aus [tool.mypy]
+uv run mypy                                                            # strict, src + tests (Pfade aus [tool.mypy])
+uv run pyright                                                         # strict, zweites Typ-Gate ([tool.pyright])
 uv audit --frozen
+uv lock --check
 ```
 
 Bei Migrationen kommt dazu: `alembic upgrade head`, `downgrade -1`, erneut `upgrade head` und `alembic check`, auf einem Wegwerf-Compose-Projekt und nur mit `DATABASE_URL` gesetzt, ohne `ENVIRONMENT` und ohne Secrets. Wenn Docker Desktop nicht läuft (z. B. nach einem Neustart), zuerst `Docker Desktop.exe` starten und warten, bis `docker info` antwortet.

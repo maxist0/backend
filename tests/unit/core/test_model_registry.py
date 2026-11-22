@@ -4,6 +4,8 @@ import os
 import subprocess
 import sys
 
+from sqlalchemy import Table
+
 from app.core import Base
 from app.modules import MODULES
 from tests.helpers import BACKEND_DIR
@@ -27,7 +29,7 @@ _ALEMBIC_IMPORTS = (
 )
 
 
-def test_modules_register_every_table_without_environment():
+def test_modules_register_every_table_without_environment() -> None:
     """`import app.modules` needs no `ENVIRONMENT` and reads no settings."""
     env = {k: v for k, v in os.environ.items() if k != "ENVIRONMENT"}
     proc = subprocess.run(
@@ -37,6 +39,7 @@ def test_modules_register_every_table_without_environment():
         capture_output=True,
         text=True,
         timeout=120,
+        check=False,
     )
 
     assert proc.returncode == 0, proc.stderr[-1500:]
@@ -45,16 +48,18 @@ def test_modules_register_every_table_without_environment():
     assert settings_built == "SETTINGS_BUILT 0"
 
 
-def test_modules_models_cover_every_mapped_table():
+def test_modules_models_cover_every_mapped_table() -> None:
     """Every mapped table belongs to the `models` of a registered module."""
-    module_tables = {
-        mapper.local_table.name
+    selectables = [
+        mapper.local_table
         for mapper in Base.registry.mappers
         if any(
             module.models is not None
             and mapper.class_.__module__ == module.models.__name__
             for module in MODULES
         )
-    }
+    ]
+    assert all(isinstance(table, Table) for table in selectables)
+    module_tables = {table.name for table in selectables if isinstance(table, Table)}
 
     assert module_tables == set(Base.metadata.tables) == EXPECTED_TABLES

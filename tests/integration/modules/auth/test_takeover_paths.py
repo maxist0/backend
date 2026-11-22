@@ -1,4 +1,4 @@
-"""Regression tests for account-takeover paths.
+"""Account-takeover paths stay closed.
 
 * A pending email change (or verification) dies with every event that
   should end an attacker's grip on the account: password change, password
@@ -10,53 +10,63 @@
   `PUT /users/me/email` count towards the login lockout.
 """
 
+from collections.abc import Callable
+
 import pytest
+from fastapi.testclient import TestClient
+from httpx2 import Response
 
 from tests.helpers import (
     MAXIMUM_LOGIN_ATTEMPTS,
     PASSWORD,
+    CapturedEmails,
+    Db,
+    Tokens,
+    admin_login,
     audit_count,
     bearer,
+    change_email,
+    change_password,
     login,
     login_tokens,
     refresh_with,
     register_ok,
+    reset_password,
+    run_action,
     user_id_of,
+    verify_email,
 )
-from tests.integration.admin.test_admin_actions import admin_login, run_action
 
 NEW_EMAIL = "attacker@example.org"
 NEW_PASSWORD = "NewPassword456!"
 
 
 @pytest.fixture
-def alice(client, captured_emails):
+def alice(client: TestClient, captured_emails: CapturedEmails) -> Tokens:
+    """Alice, registered with her verification mail recorded, and logged in."""
     register_ok(client, username="alice")
+    assert captured_emails.of_kind("verify")
     return login_tokens(client, "alice")
 
 
-def _request_email_change(client, captured_emails, access: str) -> str:
-    r = client.put(
-        "/api/v1/users/me/email",
-        json={"current_password": PASSWORD, "new_email": NEW_EMAIL},
-        headers=bearer(access),
-    )
+def _request_email_change(
+    client: TestClient, captured_emails: CapturedEmails, access: str
+) -> str:
+    r = change_email(client, access, NEW_EMAIL)
     assert r.status_code == 202, r.text
     return captured_emails.latest_token(NEW_EMAIL, "change_email")
 
 
-def _redeem(client, token: str):
-    return client.post("/api/v1/auth/email/verify", json={"token": token})
-
-
-def _assert_refused_and_email_unchanged(response, db) -> None:
+def _assert_refused_and_email_unchanged(response: Response, db: Db) -> None:
     assert response.status_code == 400
     assert response.json()["code"] == "invalid_token"
     assert db.scalar("SELECT email FROM users") == "alice@example.com"
 
 
 class TestPendingEmailChangeIsCancelled:
-    def test_by_a_password_change(self, client, captured_emails, db, alice):
+    def test_by_a_password_change(
+        self, client: TestClient, captured_emails: CapturedEmails, db: Db, alice: Tokens
+    ) -> None:
         token = _request_email_change(client, captured_emails, alice.access)
 
         r = client.put(
@@ -66,20 +76,19 @@ class TestPendingEmailChangeIsCancelled:
         )
         assert r.status_code == 204
 
-        _assert_refused_and_email_unchanged(_redeem(client, token), db)
+        _assert_refused_and_email_unchanged(verify_email(client, token), db)
 
-    def test_by_a_password_reset(self, client, captured_emails, db, alice):
+    def test_by_a_password_reset(
+        self, client: TestClient, captured_emails: CapturedEmails, db: Db, alice: Tokens
+    ) -> None:
         token = _request_email_change(client, captured_emails, alice.access)
         client.post("/api/v1/auth/password/forgot", json={"email": "alice@example.com"})
         reset = captured_emails.latest_token("alice@example.com", "reset")
 
-        r = client.post(
-            "/api/v1/auth/password/reset",
-            json={"token": reset, "new_password": NEW_PASSWORD},
-        )
+        r = reset_password(client, reset, NEW_PASSWORD)
         assert r.status_code == 204
 
-        _assert_refused_and_email_unchanged(_redeem(client, token), db)
+        _assert_refused_and_email_unchanged(verify_email(client, token), db)
 
     @pytest.mark.parametrize(
         ("block", "unblock"),
@@ -89,14 +98,20 @@ class TestPendingEmailChangeIsCancelled:
         ],
     )
     def test_by_an_admin_block_also_after_it_is_lifted(
-        self, client, captured_emails, db, alice, block, unblock
-    ):
+        self,
+        client: TestClient,
+        captured_emails: CapturedEmails,
+        db: Db,
+        alice: Tokens,
+        block: str,
+        unblock: str,
+    ) -> None:
         token = _request_email_change(client, captured_emails, alice.access)
         admin_login(client)
         run_action(client, "user", block, [user_id_of(db, "alice")])
         run_action(client, "user", unblock, [user_id_of(db, "alice")])
 
-        _assert_refused_and_email_unchanged(_redeem(client, token), db)
+        _assert_refused_and_email_unchanged(verify_email(client, token), db)
         assert (
             db.scalar("SELECT count(*) FROM email_tokens WHERE invalidated_at IS NULL")
             == 0
@@ -111,14 +126,19 @@ class TestPendingEmailChangeIsCancelled:
         ids=["inactive", "admin_locked"],
     )
     def test_no_token_applies_to_a_blocked_account(
-        self, client, captured_emails, db, alice, block_sql
-    ):
+        self,
+        client: TestClient,
+        captured_emails: CapturedEmails,
+        db: Db,
+        alice: Tokens,
+        block_sql: str,
+    ) -> None:
         change = _request_email_change(client, captured_emails, alice.access)
         verify = captured_emails.latest_token("alice@example.com", "verify")
         db.execute(block_sql)
 
-        _assert_refused_and_email_unchanged(_redeem(client, change), db)
-        r = _redeem(client, verify)
+        _assert_refused_and_email_unchanged(verify_email(client, change), db)
+        r = verify_email(client, verify)
         assert r.status_code == 400
         assert r.json()["code"] == "invalid_token"
         assert db.scalar("SELECT is_email_verified FROM users") is False
@@ -127,12 +147,14 @@ class TestPendingEmailChangeIsCancelled:
         db.execute(
             "UPDATE users SET is_active = true, is_locked = false, locked_until = NULL"
         )
-        _assert_refused_and_email_unchanged(_redeem(client, change), db)
-        assert _redeem(client, verify).status_code == 400
+        _assert_refused_and_email_unchanged(verify_email(client, change), db)
+        assert verify_email(client, verify).status_code == 400
 
 
 class TestLogoutWithRotatedToken:
-    def test_is_reuse_keeps_the_marker_and_ends_the_family(self, client, db, alice):
+    def test_is_reuse_keeps_the_marker_and_ends_the_family(
+        self, client: TestClient, db: Db, alice: Tokens
+    ) -> None:
         _, successor = refresh_with(client, alice.refresh)
 
         r = client.post(
@@ -147,10 +169,13 @@ class TestLogoutWithRotatedToken:
             == "rotated"
         )
         assert db.scalar("SELECT count(*) FROM sessions WHERE NOT is_revoked") == 0
+        assert successor
         assert refresh_with(client, successor.refresh)[0].status_code == 401
         assert audit_count(db, "session_revoked", "alice") == 1
 
-    def test_second_logout_is_idempotent_and_keeps_the_reason(self, client, db, alice):
+    def test_second_logout_is_idempotent_and_keeps_the_reason(
+        self, client: TestClient, db: Db, alice: Tokens
+    ) -> None:
         cookie = {"Cookie": f"refresh_token={alice.refresh}"}
         assert client.post("/api/v1/auth/logout", headers=cookie).status_code == 204
         db.execute("UPDATE sessions SET revoke_reason = 'admin'")
@@ -161,27 +186,24 @@ class TestLogoutWithRotatedToken:
         assert db.scalar("SELECT revoke_reason FROM sessions") == "admin"
 
 
-def _change_password(client, access: str, current: str):
-    return client.put(
-        "/api/v1/users/me/password",
-        json={"current_password": current, "new_password": NEW_PASSWORD},
-        headers=bearer(access),
-    )
+def _change_password(client: TestClient, access: str, current: str) -> Response:
+    return change_password(client, access, current, NEW_PASSWORD)
 
 
-def _change_email(client, access: str, current: str):
-    return client.put(
-        "/api/v1/users/me/email",
-        json={"current_password": current, "new_email": NEW_EMAIL},
-        headers=bearer(access),
-    )
+def _change_email(client: TestClient, access: str, current: str) -> Response:
+    return change_email(client, access, NEW_EMAIL, current)
 
 
 class TestPasswordConfirmationLockout:
+    @pytest.mark.usefixtures("captured_emails")
     @pytest.mark.parametrize("confirm", [_change_password, _change_email])
     def test_wrong_passwords_lock_the_account_like_failed_logins(
-        self, client, captured_emails, db, alice, confirm
-    ):
+        self,
+        client: TestClient,
+        db: Db,
+        alice: Tokens,
+        confirm: Callable[[TestClient, str, str], Response],
+    ) -> None:
         for _ in range(MAXIMUM_LOGIN_ATTEMPTS):
             r = confirm(client, alice.access, "WrongPassword1!")
             assert r.status_code == 400
@@ -204,8 +226,8 @@ class TestPasswordConfirmationLockout:
         )
 
     def test_correct_password_before_the_threshold_works_and_resets_the_count(
-        self, client, db, alice
-    ):
+        self, client: TestClient, db: Db, alice: Tokens
+    ) -> None:
         for _ in range(MAXIMUM_LOGIN_ATTEMPTS - 1):
             assert (
                 _change_password(client, alice.access, "WrongPassword1!").status_code

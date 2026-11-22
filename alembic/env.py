@@ -35,7 +35,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 # Importing app.modules imports every registered module (MODULES), and with
 # it each module's models, so the metadata holds all tables (autogenerate
 # must never see an empty metadata). It reads no settings.
-import app.modules  # noqa: F401 - registers every module's tables on Base.metadata
+import app.modules  # noqa: F401  # pyright: ignore[reportUnusedImport] - registers every module's tables on Base.metadata
 from app.core import Base
 from app.core.config import LOCAL_ENV_FILE, Environment, normalize_database_url
 

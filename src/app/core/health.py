@@ -90,7 +90,7 @@ async def readiness(
     timeout = settings.READINESS_TIMEOUT_SECONDS
     checks: dict[str, CheckStatus] = {
         "database": await _check("database", lambda: _ping_database(engine), timeout),
-        "redis": await _check("redis", redis.ping, timeout),
+        "redis": await _check("redis", redis.ping, timeout),  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType] - redis-py leaves `**kwargs` of ping() unannotated
     }
     ready = all(status == "ok" for status in checks.values())
     if not ready:

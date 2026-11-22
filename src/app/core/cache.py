@@ -45,7 +45,7 @@ async def open_redis(settings: Settings) -> redis.Redis:
         max_connections=settings.CACHE_MAX_CONNECTIONS,
     )
     try:
-        await client.ping()
+        await client.ping()  # pyright: ignore[reportUnknownMemberType] - redis-py leaves `**kwargs` of ping() unannotated
     except redis.RedisError as exc:
         await client.aclose()
         logger.error("cache.connect_failed", error_type=type(exc).__name__)

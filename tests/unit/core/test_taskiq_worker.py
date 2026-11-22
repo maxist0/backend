@@ -6,28 +6,30 @@ registry, which must never happen in an API process (or in this one).
 """
 
 import asyncio
-import datetime
 import json
 import os
 import subprocess
 import sys
+from collections.abc import AsyncIterator
+from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 import redis.exceptions
-from pydantic import ValidationError
 from jinja2 import TemplateNotFound
-from taskiq import AckableMessage, ScheduledTask, ScheduleSource
+from pydantic import ValidationError
+from taskiq import AckableMessage, ScheduledTask, ScheduleSource, TaskiqEvents
 from taskiq.exceptions import NoResultError
 from taskiq.message import TaskiqMessage
 from taskiq.result import TaskiqResult
-from taskiq_redis import RedisStreamBroker
+from taskiq_redis import RedisAsyncResultBackend, RedisStreamBroker
 
 import app.core.tasks as app_tasks
-import app.modules  # noqa: F401  (registers the module tasks)
+import app.modules  # noqa: F401  # pyright: ignore[reportUnusedImport] - registers the module tasks
 from app.core.config import get_settings
 from app.core.mail import MailDeliveryError, TransientMailDeliveryError
 from app.modules.auth.tasks import send_token_email_task
-from tests.helpers import BACKEND_DIR, run_async
+from tests.helpers import BACKEND_DIR, SettingsFactory, run_async
 
 
 class RecordingSource(ScheduleSource):
@@ -43,7 +45,9 @@ class RecordingSource(ScheduleSource):
         self.added.append(schedule)
 
 
-def _fail(exc: BaseException, retries: int = 0) -> tuple[RecordingSource, TaskiqResult]:
+def _fail(
+    exc: BaseException, retries: int = 0
+) -> tuple[RecordingSource, TaskiqResult[None]]:
     """Let the configured retry middleware handle a failed verification mail."""
     settings = get_settings()
     source = RecordingSource()
@@ -59,7 +63,7 @@ def _fail(exc: BaseException, retries: int = 0) -> tuple[RecordingSource, Taskiq
         args=[],
         kwargs={},
     )
-    result: TaskiqResult = TaskiqResult(
+    result = TaskiqResult[None](
         is_err=True, return_value=None, execution_time=0.1, error=exc
     )
     run_async(middleware.on_error(message, result, exc))
@@ -67,7 +71,7 @@ def _fail(exc: BaseException, retries: int = 0) -> tuple[RecordingSource, Taskiq
 
 
 class TestApiBroker:
-    def test_is_a_bounded_stream_broker_with_result_ttl(self):
+    def test_is_a_bounded_stream_broker_with_result_ttl(self) -> None:
         broker = app_tasks.build_broker(get_settings())
 
         assert isinstance(broker, app_tasks.ReconnectingStreamBroker)
@@ -76,17 +80,21 @@ class TestApiBroker:
         assert broker.maxlen == app_tasks.TASK_STREAM_MAXLEN
         assert broker.approximate is True
         assert broker.consumer_id == "0"
+        assert isinstance(broker.result_backend, RedisAsyncResultBackend)
         assert broker.result_backend.result_ex_time == app_tasks.TASK_RESULT_TTL_SECONDS
 
-    def test_blocking_read_ends_before_the_socket_timeout(self):
+    def test_blocking_read_ends_before_the_socket_timeout(self) -> None:
         """An idle XREADGROUP must return before redis-py's read timeout."""
         broker = app_tasks.build_broker(get_settings())
+        assert isinstance(broker, app_tasks.ReconnectingStreamBroker)
 
         socket_timeout = broker.connection_pool.connection_kwargs["socket_timeout"]
 
         assert broker.block < socket_timeout * 1000
 
-    def test_has_no_worker_middlewares_and_leaves_prometheus_alone(self, monkeypatch):
+    def test_has_no_worker_middlewares_and_leaves_prometheus_alone(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """The API lifespan builds this broker; worker middlewares stay out.
 
         `PrometheusMiddleware` sets `PROMETHEUS_MULTIPROC_DIR`, which would put
@@ -102,14 +110,15 @@ class TestApiBroker:
 
 class TestRetries:
     def test_transient_error_is_retried_through_the_schedule_source(
-        self, fresh_settings
-    ):
+        self, fresh_settings: pytest.MonkeyPatch
+    ) -> None:
         fresh_settings.setenv("TASKIQ_RETRY_DELAY_SECONDS", "42")
-        before = datetime.datetime.now(datetime.UTC)
+        before = datetime.now(UTC)
 
         source, result = _fail(TransientMailDeliveryError(TimeoutError()))
 
         [scheduled] = source.added
+        assert scheduled.time is not None
         delay = (scheduled.time - before).total_seconds()
         assert 42 <= delay <= 42 + 1 + 5  # jitter adds up to 1 s
         assert scheduled.task_name == "email.send_token_email"
@@ -127,12 +136,14 @@ class TestRetries:
         ],
         ids=["permanent-mail-error", "type-error", "runtime-error"],
     )
-    def test_other_errors_are_not_retried(self, exc):
+    def test_other_errors_are_not_retried(self, exc: BaseException) -> None:
         source, _ = _fail(exc)
 
         assert source.added == []
 
-    def test_retry_count_comes_from_the_settings(self, fresh_settings):
+    def test_retry_count_comes_from_the_settings(
+        self, fresh_settings: pytest.MonkeyPatch
+    ) -> None:
         """`TASKIQ_RETRY_COUNT` retries follow the first run, then it stops."""
         fresh_settings.setenv("TASKIQ_RETRY_COUNT", "2")
         transient = TransientMailDeliveryError(ConnectionError())
@@ -143,7 +154,7 @@ class TestRetries:
         assert [int(s.labels["_retries"]) for s in last_retry.added] == [2]
         assert exhausted.added == []
 
-    def test_retry_source_key_prefix_has_no_colon(self):
+    def test_retry_source_key_prefix_has_no_colon(self) -> None:
         """ListRedisScheduleSource parses `<prefix>:time:<time>` by colons."""
         assert ":" not in app_tasks.RETRY_SCHEDULE_PREFIX
 
@@ -152,18 +163,22 @@ class TestReconnect:
     """`listen` waits out what may pass and gives up on what cannot."""
 
     @staticmethod
-    def _first_message(monkeypatch, first_error: BaseException) -> tuple[list, list]:
+    def _first_message(
+        monkeypatch: pytest.MonkeyPatch, first_error: BaseException
+    ) -> tuple[list[str], list[str]]:
         """Fail the first read with `first_error`, then deliver one message."""
         reads: list[str] = []
         declares: list[str] = []
 
-        async def flaky_listen(self):
+        async def flaky_listen(
+            _self: RedisStreamBroker,
+        ) -> AsyncIterator[AckableMessage]:
             reads.append("listen")
             if len(reads) == 1:
                 raise first_error
             yield AckableMessage(data=b"payload", ack=lambda: None)
 
-        async def declare(self):
+        async def declare(_self: RedisStreamBroker) -> None:
             declares.append("declare")
 
         monkeypatch.setattr(RedisStreamBroker, "listen", flaky_listen)
@@ -171,17 +186,21 @@ class TestReconnect:
         monkeypatch.setattr(app_tasks, "BROKER_RECONNECT_SECONDS", 0)
         broker = app_tasks.build_broker(get_settings())
 
-        async def first() -> AckableMessage:
+        async def first() -> bytes | AckableMessage:
             listener = broker.listen()
             try:
                 return await asyncio.wait_for(anext(listener), timeout=5)
             finally:
                 await listener.aclose()
 
-        assert run_async(first()).data == b"payload"
+        message = run_async(first())
+        assert isinstance(message, AckableMessage)
+        assert message.data == b"payload"
         return reads, declares
 
-    def test_resumes_after_redis_was_unreachable(self, monkeypatch):
+    def test_resumes_after_redis_was_unreachable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """A Redis outage must not end `listen` (it would kill the worker)."""
         reads, _ = self._first_message(
             monkeypatch, redis.exceptions.ConnectionError("down")
@@ -193,12 +212,16 @@ class TestReconnect:
         "message",
         [
             "NOGROUP No such key 'taskiq:tasks' or consumer group 'taskiq'",
-            "Command # 2 (XAUTOCLAIM taskiq:tasks taskiq c 600000 0-0 COUNT 100) "
-            "of pipeline caused error: (\"NOGROUP No such key 'taskiq:tasks'\",)",
+            (
+                "Command # 2 (XAUTOCLAIM taskiq:tasks taskiq c 600000 0-0 COUNT 100) "
+                "of pipeline caused error: (\"NOGROUP No such key 'taskiq:tasks'\",)"
+            ),
         ],
         ids=["xreadgroup", "xautoclaim-pipeline"],
     )
-    def test_declares_the_group_again_when_it_is_gone(self, monkeypatch, message):
+    def test_declares_the_group_again_when_it_is_gone(
+        self, monkeypatch: pytest.MonkeyPatch, message: str
+    ) -> None:
         """After FLUSHALL the connection lives on, but the group is gone."""
         reads, declares = self._first_message(
             monkeypatch, redis.exceptions.ResponseError(message)
@@ -215,25 +238,38 @@ class TestReconnect:
         ],
         ids=["authentication", "other-error-reply"],
     )
-    def test_errors_that_do_not_pass_by_waiting_propagate(self, monkeypatch, error):
+    def test_errors_that_do_not_pass_by_waiting_propagate(
+        self, monkeypatch: pytest.MonkeyPatch, error: BaseException
+    ) -> None:
         with pytest.raises(type(error)):
             self._first_message(monkeypatch, error)
 
 
 class TestSettings:
-    def test_metrics_server_listens_on_loopback_by_default(self, settings_factory):
+    def test_metrics_server_listens_on_loopback_by_default(
+        self, settings_factory: SettingsFactory
+    ) -> None:
         assert settings_factory().TASKIQ_METRICS_HOST == "127.0.0.1"
 
-    @pytest.mark.parametrize("host", ["0.0.0.0", "::1", "metrics.internal", "worker"])
-    def test_metrics_host_accepts_addresses_and_hostnames(self, settings_factory, host):
-        assert settings_factory(TASKIQ_METRICS_HOST=host).TASKIQ_METRICS_HOST == host
+    @pytest.mark.parametrize(
+        "host",
+        ["0.0.0.0", "::1", "metrics.internal", "worker"],  # noqa: S104 - setting values under test; nothing binds
+    )
+    def test_metrics_host_accepts_addresses_and_hostnames(
+        self, settings_factory: SettingsFactory, host: str
+    ) -> None:
+        assert host == settings_factory(TASKIQ_METRICS_HOST=host).TASKIQ_METRICS_HOST
 
     @pytest.mark.parametrize("host", ["", "bad host", "http://worker", "-worker"])
-    def test_metrics_host_refuses_anything_else(self, settings_factory, host):
+    def test_metrics_host_refuses_anything_else(
+        self, settings_factory: SettingsFactory, host: str
+    ) -> None:
         with pytest.raises(ValidationError, match="TASKIQ_METRICS_HOST"):
             settings_factory(TASKIQ_METRICS_HOST=host)
 
-    def test_retry_delay_is_at_least_thirty_seconds(self, settings_factory):
+    def test_retry_delay_is_at_least_thirty_seconds(
+        self, settings_factory: SettingsFactory
+    ) -> None:
         with pytest.raises(ValidationError, match="TASKIQ_RETRY_DELAY_SECONDS"):
             settings_factory(TASKIQ_RETRY_DELAY_SECONDS=29)
 
@@ -244,7 +280,7 @@ class TestSettings:
 
 
 @pytest.fixture(scope="module")
-def worker_root(tmp_path_factory) -> dict:
+def worker_root(tmp_path_factory: pytest.TempPathFactory) -> dict[str, object]:
     """Import `app.worker` in a fresh interpreter and report its wiring."""
     metrics_dir = tmp_path_factory.mktemp("taskiq-metrics")
     code = """
@@ -258,7 +294,9 @@ import app.worker as w
 
 retry = next(m for m in w.broker.middlewares if isinstance(m, SmartRetryMiddleware))
 prom = next(m for m in w.broker.middlewares if isinstance(m, PrometheusMiddleware))
-prom.pre_execute(TaskiqMessage(task_id="1", task_name="probe", labels={}, args=[], kwargs={}))
+prom.pre_execute(
+    TaskiqMessage(task_id="1", task_name="probe", labels={}, args=[], kwargs={})
+)
 registry = CollectorRegistry()
 MultiProcessCollector(registry, path=str(w.METRICS_DIR))
 metrics = generate_latest(registry).decode()
@@ -289,7 +327,7 @@ print(json.dumps({
         "TASKIQ_METRICS_PORT": "9123",
         "TASKIQ_RETRY_COUNT": "4",
         "TASKIQ_RETRY_DELAY_SECONDS": "45",
-        "TASKIQ_METRICS_HOST": "0.0.0.0",
+        "TASKIQ_METRICS_HOST": "0.0.0.0",  # noqa: S104 - setting value under test; the subprocess binds nothing
     }
     proc = subprocess.run(
         [sys.executable, "-c", code],
@@ -298,41 +336,52 @@ print(json.dumps({
         capture_output=True,
         text=True,
         timeout=120,
+        check=False,
     )
     assert proc.returncode == 0, proc.stderr[-2000:]
-    report = json.loads(proc.stdout.strip().splitlines()[-1])
+    report: dict[str, object] = json.loads(proc.stdout.strip().splitlines()[-1])
     report["expected_metrics_dir"] = str(metrics_dir)
     return report
 
 
 class TestWorkerRoot:
-    def test_worker_broker_has_retry_and_metrics_middlewares(self, worker_root):
+    def test_worker_broker_has_retry_and_metrics_middlewares(
+        self, worker_root: dict[str, object]
+    ) -> None:
         assert worker_root["middlewares"] == [
             "PrometheusMiddleware",
             "SmartRetryMiddleware",
         ]
 
-    def test_settings_are_wired(self, worker_root):
+    def test_settings_are_wired(self, worker_root: dict[str, object]) -> None:
         assert worker_root["retry_count"] == 5  # first run + TASKIQ_RETRY_COUNT
         assert worker_root["retry_delay"] == 45
         assert worker_root["metrics_port"] == 9123
-        assert worker_root["metrics_host"] == "0.0.0.0"
+        assert worker_root["metrics_host"] == "0.0.0.0"  # noqa: S104 - the configured value, compared
 
-    def test_scheduler_reads_the_retries_the_worker_writes(self, worker_root):
+    def test_scheduler_reads_the_retries_the_worker_writes(
+        self, worker_root: dict[str, object]
+    ) -> None:
         assert worker_root["retry_source_shared"] is True
         assert worker_root["scheduler_reads_retries"] is True
 
-    def test_task_metrics_reach_the_multiprocess_directory(self, worker_root):
+    def test_task_metrics_reach_the_multiprocess_directory(
+        self, worker_root: dict[str, object]
+    ) -> None:
         """The metrics server reads only these files; in-memory values are lost."""
         assert worker_root["metrics_dir"] == worker_root["expected_metrics_dir"]
         assert worker_root["probe_counted"] is True
 
-    def test_entry_point_runs_on_a_selector_event_loop(self, worker_root):
-        """psycopg cannot use Windows' default ProactorEventLoop."""
+    def test_entry_point_runs_on_a_selector_event_loop(
+        self, worker_root: dict[str, object]
+    ) -> None:
+        """Psycopg cannot use Windows' default ProactorEventLoop."""
         assert worker_root["selector_loop"] is True
 
 
-def test_scheduler_process_keeps_task_arguments_out_of_debug_logs(tmp_path):
+def test_scheduler_process_keeps_task_arguments_out_of_debug_logs(
+    tmp_path: Path,
+) -> None:
     """The scheduler fires CLIENT_STARTUP, not WORKER_STARTUP.
 
     It runs like `taskiq scheduler --log-level DEBUG`: the CLI configures
@@ -381,6 +430,7 @@ asyncio.run(main(), loop_factory=asyncio.SelectorEventLoop)
         capture_output=True,
         text=True,
         timeout=120,
+        check=False,
     )
 
     output = proc.stdout + proc.stderr
@@ -391,7 +441,7 @@ asyncio.run(main(), loop_factory=asyncio.SelectorEventLoop)
     assert "MARKER" not in output.replace("KICK-FAILED", "")
 
 
-def test_scheduler_process_opens_no_task_database(tmp_path):
+def test_scheduler_process_opens_no_task_database(tmp_path: Path) -> None:
     """The scheduler builds the worker broker but fires CLIENT_STARTUP only.
 
     It must not open a database pool for `TaskDbSession`; a worker process
@@ -443,6 +493,7 @@ asyncio.run(main(), loop_factory=asyncio.SelectorEventLoop)
         capture_output=True,
         text=True,
         timeout=120,
+        check=False,
     )
 
     output = proc.stdout + proc.stderr
@@ -451,20 +502,16 @@ asyncio.run(main(), loop_factory=asyncio.SelectorEventLoop)
     assert "WORKER_OPENS_DB" in proc.stdout
 
 
-def test_built_broker_opens_the_task_database_in_worker_events_only():
+def test_built_broker_opens_the_task_database_in_worker_events_only() -> None:
     broker = app_tasks.build_broker(get_settings())
 
+    assert app_tasks.open_task_db in broker.event_handlers[TaskiqEvents.WORKER_STARTUP]
     assert (
-        app_tasks.open_task_db
-        in broker.event_handlers[app_tasks.TaskiqEvents.WORKER_STARTUP]
-    )
-    assert (
-        app_tasks.close_task_db
-        in broker.event_handlers[app_tasks.TaskiqEvents.WORKER_SHUTDOWN]
+        app_tasks.close_task_db in broker.event_handlers[TaskiqEvents.WORKER_SHUTDOWN]
     )
     for event in (
-        app_tasks.TaskiqEvents.CLIENT_STARTUP,
-        app_tasks.TaskiqEvents.CLIENT_SHUTDOWN,
+        TaskiqEvents.CLIENT_STARTUP,
+        TaskiqEvents.CLIENT_SHUTDOWN,
     ):
         handlers = broker.event_handlers.get(event, [])
         assert app_tasks.open_task_db not in handlers

@@ -17,7 +17,7 @@ and the constraint name. They come from psycopg 3's diagnostics
 import re
 from collections.abc import Mapping, Sequence
 from http import HTTPStatus
-from typing import Any
+from typing import Any, cast
 
 import structlog
 from fastapi import FastAPI, Request, Response
@@ -279,7 +279,10 @@ async def _http_exception_handler(
     # Same rule as Starlette's own handler: these statuses carry no body.
     if exc.status_code in {204, 304}:
         return Response(status_code=exc.status_code, headers=exc.headers)
-    detail = exc.detail if isinstance(exc.detail, str) else None
+    # Starlette annotates `detail` as `str`, but FastAPI's `HTTPException`
+    # accepts any JSON value; only a string becomes the problem's `detail`.
+    raw_detail = cast("object", exc.detail)
+    detail = raw_detail if isinstance(raw_detail, str) else None
     return problem_response(
         exc.status_code,
         _code_for_status(exc.status_code),

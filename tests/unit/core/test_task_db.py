@@ -1,23 +1,28 @@
 """`TaskDbSession`: the worker's task database, injected by taskiq."""
 
 import logging
+from collections.abc import Callable, Coroutine
+from typing import Any, Never
 
 import pytest
-from taskiq import InMemoryBroker, TaskiqDepends, TaskiqState
+from taskiq import InMemoryBroker, TaskiqDepends, TaskiqResult, TaskiqState
 
 import app.core.tasks as app_tasks
 from app.core import TaskDbSession
 from tests.helpers import run_async
+
+# Any: the send and yield types of a task's coroutine are irrelevant here.
+type _ProbeTask = Callable[[], Coroutine[Any, Any, None]]
 
 
 class _Session:
     def __init__(self) -> None:
         self.closed = False
 
-    async def __aenter__(self) -> "_Session":
+    async def __aenter__(self) -> _Session:
         return self
 
-    async def __aexit__(self, *exc_info) -> None:
+    async def __aexit__(self, *exc_info: object) -> None:
         self.closed = True
 
 
@@ -38,10 +43,10 @@ def _broker_with(factory: _Factory | None) -> InMemoryBroker:
     return broker
 
 
-def _run_task(broker: InMemoryBroker, func) -> object:
+def _run_task(broker: InMemoryBroker, func: _ProbeTask) -> TaskiqResult[None]:
     task = broker.task(task_name=f"probe.{func.__name__}")(func)
 
-    async def _scenario():
+    async def _scenario() -> TaskiqResult[None]:
         await broker.startup()
         try:
             sent = await task.kiq()
@@ -53,9 +58,9 @@ def _run_task(broker: InMemoryBroker, func) -> object:
 
 
 class TestTaskDbSession:
-    def test_task_gets_a_session_that_is_closed_afterwards(self):
+    def test_task_gets_a_session_that_is_closed_afterwards(self) -> None:
         factory = _Factory()
-        seen: list = []
+        seen: list[object] = []
 
         async def uses_db(db: TaskDbSession = TaskiqDepends()) -> None:
             seen.append(db)
@@ -66,12 +71,17 @@ class TestTaskDbSession:
         assert seen == factory.sessions
         assert factory.sessions[0].closed
 
-    def test_failing_task_is_not_logged_again_by_the_dependency(self, caplog):
-        """taskiq-dependencies throws the task's error into the dependency
-        and logs whatever comes back, message included."""
+    def test_failing_task_is_not_logged_again_by_the_dependency(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The dependency does not log the task's error a second time.
+
+        taskiq-dependencies throws the task's error into the dependency and
+        logs whatever comes back, message included.
+        """
         factory = _Factory()
 
-        async def fails(db: TaskDbSession = TaskiqDepends()) -> None:
+        async def fails(_db: TaskDbSession = TaskiqDepends()) -> None:
             raise RuntimeError("MARKER-secret")
 
         caplog.set_level(logging.DEBUG)
@@ -84,8 +94,8 @@ class TestTaskDbSession:
         ]
         assert teardown == []
 
-    def test_outside_a_worker_the_task_fails_clearly(self):
-        async def uses_db(db: TaskDbSession = TaskiqDepends()) -> None:
+    def test_outside_a_worker_the_task_fails_clearly(self) -> None:
+        async def uses_db(_db: TaskDbSession = TaskiqDepends()) -> None:
             raise AssertionError("must not run")
 
         result = _run_task(_broker_with(None), uses_db)
@@ -95,17 +105,22 @@ class TestTaskDbSession:
 
 
 class TestWorkerHooks:
-    def test_unreachable_database_disposes_the_engine(self, monkeypatch):
+    def test_unreachable_database_disposes_the_engine(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         disposed: list[bool] = []
 
         class _Engine:
             async def dispose(self) -> None:
                 disposed.append(True)
 
-        async def _init_db(engine, settings):
+        def _build_engine(_settings: object) -> _Engine:
+            return _Engine()
+
+        async def _init_db(_engine: object, _settings: object) -> Never:
             raise RuntimeError("Database connection failed")
 
-        monkeypatch.setattr(app_tasks, "build_engine", lambda settings: _Engine())
+        monkeypatch.setattr(app_tasks, "build_engine", _build_engine)
         monkeypatch.setattr(app_tasks, "init_db", _init_db)
         state = TaskiqState()
 
@@ -115,21 +130,29 @@ class TestWorkerHooks:
         assert disposed == [True]
         assert dict(state) == {}
 
-    def test_startup_stores_the_factory_and_shutdown_disposes(self, monkeypatch):
-        closed: list = []
+    def test_startup_stores_the_factory_and_shutdown_disposes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        closed: list[object] = []
         engine = object()
 
-        async def _init_db(engine, settings):
+        def _build_engine(_settings: object) -> object:
+            return engine
+
+        async def _init_db(_engine: object, _settings: object) -> None:
             return None
 
-        async def _close_db(engine):
+        async def _close_db(engine: object) -> None:
             closed.append(engine)
 
-        monkeypatch.setattr(app_tasks, "build_engine", lambda settings: engine)
+        def _create_session_factory(bound: object) -> tuple[str, object]:
+            return ("factory", bound)
+
+        monkeypatch.setattr(app_tasks, "build_engine", _build_engine)
         monkeypatch.setattr(app_tasks, "init_db", _init_db)
         monkeypatch.setattr(app_tasks, "close_db", _close_db)
         monkeypatch.setattr(
-            app_tasks, "create_session_factory", lambda bound: ("factory", bound)
+            app_tasks, "create_session_factory", _create_session_factory
         )
         state = TaskiqState()
 

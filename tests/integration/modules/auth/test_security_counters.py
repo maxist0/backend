@@ -1,10 +1,13 @@
 """The auth security counters count each refusal once, by reason."""
 
 import pytest
+from fastapi.testclient import TestClient
 from prometheus_client import REGISTRY
 
 from tests.helpers import (
     MAXIMUM_LOGIN_ATTEMPTS,
+    CapturedEmails,
+    Db,
     login,
     login_tokens,
     refresh_with,
@@ -22,11 +25,13 @@ def _counter(name: str) -> float:
 
 
 @pytest.fixture
-def alice(client, captured_emails):
+def alice(client: TestClient, captured_emails: CapturedEmails) -> None:
+    """Alice, registered with her verification mail recorded."""
     register_ok(client, username="alice")
+    assert captured_emails.of_kind("verify")
 
 
-def test_every_reason_is_exported_from_the_start(client):
+def test_every_reason_is_exported_from_the_start(client: TestClient) -> None:
     body = client.get("/metrics").text
 
     for reason in ("invalid_password", "unknown_user", "locked", "inactive"):
@@ -35,7 +40,7 @@ def test_every_reason_is_exported_from_the_start(client):
     assert "auth_refresh_token_reuse_total" in body
 
 
-def test_unknown_user(client):
+def test_unknown_user(client: TestClient) -> None:
     before = _failures("unknown_user")
 
     assert login(client, username="ghost").status_code == 401
@@ -43,7 +48,8 @@ def test_unknown_user(client):
     assert _failures("unknown_user") == before + 1
 
 
-def test_inactive_account(client, alice, db):
+@pytest.mark.usefixtures("alice")
+def test_inactive_account(client: TestClient, db: Db) -> None:
     db.execute("UPDATE users SET is_active = false WHERE username = 'alice'")
     before = _failures("inactive")
 
@@ -52,7 +58,8 @@ def test_inactive_account(client, alice, db):
     assert _failures("inactive") == before + 1
 
 
-def test_wrong_passwords_then_lockout_then_locked(client, alice):
+@pytest.mark.usefixtures("alice")
+def test_wrong_passwords_then_lockout_then_locked(client: TestClient) -> None:
     wrong, locks, locked = (
         _failures("invalid_password"),
         _counter("auth_lockouts_total"),
@@ -70,7 +77,8 @@ def test_wrong_passwords_then_lockout_then_locked(client, alice):
     assert _failures("locked") == locked + 1
 
 
-def test_refresh_token_reuse(client, alice):
+@pytest.mark.usefixtures("alice")
+def test_refresh_token_reuse(client: TestClient) -> None:
     tokens = login_tokens(client, "alice")
     first, _ = refresh_with(client, tokens.refresh)
     assert first.status_code == 200
@@ -82,7 +90,8 @@ def test_refresh_token_reuse(client, alice):
     assert _counter("auth_refresh_token_reuse_total") == before + 1
 
 
-def test_a_successful_login_counts_nothing(client, alice):
+@pytest.mark.usefixtures("alice")
+def test_a_successful_login_counts_nothing(client: TestClient) -> None:
     before = {
         reason: _failures(reason)
         for reason in ("invalid_password", "unknown_user", "locked", "inactive")

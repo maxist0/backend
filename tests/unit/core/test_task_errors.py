@@ -2,31 +2,42 @@
 
 import inspect
 import logging
+from collections.abc import Callable, Coroutine
+from typing import Any
 
 import psycopg
 import psycopg.errors
 import pytest
 from sqlalchemy.exc import DBAPIError, IntegrityError, OperationalError
-from taskiq import InMemoryBroker, ScheduledTask, ScheduleSource, TaskiqDepends
+from taskiq import (
+    InMemoryBroker,
+    ScheduledTask,
+    ScheduleSource,
+    TaskiqDepends,
+    TaskiqResult,
+)
 
 import app.core.tasks as app_tasks
 from app.core import TaskDbSession, task
 from app.core.config import get_settings
 from app.core.mail import TransientMailDeliveryError
-from tests.helpers import run_async
-
-MARKER = "zebra.mail91@example.com"
+from tests.helpers import (
+    PII_EMAIL,
+    run_async,
+)
 
 
 class _DriverError(Exception):
     """Stands in for a psycopg error: a message with row data and a SQLSTATE."""
 
     def __init__(self, sqlstate: str | None) -> None:
-        super().__init__(f"DETAIL: Key (email)=({MARKER}) already exists.")
+        super().__init__(f"DETAIL: Key (email)=({PII_EMAIL}) already exists.")
         self.sqlstate = sqlstate
 
 
-def _db_error(sqlstate: str | None, cls: type[DBAPIError] = IntegrityError):
+def _db_error(
+    sqlstate: str | None, cls: type[DBAPIError] = IntegrityError
+) -> DBAPIError:
     return cls("INSERT INTO users ...", None, _DriverError(sqlstate))
 
 
@@ -65,7 +76,9 @@ class TestClassification:
             "raw-operational",
         ],
     )
-    def test_passing_errors_are_transient(self, error):
+    def test_passing_errors_are_transient(
+        self, error: DBAPIError | psycopg.Error
+    ) -> None:
         assert isinstance(
             app_tasks.task_database_error(error), app_tasks.TransientTaskDatabaseError
         )
@@ -80,12 +93,14 @@ class TestClassification:
         ],
         ids=["23505", "42P01", "integrity-no-sqlstate", "raw-unique"],
     )
-    def test_other_errors_are_permanent(self, error):
+    def test_other_errors_are_permanent(
+        self, error: DBAPIError | psycopg.Error
+    ) -> None:
         replaced = app_tasks.task_database_error(error)
 
         assert type(replaced) is app_tasks.TaskDatabaseError
 
-    def test_invalidated_connection_is_transient(self):
+    def test_invalidated_connection_is_transient(self) -> None:
         error = DBAPIError(
             "SELECT 1", None, _DriverError(None), connection_invalidated=True
         )
@@ -94,19 +109,24 @@ class TestClassification:
             app_tasks.task_database_error(error), app_tasks.TransientTaskDatabaseError
         )
 
-    def test_message_holds_only_types_and_sqlstate(self):
+    def test_message_holds_only_types_and_sqlstate(self) -> None:
         replaced = app_tasks.task_database_error(_db_error("23505"))
 
         assert str(replaced) == "IntegrityError (_DriverError, SQLSTATE 23505)"
 
-    def test_rebuilds_from_its_message(self):
-        """taskiq rebuilds a stored error as `cls(*args)`."""
+    def test_rebuilds_from_its_message(self) -> None:
+        """Taskiq rebuilds a stored error as `cls(*args)`."""
         replaced = app_tasks.task_database_error(_db_error("40P01"))
 
         assert str(type(replaced)(*replaced.args)) == str(replaced)
 
 
-def _run(func, *, retry: bool = False):
+# Any: the send and yield types of a task's coroutine, and the stored value.
+type _ProbeTask = Callable[[], Coroutine[Any, Any, None]]
+type _Stored = TaskiqResult[Any] | None
+
+
+def _run(func: _ProbeTask, *, retry: bool = False) -> tuple[_Stored, _RecordingSource]:
     """Run `func` as a shared task through an in-memory worker.
 
     Returns the stored result (None when the retry middleware scheduled a
@@ -116,10 +136,10 @@ def _run(func, *, retry: bool = False):
     source = _RecordingSource()
     broker = InMemoryBroker(await_inplace=True)
     broker.add_middlewares(app_tasks.build_retry_middleware(settings, source))
-    labels = {"retry_on_error": True} if retry else {}
+    labels: dict[str, Any] = {"retry_on_error": True} if retry else {}
     decorated = task(task_name=f"probe.{func.__name__}", **labels)(func)
 
-    async def _scenario():
+    async def _scenario() -> _Stored:
         await broker.startup()
         try:
             # The inline broker has run the task when `kiq` returns.
@@ -133,8 +153,8 @@ def _run(func, *, retry: bool = False):
 
 class TestTaskDecorator:
     def test_database_error_text_reaches_neither_log_nor_result(
-        self, caplog, monkeypatch
-    ):
+        self, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         async def violates_unique() -> None:
             raise _db_error("23505")
 
@@ -145,6 +165,7 @@ class TestTaskDecorator:
         )
         caplog.set_level(logging.DEBUG)
         result, _ = _run(violates_unique)
+        assert result is not None
 
         assert type(result.error) is app_tasks.TaskDatabaseError
         assert result.error.__context__ is None
@@ -153,10 +174,10 @@ class TestTaskDecorator:
             f"{r.getMessage()} {r.exc_text or ''}" for r in caplog.records
         )
         assert "Exception found while executing function" in logged
-        assert MARKER not in logged
-        assert MARKER not in repr(result.error)
+        assert PII_EMAIL not in logged
+        assert PII_EMAIL not in repr(result.error)
 
-    def test_deadlock_is_scheduled_for_a_retry(self):
+    def test_deadlock_is_scheduled_for_a_retry(self) -> None:
         async def deadlocks() -> None:
             raise _db_error("40P01")
 
@@ -165,7 +186,7 @@ class TestTaskDecorator:
         [scheduled] = source.added
         assert scheduled.task_name == "probe.deadlocks"
 
-    def test_permanent_database_error_is_not_retried(self):
+    def test_permanent_database_error_is_not_retried(self) -> None:
         async def violates_unique_again() -> None:
             raise _db_error("23505")
 
@@ -173,7 +194,7 @@ class TestTaskDecorator:
 
         assert source.added == []
 
-    def test_other_errors_pass_through_unchanged(self):
+    def test_other_errors_pass_through_unchanged(self) -> None:
         """The mail classification still works through the wrapper."""
         error = TransientMailDeliveryError(TimeoutError())
 
@@ -185,7 +206,7 @@ class TestTaskDecorator:
         assert len(source.added) == 1
         assert result is None  # retried: the wrapper let the mail error through
 
-    def test_non_database_error_keeps_its_type_and_identity(self):
+    def test_non_database_error_keeps_its_type_and_identity(self) -> None:
         error = RuntimeError("bug")
 
         async def has_a_bug() -> None:
@@ -193,10 +214,15 @@ class TestTaskDecorator:
 
         result, _ = _run(has_a_bug)
 
+        assert result is not None
+
         assert result.error is error
 
-    def test_signature_dependencies_and_labels_are_kept(self):
-        async def needs_db(user_id: str, db: TaskDbSession = TaskiqDepends()) -> None:
+    def test_signature_dependencies_and_labels_are_kept(self) -> None:
+        async def needs_db(
+            user_id: str,  # noqa: ARG001 - the signature is under test
+            db: TaskDbSession = TaskiqDepends(),  # noqa: ARG001 - the signature is under test
+        ) -> None:
             return None
 
         decorated = task(
@@ -212,7 +238,7 @@ class TestTaskDecorator:
             "retry_on_error": True,
             "timeout": 30,
         }
-        assert decorated.original_func.__wrapped__ is needs_db
+        assert inspect.unwrap(decorated.original_func) is needs_db
         assert list(inspect.signature(decorated.original_func).parameters) == [
             "user_id",
             "db",

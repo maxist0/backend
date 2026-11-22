@@ -14,7 +14,9 @@ from app.modules.auth.tasks import TEMPLATE_DIR
         ("confirm_email_change.html", "confirm_url"),
     ],
 )
-def test_auth_templates_extend_the_core_layout(template_name, url_key):
+def test_auth_templates_extend_the_core_layout(
+    template_name: str, url_key: str
+) -> None:
     html = render_email(
         template_name,
         {
@@ -40,7 +42,7 @@ def test_auth_templates_extend_the_core_layout(template_name, url_key):
         "email_change_completed.html",
     ],
 )
-def test_notice_templates_extend_the_layout_and_escape(template_name):
+def test_notice_templates_extend_the_layout_and_escape(template_name: str) -> None:
     html = render_email(
         template_name,
         {
@@ -59,7 +61,7 @@ def test_notice_templates_extend_the_layout_and_escape(template_name):
     assert "If this wasn't you" in html or "If this wasn&#39;t you" in html
 
 
-def test_lock_notice_states_the_end_in_utc():
+def test_lock_notice_states_the_end_in_utc() -> None:
     html = render_email(
         "account_locked.html",
         {"username": "a", "locked_until": "00:10 UTC on 2026-11-18"},
@@ -69,7 +71,7 @@ def test_lock_notice_states_the_end_in_utc():
     assert "00:10 UTC on 2026-11-18" in html
 
 
-def test_completed_notice_says_how_to_get_the_account_back():
+def test_completed_notice_says_how_to_get_the_account_back() -> None:
     """A new password alone is not enough: the new address can reset it again."""
     html = render_email(
         "email_change_completed.html",

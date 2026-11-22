@@ -33,7 +33,8 @@ uv run alembic upgrade head                 # migrate local DB (reads .env.local
 uv run python run.py dev                    # API on :8000 + taskiq worker + scheduler, reads .env.local
 uv run ruff check src tests run.py alembic   # lint (ruff pinned in the lint group)
 uv run ruff format src tests run.py alembic  # format; explicit paths, ruff would also format Markdown code blocks
-uv run mypy                                 # types, strict; paths come from [tool.mypy] in pyproject.toml
+uv run mypy                                 # types, strict, src + tests; paths come from [tool.mypy] in pyproject.toml
+uv run pyright                              # second type gate, strict ([tool.pyright]); the checker behind VS Code's Pylance
 uv run ty check                             # informational only (open decision D6), not a gate
 uv run pytest tests/unit --no-cov           # fast loop, no Docker; the coverage gate applies only to the full run
 uv run pytest                               # full suite (unit + integration, coverage gate); needs a running Docker daemon
@@ -135,7 +136,7 @@ src/app/modules/<name>/
 
 ## Code style
 
-- Ruff for lint and format, mypy for types. All code must pass both. Target rules: no `Optional[X]` (use `X | None`), no `List`/`Dict`/`Tuple` from typing, no naive `datetime.now()` (use `utcnow()` from `app.core`), no `print`, no commented-out code, no `assert` outside tests.
+- Ruff for lint and format, mypy and pyright for types (both strict, `src` and `tests`). All code must pass all three. A suppression names its rule and gives the reason on the same line: `# type: ignore[code]  # reason`, `# pyright: ignore[rule] - reason`, `# noqa: CODE - reason`. Target rules: no `Optional[X]` (use `X | None`), no `List`/`Dict`/`Tuple` from typing, no naive `datetime.now()` (use `utcnow()` from `app.core`), no `print`, no commented-out code, no `assert` outside tests.
 - Type every parameter and return value. `Any` needs a comment explaining why.
 - Pydantic v2 only: `model_config = ConfigDict(...)`, `field_validator`, `model_validator`, `model_dump(mode="json")`. Request models set `extra="forbid"`. Separate `XCreate`, `XUpdate`, `XResponse`; never return ORM objects.
 - Naming: `snake_case` functions and modules, `PascalCase` classes, `UPPER_SNAKE` constants, schemas suffixed `Request`/`Response`, exceptions suffixed `Error`.
@@ -228,7 +229,7 @@ async def revoke_user_sessions(
 - There is no backend e2e folder. End-to-end journeys are covered by frontend Playwright.
 - Do not test third-party libraries. Guard our own configuration of them.
 - Each new endpoint gets: happy path, validation error, auth failure (missing, invalid, expired token), not-found or conflict, and one test proving the side effect (audit row, email, cache invalidation).
-- Tests are independent. The autouse `clean_db` fixture truncates the application tables **before** each test. Use plain helper functions (`register`, `login`, `bearer`) as in the existing auth tests.
+- Tests are independent. The autouse `clean_db` fixture truncates the application tables **before** each test. Use the plain helpers in `tests/helpers.py` (`register`, `login`, `bearer`, `login_tokens`, `change_password`, `verify_email`, the `Db` SQL helper, `log_events` and so on); add a shared helper there instead of a copy in a test module.
 - Every test must fail without the change it covers. Keep the suite deterministic (no sleeps, no real network).
 - The coverage threshold is enforced by pytest-cov on the full run; do not lower it to make a PR pass.
 - ADR: [0007](documentation/adr/0007-test-split-unit-integration.md).
@@ -236,7 +237,8 @@ async def revoke_user_sessions(
 ## Definition of done
 
 - [ ] `uv run ruff check src tests run.py alembic` and `uv run ruff format --check src tests run.py alembic` pass
-- [ ] `uv run mypy` passes
+- [ ] `uv run mypy` and `uv run pyright` pass
+- [ ] The OpenAPI snapshot test passes; after an intended contract change, regenerate `tests/unit/core/openapi_snapshot.json` with `UPDATE_OPENAPI_SNAPSHOT=1` and review the diff
 - [ ] `uv run pytest` passes locally with Docker running
 - [ ] New settings added to `src/app/core/config.py`, the `.env` template and the README configuration table
 - [ ] Migration generated and reviewed if models changed; command listed in the PR description

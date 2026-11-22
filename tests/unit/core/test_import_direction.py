@@ -52,7 +52,7 @@ def _module_packages() -> list[str]:
     )
 
 
-def test_core_does_not_import_modules():
+def test_core_does_not_import_modules() -> None:
     files = sorted(CORE_DIR.rglob("*.py"))
     assert files, f"no core files found under {CORE_DIR}"
 
@@ -66,15 +66,15 @@ def test_core_does_not_import_modules():
     assert violations == []
 
 
-def test_every_module_package_is_registered_under_its_name():
+def test_every_module_package_is_registered_under_its_name() -> None:
     """The order check below needs a position for every module package."""
     assert sorted(module.name for module in MODULES) == _module_packages()
 
 
-def test_modules_import_only_modules_listed_before_them():
+def test_modules_import_only_modules_listed_before_them() -> None:
     position = {module.name: index for index, module in enumerate(MODULES)}
 
-    violations = []
+    violations: list[str] = []
     for name in _module_packages():
         package_dir = MODULES_DIR / name
         for path in sorted(package_dir.rglob("*.py")):

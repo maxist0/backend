@@ -1,48 +1,47 @@
-"""Request parsing contract across the FastAPI 0.136 -> 0.163 upgrade.
+"""How request bodies and the login form are parsed: status and error codes.
 
-Each test pins a status code and validation-error code the frontend sees.
-Before/after was measured on 2026-11-16 (FastAPI 0.136.1 vs 0.163.1); the
-docstrings name the FastAPI release whose change the test covers and whether
-the observable result changed.
+Each test pins a status code and validation-error code the frontend sees:
+explicit JSON `null` against omitted fields and bodies, and the OAuth2
+password form in the shapes browsers and Swagger send it.
 """
 
 import pytest
+from fastapi.testclient import TestClient
+from httpx2 import Response
 
-from tests.helpers import PASSWORD, bearer, login, register_ok
+from tests.helpers import (
+    PASSWORD,
+    CapturedEmails,
+    bearer,
+    register_and_login,
+    register_ok,
+)
+
+pytestmark = pytest.mark.usefixtures("captured_emails")
 
 
-@pytest.fixture(autouse=True)
-def _no_real_email_dispatch(captured_emails):
-    return captured_emails
-
-
-def _validation_errors(response) -> list[dict]:
+def _validation_errors(response: Response) -> list[dict[str, str]]:
     assert response.status_code == 422, response.text
     assert response.headers["content-type"] == "application/problem+json"
     body = response.json()
     assert body["code"] == "validation_error"
-    return body["errors"]
-
-
-def _access_token(client, username: str = "nulltest") -> str:
-    register_ok(client, username=username)
-    r = login(client, username=username)
-    assert r.status_code == 200, r.text
-    return r.json()["access_token"]
+    errors: list[dict[str, str]] = body["errors"]
+    return errors
 
 
 class TestExplicitJsonNull:
-    """FastAPI 0.151: explicit JSON null is no longer the same as an omitted value."""
+    """An explicit JSON null is validated; it is not the same as an omitted value."""
 
-    def test_patch_me_null_display_name_keeps_the_value(self, client):
-        """0.151, unchanged: ``{"display_name": null}`` -> 200, no change.
+    def test_patch_me_null_display_name_keeps_the_value(
+        self, client: TestClient
+    ) -> None:
+        """`{"display_name": null}` -> 200, no change.
 
-        The field is ``str | None`` in a Pydantic body model, so null validates
-        as None, which the service treats as "not provided". Clearing a
-        display name is therefore not possible through null (pre-existing
-        contract, not changed by the upgrade).
+        The field is `str | None` in a Pydantic body model, so null validates
+        as None, which the service treats as "not provided". A display name
+        cannot be cleared through null.
         """
-        headers = bearer(_access_token(client))
+        headers = bearer(register_and_login(client, username="nulltest"))
         assert (
             client.patch(
                 "/api/v1/users/me", json={"display_name": "Alice"}, headers=headers
@@ -57,13 +56,15 @@ class TestExplicitJsonNull:
         assert r.status_code == 200, r.text
         assert r.json()["display_name"] == "Alice"
 
-    def test_patch_me_null_email_is_an_unknown_field(self, client, captured_emails):
-        """``{"email": null}`` -> 422 ``extra_forbidden``, no mail.
+    def test_patch_me_null_email_is_an_unknown_field(
+        self, client: TestClient, captured_emails: CapturedEmails
+    ) -> None:
+        """`{"email": null}` -> 422 `extra_forbidden`, no mail.
 
         The profile update has no email field any more (`PUT /users/me/email`
         changes the address) and rejects unknown fields, null or not.
         """
-        headers = bearer(_access_token(client))
+        headers = bearer(register_and_login(client, username="nulltest"))
         mails_before = len(captured_emails)
 
         errors = _validation_errors(
@@ -75,8 +76,10 @@ class TestExplicitJsonNull:
         ]
         assert len(captured_emails) == mails_before
 
-    def test_register_with_null_optional_field_is_accepted(self, client):
-        """0.151, unchanged: optional ``display_name: null`` -> 201 with null."""
+    def test_register_with_null_optional_field_is_accepted(
+        self, client: TestClient
+    ) -> None:
+        """Optional `display_name: null` -> 201 with null."""
         r = client.post(
             "/api/v1/auth/register",
             json={
@@ -104,27 +107,30 @@ class TestExplicitJsonNull:
         ],
     )
     def test_null_for_a_required_field_is_a_type_error(
-        self, client, method, path, payload, field
-    ):
-        """0.151, unchanged: null for a required string -> 422 ``string_type``."""
+        self,
+        client: TestClient,
+        method: str,
+        path: str,
+        payload: dict[str, object] | dict[str, None],
+        field: str,
+    ) -> None:
+        """Null for a required string -> 422 `string_type`."""
         errors = _validation_errors(getattr(client, method)(path, json=payload))
 
         assert {"field": field, "code": "string_type"}.items() <= errors[0].items()
 
     @pytest.mark.parametrize("path", ["/api/v1/auth/register", "/api/v1/users/me"])
-    def test_null_as_the_whole_body_is_a_type_error(self, client, path):
-        """0.151, CHANGED: a JSON ``null`` body -> 422 ``model_attributes_type``.
+    def test_null_as_the_whole_body_is_a_type_error(
+        self, client: TestClient, path: str
+    ) -> None:
+        """A JSON `null` body -> 422 `model_attributes_type`.
 
-        Up to FastAPI 0.150 a null body counted as a missing body
-        (422, type ``missing``, message "Field required"). Now null is
-        validated against the body model and rejected as "Input should be a
-        valid dictionary or object to extract fields from". The status code
-        is unchanged; only the error code and message differ. The whole body
-        is reported as the field `body`.
+        Null is validated against the body model, not treated as a missing
+        body, and the whole body is reported as the field `body`.
         """
         headers = {"content-type": "application/json"}
         if path == "/api/v1/users/me":
-            headers |= bearer(_access_token(client))
+            headers |= bearer(register_and_login(client, username="nulltest"))
             response = client.patch(path, content="null", headers=headers)
         else:
             response = client.post(path, content="null", headers=headers)
@@ -140,9 +146,11 @@ class TestExplicitJsonNull:
             }
         ]
 
-    def test_missing_body_is_still_reported_as_missing(self, client):
-        """0.151, unchanged: no body at all -> 422 ``missing``."""
-        headers = bearer(_access_token(client))
+    def test_missing_body_is_still_reported_as_missing(
+        self, client: TestClient
+    ) -> None:
+        """No body at all -> 422 `missing`."""
+        headers = bearer(register_and_login(client, username="nulltest"))
 
         errors = _validation_errors(client.patch("/api/v1/users/me", headers=headers))
 
@@ -152,23 +160,26 @@ class TestExplicitJsonNull:
 
 
 class TestOAuth2PasswordForm:
-    """OAuth2PasswordRequestForm is a class dependency with individual Form()
-    parameters (not a form model), so the 0.147-0.162 form-model changes
-    (booleans, empty strings, defaults) leave it unchanged. All results below
-    were identical on FastAPI 0.136.1 and 0.163.1.
+    """The login form in every shape browsers and Swagger UI send.
+
+    `OAuth2PasswordRequestForm` is a class dependency with individual `Form()`
+    parameters, not a form model, so FastAPI's form-model rules for empty
+    strings and defaults do not apply to it.
     """
 
     @pytest.fixture(autouse=True)
-    def _user(self, client):
+    def _user(self, client: TestClient) -> None:
         register_ok(client, username="formuser")
 
-    def test_plain_form_logs_in(self, client):
+    def test_plain_form_logs_in(self, client: TestClient) -> None:
         r = client.post(
             "/api/v1/auth/login", data={"username": "formuser", "password": PASSWORD}
         )
         assert r.status_code == 200, r.text
 
-    def test_swagger_ui_form_with_empty_optional_fields_logs_in(self, client):
+    def test_swagger_ui_form_with_empty_optional_fields_logs_in(
+        self, client: TestClient
+    ) -> None:
         """Swagger's "Authorize" dialog sends grant_type and empty extras."""
         r = client.post(
             "/api/v1/auth/login",
@@ -183,21 +194,21 @@ class TestOAuth2PasswordForm:
         )
         assert r.status_code == 200, r.text
 
-    def test_empty_grant_type_counts_as_omitted(self, client):
+    def test_empty_grant_type_counts_as_omitted(self, client: TestClient) -> None:
         r = client.post(
             "/api/v1/auth/login",
             data={"grant_type": "", "username": "formuser", "password": PASSWORD},
         )
         assert r.status_code == 200, r.text
 
-    def test_multipart_form_logs_in(self, client):
+    def test_multipart_form_logs_in(self, client: TestClient) -> None:
         r = client.post(
             "/api/v1/auth/login",
             files={"username": (None, "formuser"), "password": (None, PASSWORD)},
         )
         assert r.status_code == 200, r.text
 
-    def test_other_grant_type_is_rejected(self, client):
+    def test_other_grant_type_is_rejected(self, client: TestClient) -> None:
         errors = _validation_errors(
             client.post(
                 "/api/v1/auth/login",
@@ -220,15 +231,17 @@ class TestOAuth2PasswordForm:
             ({}, ["username", "password"]),
         ],
     )
-    def test_empty_or_absent_credentials_are_missing(self, client, data, missing):
-        """Empty strings are treated like absent fields: 422 ``missing``."""
+    def test_empty_or_absent_credentials_are_missing(
+        self, client: TestClient, data: dict[str, str], missing: list[str]
+    ) -> None:
+        """Empty strings are treated like absent fields: 422 `missing`."""
         errors = _validation_errors(client.post("/api/v1/auth/login", data=data))
 
         assert [(e["field"], e["code"]) for e in errors] == [
             (name, "missing") for name in missing
         ]
 
-    def test_json_body_is_not_a_form(self, client):
+    def test_json_body_is_not_a_form(self, client: TestClient) -> None:
         errors = _validation_errors(
             client.post(
                 "/api/v1/auth/login",

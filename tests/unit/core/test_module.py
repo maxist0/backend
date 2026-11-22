@@ -8,7 +8,7 @@ from fastapi import APIRouter
 from app.core import Module
 
 
-def test_module_defaults():
+def test_module_defaults() -> None:
     router = APIRouter()
 
     module = Module(name="items", router=router)
@@ -17,7 +17,7 @@ def test_module_defaults():
     assert (module.models, module.tasks, module.admin_views) == (None, None, ())
 
 
-def test_module_is_frozen():
+def test_module_is_frozen() -> None:
     module = Module(name="items", router=APIRouter())
 
     with pytest.raises(dataclasses.FrozenInstanceError):

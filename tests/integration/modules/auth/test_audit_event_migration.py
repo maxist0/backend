@@ -1,5 +1,6 @@
-"""The audit event types in PostgreSQL match the model, and the migrations
-that added event types survive upgrade, downgrade and upgrade.
+"""The audit event types in PostgreSQL match the model; their migrations round-trip.
+
+The migrations that added event types survive upgrade, downgrade and upgrade.
 
 `alembic check` cannot see enum values, so the label comparison is the drift
 guard for `auditeventtype`. The round trip runs in a throwaway database of
@@ -53,7 +54,9 @@ def _alembic_config() -> Config:
 
 
 @pytest.fixture
-def scratch_db(sync_engine, monkeypatch) -> Iterator[Engine]:
+def scratch_db(
+    sync_engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[Engine]:
     """An empty database; `DATABASE_URL` points at it for Alembic."""
     name = f"migration_{uuid.uuid4().hex[:12]}"
     admin = sync_engine.execution_options(isolation_level="AUTOCOMMIT")
@@ -71,7 +74,7 @@ def scratch_db(sync_engine, monkeypatch) -> Iterator[Engine]:
             conn.execute(text(f'DROP DATABASE "{name}" WITH (FORCE)'))
 
 
-def test_database_labels_match_the_model(sync_engine):
+def test_database_labels_match_the_model(sync_engine: Engine) -> None:
     assert _labels(sync_engine) == MODEL_LABELS
 
 
@@ -93,8 +96,9 @@ def _insert_user_and_audit_rows(
             conn.execute(
                 text(
                     "INSERT INTO auth_audit_log (id, user_id, event_type, detail, "
-                    "created_at) VALUES (:id, :user_id, CAST(:label AS auditeventtype), "
-                    ":detail, now() + make_interval(secs => :position))"
+                    "created_at) VALUES (:id, :user_id, "
+                    "CAST(:label AS auditeventtype), :detail, "
+                    "now() + make_interval(secs => :position))"
                 ),
                 {
                     "id": uuid.uuid4(),
@@ -142,7 +146,7 @@ def _indexes(engine: Engine, table: str) -> set[str]:
         )
 
 
-def test_lock_notice_round_trip_keeps_every_audit_row(scratch_db):
+def test_lock_notice_round_trip_keeps_every_audit_row(scratch_db: Engine) -> None:
     cfg = _alembic_config()
     command.upgrade(cfg, "head")
     _insert_user_and_audit_rows(
@@ -173,7 +177,7 @@ def test_lock_notice_round_trip_keeps_every_audit_row(scratch_db):
     command.check(cfg)
 
 
-def test_admin_types_round_trip_keeps_every_audit_row(scratch_db):
+def test_admin_types_round_trip_keeps_every_audit_row(scratch_db: Engine) -> None:
     cfg = _alembic_config()
     command.upgrade(cfg, "head")
     _insert_user_and_audit_rows(

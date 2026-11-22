@@ -76,7 +76,7 @@ class UserAdmin(ModelView, model=User):
         User.last_login_at,
         User.failed_login_attempts,
     ]
-    column_default_sort: ClassVar = [(User.created_at, True)]
+    column_default_sort = (User.created_at, True)
     page_size = 25
     page_size_options: ClassVar = [10, 25, 50, 100]
 
@@ -152,7 +152,7 @@ class AuthAuditLogAdmin(ModelView, model=AuthAuditLog):
     ]
     column_searchable_list: ClassVar = [AuthAuditLog.ip_address, AuthAuditLog.detail]
     column_sortable_list: ClassVar = [AuthAuditLog.created_at, AuthAuditLog.event_type]
-    column_default_sort: ClassVar = [(AuthAuditLog.created_at, True)]
+    column_default_sort = (AuthAuditLog.created_at, True)
     page_size = 50
     page_size_options: ClassVar = [25, 50, 100, 200]
 
@@ -190,7 +190,7 @@ class SessionAdmin(ModelView, model=Session):
         Session.created_at,
         Session.revoked_at,
     ]
-    column_default_sort: ClassVar = [(Session.created_at, True)]
+    column_default_sort = (Session.created_at, True)
     page_size = 50
     page_size_options: ClassVar = [25, 50, 100, 200]
 

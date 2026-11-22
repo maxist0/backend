@@ -425,6 +425,8 @@ async def authenticate_user(  # noqa: PLR0912, PLR0915 - the lock checks, their 
         raise InvalidCredentialsError()
 
     locked_meanwhile = False
+    credential: PasswordCredential | None = None
+    failure: tuple[int, bool, datetime | None] | None = None
     async with login_admission_limiter():
         # Re-check after the wait: guesses evaluated meanwhile may have
         # locked the account (fresh read, not the cached User).
@@ -443,7 +445,6 @@ async def authenticate_user(  # noqa: PLR0912, PLR0915 - the lock checks, their 
             else:
                 valid = await verify_password(password, credential.password_hash)
 
-            failure: tuple[int, bool, datetime | None] | None = None
             if not valid:
                 # Atomic increment + lock in the database (no lost update),
                 # committed before the admission slot is released.

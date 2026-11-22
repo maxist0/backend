@@ -94,7 +94,13 @@ lint = [
     # new version is an explicit lint-config change, not a side effect of a relock.
     "ruff==0.17.5",
     "mypy>=1.19.1",
-    # Informational only (open decision D6); mypy is the gate.
+    # Second type gate next to mypy; the same checker as VS Code's Pylance, so
+    # editor and CLI agree. Exact pin for the same reason as ruff. The wrapper
+    # runs the npm package of the same version, downloaded on first use; the
+    # `nodejs` extra brings Node.js as a locked wheel instead of a runtime
+    # download (pyright-python README, checked 2026-11-18).
+    "pyright[nodejs]==1.1.414",
+    # Informational only (open decision D6); mypy and pyright are the gates.
     "ty>=0.0.104",
 ]
 dev = [
@@ -159,6 +165,12 @@ ignore = [
     "D101", "D102", "D103", "D107",
     "PLR2004",  # expected values in assertions are the point of a test
     "S105", "S106",  # fixed test credentials, never real secrets
+    # Imports inside a test control import-time side effects: a module that
+    # reads the environment or registers metrics when imported is imported
+    # only after the test prepared it.
+    "PLC0415",
+    "S603",  # subprocess tests run fixed argv lists (sys.executable, -c code)
+    "S608",  # SQL in fixtures and assertions is built from fixed values only
 ]
 "alembic/**" = [
     "INP001",  # Alembic loads env.py and revisions by path; not packages
@@ -204,12 +216,21 @@ extend-allowed-calls = ["sqlalchemy.orm.attributes.set_committed_value"]
 [tool.mypy]
 python_version = "3.14"
 strict = true
-# "tests" joins once the tests are fully annotated.
-files = ["src"]
+files = ["src", "tests"]
 # Beyond strict: every `# type: ignore` names its error code (house rule),
 # and calls to APIs marked deprecated (PEP 702) fail like deprecation
 # warnings do in pytest.
 enable_error_code = ["ignore-without-code", "deprecated"]
+
+[tool.pyright]
+# Second type gate (`uv run pyright`), the checker behind VS Code's Pylance,
+# which reads this section. Applied migrations in alembic/versions are never
+# edited, so they are not in scope.
+include = ["src", "tests", "run.py", "alembic/env.py"]
+pythonVersion = "3.14"
+typeCheckingMode = "strict"
+venvPath = "."
+venv = ".venv"
 
 [tool.pytest.ini_options]
 # The coverage threshold lives only in [tool.coverage.report].fail_under.
@@ -236,7 +257,7 @@ filterwarnings = [
     # cashews 7.6.0 (latest on 2026-11-16) still calls the deprecated redis-py
     # Redis.close() in backends/redis/backend.py when the cache (`close_cache`) shuts
     # down. Upstream; the app's own redis client uses aclose(). Remove together
-    # with tests/integration/core/test_upgrade_libraries.py::TestRedisPy8::
+    # with tests/integration/core/test_cache.py::TestRedisClient::
     # test_cashews_still_calls_the_deprecated_redis_close once that test fails.
     "ignore:Call to deprecated close:DeprecationWarning:cashews",
 ]

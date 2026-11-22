@@ -5,38 +5,22 @@ service nor the database layer is mocked. `captured_emails` is needed for
 register.
 """
 
-from tests.helpers import bearer, login, register
+import pytest
+from fastapi.testclient import TestClient
+
+from tests.helpers import (
+    CapturedEmails,
+    Db,
+    bearer,
+    register_and_login,
+)
 
 ME = "/api/v1/users/me"
 
 
-def register_and_login(
-    client,
-    *,
-    username: str = "alice",
-    email: str | None = None,
-    display_name: str | None = None,
-) -> str:
-    """Register a user, log in, and return the access token."""
-    if display_name is None:
-        register(client, username=username, email=email)
-    else:
-        client.post(
-            "/api/v1/auth/register",
-            json={
-                "username": username,
-                "email": email or f"{username}@example.com",
-                "password": "Password123!",
-                "display_name": display_name,
-            },
-        )
-    r = login(client, username=username)
-    assert r.status_code == 200, f"Login failed: {r.text}"
-    return r.json()["access_token"]
-
-
 class TestGetMe:
-    def test_returns_profile_when_authenticated(self, client, captured_emails):
+    @pytest.mark.usefixtures("captured_emails")
+    def test_returns_profile_when_authenticated(self, client: TestClient) -> None:
         token = register_and_login(
             client, username="alice", display_name="Alice Liddell"
         )
@@ -52,7 +36,8 @@ class TestGetMe:
         assert "id" in user
         assert "created_at" in user
 
-    def test_returns_401_without_token(self, client, captured_emails):
+    @pytest.mark.usefixtures("captured_emails")
+    def test_returns_401_without_token(self, client: TestClient) -> None:
         register_and_login(client, username="alice")
         r = client.get(ME)
 
@@ -60,7 +45,8 @@ class TestGetMe:
         assert r.headers["www-authenticate"] == "Bearer"
         assert r.json()["code"] == "unauthorized"
 
-    def test_returns_401_with_invalid_token(self, client, captured_emails):
+    @pytest.mark.usefixtures("captured_emails")
+    def test_returns_401_with_invalid_token(self, client: TestClient) -> None:
         register_and_login(client, username="alice")
         r = client.get(ME, headers=bearer("not.a.valid.token"))
 
@@ -68,29 +54,33 @@ class TestGetMe:
         assert r.headers["www-authenticate"] == "Bearer"
         assert r.json()["code"] == "unauthorized"
 
-    def test_returns_401_with_malformed_bearer_header(self, client, captured_emails):
+    @pytest.mark.usefixtures("captured_emails")
+    def test_returns_401_with_malformed_bearer_header(self, client: TestClient) -> None:
         register_and_login(client, username="alice")
         r = client.get(ME, headers={"Authorization": "Token somejunk"})
 
         assert r.status_code == 401
 
+    @pytest.mark.usefixtures("captured_emails")
     def test_profile_reflects_display_name_from_registration(
-        self, client, captured_emails
-    ):
+        self, client: TestClient
+    ) -> None:
         token = register_and_login(client, username="bob", display_name="Bob Builder")
         r = client.get(ME, headers=bearer(token))
 
         assert r.status_code == 200
         assert r.json()["display_name"] == "Bob Builder"
 
-    def test_profile_has_no_display_name_when_not_set(self, client, captured_emails):
+    @pytest.mark.usefixtures("captured_emails")
+    def test_profile_has_no_display_name_when_not_set(self, client: TestClient) -> None:
         token = register_and_login(client, username="alice")
         r = client.get(ME, headers=bearer(token))
 
         assert r.status_code == 200
         assert r.json()["display_name"] is None
 
-    def test_each_user_sees_only_their_own_profile(self, client, captured_emails):
+    @pytest.mark.usefixtures("captured_emails")
+    def test_each_user_sees_only_their_own_profile(self, client: TestClient) -> None:
         token_alice = register_and_login(client, username="alice")
         token_bob = register_and_login(client, username="bob")
 
@@ -99,7 +89,8 @@ class TestGetMe:
 
 
 class TestUpdateMe:
-    def test_update_display_name_succeeds(self, client, captured_emails):
+    @pytest.mark.usefixtures("captured_emails")
+    def test_update_display_name_succeeds(self, client: TestClient) -> None:
         token = register_and_login(client, username="alice")
         r = client.patch(
             ME, json={"display_name": "Alice Updated"}, headers=bearer(token)
@@ -108,7 +99,10 @@ class TestUpdateMe:
         assert r.status_code == 200
         assert r.json()["display_name"] == "Alice Updated"
 
-    def test_update_display_name_is_reflected_in_get_me(self, client, captured_emails):
+    @pytest.mark.usefixtures("captured_emails")
+    def test_update_display_name_is_reflected_in_get_me(
+        self, client: TestClient
+    ) -> None:
         token = register_and_login(client, username="alice")
         client.patch(
             ME, json={"display_name": "Persistent Name"}, headers=bearer(token)
@@ -117,7 +111,9 @@ class TestUpdateMe:
         r = client.get(ME, headers=bearer(token))
         assert r.json()["display_name"] == "Persistent Name"
 
-    def test_email_field_is_rejected(self, client, captured_emails, db):
+    def test_email_field_is_rejected(
+        self, client: TestClient, captured_emails: CapturedEmails, db: Db
+    ) -> None:
         """The address changes only through `PUT /users/me/email`."""
         token = register_and_login(client, username="alice")
         captured_emails.clear()
@@ -143,23 +139,26 @@ class TestUpdateMe:
         assert db.scalar("SELECT display_name FROM users") is None
         assert captured_emails == []
 
+    @pytest.mark.usefixtures("captured_emails")
     def test_empty_body_returns_200_with_unchanged_profile(
-        self, client, captured_emails
-    ):
+        self, client: TestClient
+    ) -> None:
         token = register_and_login(client, username="alice", display_name="Original")
         r = client.patch(ME, json={}, headers=bearer(token))
 
         assert r.status_code == 200
         assert r.json()["display_name"] == "Original"
 
-    def test_null_display_name_leaves_value_unchanged(self, client, captured_emails):
+    @pytest.mark.usefixtures("captured_emails")
+    def test_null_display_name_leaves_value_unchanged(self, client: TestClient) -> None:
         token = register_and_login(client, username="alice", display_name="Keep Me")
         r = client.patch(ME, json={"display_name": None}, headers=bearer(token))
 
         assert r.status_code == 200
         assert r.json()["display_name"] == "Keep Me"
 
-    def test_display_name_too_long_returns_422(self, client, captured_emails):
+    @pytest.mark.usefixtures("captured_emails")
+    def test_display_name_too_long_returns_422(self, client: TestClient) -> None:
         token = register_and_login(client, username="alice")
         r = client.patch(
             ME,
@@ -170,16 +169,18 @@ class TestUpdateMe:
         assert r.status_code == 422
         assert [e["field"] for e in r.json()["errors"]] == ["display_name"]
 
-    def test_returns_401_without_token(self, client, captured_emails):
+    @pytest.mark.usefixtures("captured_emails")
+    def test_returns_401_without_token(self, client: TestClient) -> None:
         register_and_login(client, username="alice")
         r = client.patch(ME, json={"display_name": "Hacker"})
 
         assert r.status_code == 401
         assert r.json()["code"] == "unauthorized"
 
+    @pytest.mark.usefixtures("captured_emails")
     def test_multiple_sequential_updates_are_each_persisted(
-        self, client, captured_emails
-    ):
+        self, client: TestClient
+    ) -> None:
         token = register_and_login(client, username="alice")
 
         client.patch(ME, json={"display_name": "First"}, headers=bearer(token))

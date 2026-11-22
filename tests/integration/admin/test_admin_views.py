@@ -11,32 +11,44 @@ with `can_*` False with 403, before it reads a form or a row.
 """
 
 import pytest
+from fastapi.testclient import TestClient
 
-from tests.helpers import login_tokens, register_ok
-from tests.integration.admin.test_admin_actions import admin_login, run_action
+from tests.helpers import (
+    Db,
+    admin_login,
+    login_tokens,
+    register_ok,
+    run_action,
+)
 
 # (sqladmin identity, table)
-VIEWS = [
+VIEWS: list[tuple[str, str]] = [
     ("user", "users"),
     ("auth-audit-log", "auth_audit_log"),
     ("session", "sessions"),
 ]
 
 
+# Registration sends a verification mail; record it instead of skipping it.
+pytestmark = pytest.mark.usefixtures("captured_emails")
+
+
 @pytest.fixture
-def populated_admin(client, db, captured_emails):
+def populated_admin(client: TestClient) -> TestClient:
     register_ok(client, username="adminview")
     login_tokens(client, "adminview")  # creates a session row
     admin_login(client)
     return client
 
 
-def _first_pk(db, table: str) -> str:
-    return str(db.scalar(f"SELECT id FROM {table} LIMIT 1"))  # noqa: S608 (fixed names)
+def _first_pk(db: Db, table: str) -> str:
+    return str(db.scalar(f"SELECT id FROM {table} LIMIT 1"))
 
 
 @pytest.mark.parametrize(("identity", "table"), VIEWS)
-def test_list_and_detail_pages_render(populated_admin, db, identity, table):
+def test_list_and_detail_pages_render(
+    populated_admin: TestClient, db: Db, identity: str, table: str
+) -> None:
     client = populated_admin
     pk = _first_pk(db, table)
 
@@ -49,10 +61,12 @@ def test_list_and_detail_pages_render(populated_admin, db, identity, table):
 
 
 @pytest.mark.parametrize(("identity", "table"), VIEWS)
-def test_views_refuse_create_edit_and_delete(populated_admin, db, identity, table):
+def test_views_refuse_create_edit_and_delete(
+    populated_admin: TestClient, db: Db, identity: str, table: str
+) -> None:
     client = populated_admin
     pk = _first_pk(db, table)
-    rows_before = db.rows(f"SELECT * FROM {table} ORDER BY id")  # noqa: S608
+    rows_before = db.rows(f"SELECT * FROM {table} ORDER BY id")
 
     responses = {
         "create page": client.get(f"/admin/{identity}/create"),
@@ -62,10 +76,10 @@ def test_views_refuse_create_edit_and_delete(populated_admin, db, identity, tabl
         "delete": client.delete(f"/admin/{identity}/delete", params={"pks": pk}),
     }
 
-    assert {name: r.status_code for name, r in responses.items()} == {
-        name: 403 for name in responses
-    }
-    assert db.rows(f"SELECT * FROM {table} ORDER BY id") == rows_before  # noqa: S608
+    assert {name: r.status_code for name, r in responses.items()} == dict.fromkeys(
+        responses, 403
+    )
+    assert db.rows(f"SELECT * FROM {table} ORDER BY id") == rows_before
 
 
 @pytest.mark.parametrize(
@@ -75,7 +89,7 @@ def test_views_refuse_create_edit_and_delete(populated_admin, db, identity, tabl
         "/admin/email-token/list",
     ],
 )
-def test_removed_views_are_gone(populated_admin, path):
+def test_removed_views_are_gone(populated_admin: TestClient, path: str) -> None:
     assert populated_admin.get(path).status_code == 404
 
 
@@ -86,7 +100,9 @@ def test_removed_views_are_gone(populated_admin, path):
         ("session", "revoke-all-expired"),
     ],
 )
-def test_removed_actions_are_gone(populated_admin, db, identity, slug):
+def test_removed_actions_are_gone(
+    populated_admin: TestClient, db: Db, identity: str, slug: str
+) -> None:
     pk = _first_pk(db, "sessions")
 
     r = run_action(populated_admin, identity, slug, [pk])
@@ -95,7 +111,7 @@ def test_removed_actions_are_gone(populated_admin, db, identity, slug):
     assert db.scalar("SELECT count(*) FROM sessions WHERE is_revoked") == 0
 
 
-def test_user_list_offers_the_service_actions(populated_admin):
+def test_user_list_offers_the_service_actions(populated_admin: TestClient) -> None:
     page = populated_admin.get("/admin/user/list").text
 
     for slug in (
@@ -109,7 +125,7 @@ def test_user_list_offers_the_service_actions(populated_admin):
     assert "/admin/user/create" not in page
 
 
-def test_session_detail_shows_its_user(populated_admin, db):
+def test_session_detail_shows_its_user(populated_admin: TestClient, db: Db) -> None:
     """The many-to-one relationship `Session.user` is loaded on the detail page.
 
     `User` has no reverse relationships (the users module does not depend on

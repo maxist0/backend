@@ -16,7 +16,7 @@ import hmac
 import re
 import uuid
 from collections.abc import Iterable
-from typing import override
+from typing import cast, override
 
 from fastapi import FastAPI
 from sqladmin import Admin, ModelView
@@ -119,10 +119,10 @@ def session_factory(view: ModelView) -> async_sessionmaker[AsyncSession]:
     Raises:
         TypeError: The view holds a sync factory; the panel is async only.
     """
-    factory = view.session_maker
+    factory = cast("object", view.session_maker)  # pyright: ignore[reportUnknownMemberType] - sqladmin's SESSION_MAKER alias has no type arguments
     if not isinstance(factory, async_sessionmaker):
         raise TypeError("the admin panel requires an async session factory")
-    return factory
+    return cast("async_sessionmaker[AsyncSession]", factory)
 
 
 def back_to_list(request: Request, identity: str) -> RedirectResponse:

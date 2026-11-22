@@ -1,10 +1,11 @@
 """The root endpoint answers with the API entry points."""
 
 import pytest
+from fastapi.testclient import TestClient
 
 
 @pytest.mark.root
-def test_root_lists_the_entry_points(client):
+def test_root_lists_the_entry_points(client: TestClient) -> None:
     resp = client.get("/")
 
     assert resp.status_code == 200, resp.text

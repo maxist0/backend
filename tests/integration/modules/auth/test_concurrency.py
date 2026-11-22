@@ -1,4 +1,4 @@
-"""Concurrency regression tests for the auth flows.
+"""Parallel requests on the auth flows.
 
 * `TestRevocationVersusRotation`: a revoke `UPDATE` that waits on the row lock
   of an in-flight refresh rotation must also revoke the successor session
@@ -10,8 +10,8 @@
   reaches the log.
 * `TestAccountDisabledRefresh`: `revoke_family` commits only if it found rows,
   so a retry after the denied refresh must not look like token reuse.
-
-Tests marked "GUARD" are expected green already.
+* `TestEmailTokensSingleUse`: parallel redemptions of one email token succeed
+  exactly once.
 
 Design of the rotation-versus-revocation tests (primitive-agnostic,
 deterministic, no sleeps in the code under test):
@@ -29,43 +29,46 @@ deterministic, no sleeps in the code under test):
    assertions run: the successor must be revoked as well.
 """
 
+import asyncio
 import logging
 import threading
 import time
-import traceback
-from concurrent.futures import ThreadPoolExecutor
+import uuid
+from collections.abc import Callable, Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
 
 import pytest
+from fastapi import Request
+from fastapi.testclient import TestClient
+from httpx2 import Response
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from tests.helpers import MAXIMUM_LOGIN_ATTEMPTS
+from app.core import verify_password
+from app.core.config import get_settings
+from app.modules.auth import service
+from app.modules.users import User, crud
 from tests.helpers import (
+    MAXIMUM_LOGIN_ATTEMPTS,
     PASSWORD,
+    CapturedEmails,
+    Db,
     active_session_count,
     audit_count,
     bearer,
+    change_email,
+    change_password,
+    log_text,
     login,
     login_tokens,
     register,
+    register_ok,
+    reset_password,
     run_parallel,
+    verify_email,
 )
 
 ROUNDS = 3
-
-
-def _alice(client):
-    assert register(client, username="alice").status_code == 201
-
-
-def _log_text(caplog) -> str:
-    """All log text including formatted tracebacks (they carry exception messages)."""
-    parts: list[str] = []
-    for r in caplog.records:
-        parts.append(f"{r.name} {r.msg} {r.getMessage()}")
-        if r.exc_text:
-            parts.append(r.exc_text)
-        if r.exc_info:
-            parts.append("".join(traceback.format_exception(*r.exc_info)))
-    return "\n".join(parts)
+REDEMPTION_ROUNDS = 4
 
 
 _BLOCKED_BACKENDS_SQL = (
@@ -82,16 +85,16 @@ class _RotationGate:
 
 
 @pytest.fixture
-def rotation_gate(monkeypatch):
-    import asyncio
-
-    import app.modules.auth.service as service
-
+def rotation_gate(monkeypatch: pytest.MonkeyPatch) -> Iterator[_RotationGate]:
     original = service.create_session_tokens
     gate = _RotationGate()
 
-    async def gated(*args, **kwargs):
-        family_id = kwargs.get("family_id", args[3] if len(args) > 3 else None)
+    async def gated(
+        db: AsyncSession,
+        user: User,
+        request: Request | None = None,
+        family_id: uuid.UUID | None = None,
+    ) -> tuple[str, str]:
         if family_id is not None and gate.armed:  # refresh path, not login
             gate.armed = False
             gate.reached.set()
@@ -99,14 +102,14 @@ def rotation_gate(monkeypatch):
                 None, gate.release.wait, 30
             )
             assert released, "rotation gate was never released"
-        return await original(*args, **kwargs)
+        return await original(db, user, request, family_id)
 
     monkeypatch.setattr(service, "create_session_tokens", gated)
     yield gate
     gate.release.set()  # never leave a request hanging if the test aborted
 
 
-def _refresh_raw(client, refresh_token: str):
+def _refresh_raw(client: TestClient, refresh_token: str) -> tuple[Response, str | None]:
     """POST /auth/refresh; returns (response, new refresh token or None).
 
     Reads the new token from the response itself, not from the shared cookie
@@ -118,7 +121,9 @@ def _refresh_raw(client, refresh_token: str):
     return r, r.cookies.get("refresh_token") if r.status_code == 200 else None
 
 
-def _wait_until_a_backend_is_blocked(db, future, timeout: float = 20.0) -> bool:
+def _wait_until_a_backend_is_blocked(
+    db: Db, future: Future[Response], timeout: float = 20.0
+) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if future.done():
@@ -129,7 +134,13 @@ def _wait_until_a_backend_is_blocked(db, future, timeout: float = 20.0) -> bool:
     return False
 
 
-def _race_revocation_against_rotation(client, db, gate, refresh_token, revoke):
+def _race_revocation_against_rotation(
+    client: TestClient,
+    db: Db,
+    gate: _RotationGate,
+    refresh_token: str,
+    revoke: Callable[[], Response],
+) -> tuple[Response, str | None, Response]:
     """Pause a refresh mid-rotation, start `revoke`, then let the refresh commit."""
     with ThreadPoolExecutor(max_workers=2) as pool:
         refresh_future = pool.submit(_refresh_raw, client, refresh_token)
@@ -150,10 +161,11 @@ def _race_revocation_against_rotation(client, db, gate, refresh_token, revoke):
 
 
 class TestRevocationVersusRotation:
+    @pytest.mark.usefixtures("captured_emails")
     def test_logout_all_during_rotation_revokes_the_successor_too(
-        self, client, captured_emails, db, rotation_gate
-    ):
-        _alice(client)
+        self, client: TestClient, db: Db, rotation_gate: _RotationGate
+    ) -> None:
+        register_ok(client, username="alice")
         t0 = login_tokens(client, "alice")
 
         refresh_r, successor, revoke_r = _race_revocation_against_rotation(
@@ -164,15 +176,20 @@ class TestRevocationVersusRotation:
             lambda: client.post("/api/v1/auth/logout-all", headers=bearer(t0.access)),
         )
 
-        assert refresh_r.status_code == 200 and successor, refresh_r.text
+        assert refresh_r.status_code == 200, refresh_r.text
+        assert successor
         assert revoke_r.status_code == 204, revoke_r.text
         assert active_session_count(db, "alice") == 0
         assert _refresh_raw(client, successor)[0].status_code == 401
 
     def test_password_reset_during_rotation_revokes_the_successor_too(
-        self, client, captured_emails, db, rotation_gate
-    ):
-        _alice(client)
+        self,
+        client: TestClient,
+        captured_emails: CapturedEmails,
+        db: Db,
+        rotation_gate: _RotationGate,
+    ) -> None:
+        register_ok(client, username="alice")
         t0 = login_tokens(client, "alice")
         client.post("/api/v1/auth/password/forgot", json={"email": "alice@example.com"})
         reset_token = captured_emails.latest_token("alice@example.com", "reset")
@@ -182,21 +199,20 @@ class TestRevocationVersusRotation:
             db,
             rotation_gate,
             t0.refresh,
-            lambda: client.post(
-                "/api/v1/auth/password/reset",
-                json={"token": reset_token, "new_password": "NewPassword456!"},
-            ),
+            lambda: reset_password(client, reset_token, "NewPassword456!"),
         )
 
-        assert refresh_r.status_code == 200 and successor, refresh_r.text
+        assert refresh_r.status_code == 200, refresh_r.text
+        assert successor
         assert revoke_r.status_code == 204, revoke_r.text
         assert active_session_count(db, "alice") == 0
         assert _refresh_raw(client, successor)[0].status_code == 401
 
+    @pytest.mark.usefixtures("captured_emails")
     def test_change_password_during_rotation_revokes_the_successor_of_other_session(
-        self, client, captured_emails, db, rotation_gate
-    ):
-        _alice(client)
+        self, client: TestClient, db: Db, rotation_gate: _RotationGate
+    ) -> None:
+        register_ok(client, username="alice")
         rotating = login_tokens(client, "alice")
         caller = login_tokens(client, "alice")
 
@@ -205,25 +221,22 @@ class TestRevocationVersusRotation:
             db,
             rotation_gate,
             rotating.refresh,
-            lambda: client.put(
-                "/api/v1/users/me/password",
-                json={"current_password": PASSWORD, "new_password": "NewSecure456!"},
-                headers=bearer(caller.access),
-            ),
+            lambda: change_password(client, caller.access),
         )
 
-        assert refresh_r.status_code == 200 and successor, refresh_r.text
+        assert refresh_r.status_code == 200, refresh_r.text
+        assert successor
         assert revoke_r.status_code == 204, revoke_r.text
         assert _refresh_raw(client, successor)[0].status_code == 401
         # only the calling session survives
         assert active_session_count(db, "alice") == 1
 
+    @pytest.mark.usefixtures("captured_emails")
     def test_replay_during_rotation_revokes_the_successor(
-        self, client, captured_emails, db, rotation_gate
-    ):
-        """GUARD: the reuse path (revoke_family) re-reads after the rotation commit.
-        Must stay green once the revocation primitives get their user lock."""
-        _alice(client)
+        self, client: TestClient, db: Db, rotation_gate: _RotationGate
+    ) -> None:
+        """The reuse path (`revoke_family`) re-reads after the rotation commit."""
+        register_ok(client, username="alice")
         t0 = login_tokens(client, "alice")
 
         refresh_r, successor, replay_r = _race_revocation_against_rotation(
@@ -234,18 +247,36 @@ class TestRevocationVersusRotation:
             lambda: _refresh_raw(client, t0.refresh)[0],
         )
 
-        assert refresh_r.status_code == 200 and successor, refresh_r.text
+        assert refresh_r.status_code == 200, refresh_r.text
+        assert successor
         assert replay_r.status_code == 401
         assert active_session_count(db, "alice") == 0
         assert _refresh_raw(client, successor)[0].status_code == 401
 
 
+class _LoginBurstSpy:
+    """Counters of the password evaluations during one login burst."""
+
+    def __init__(self) -> None:
+        self.wrong = self.correct = self.arrived = self.burst = 0
+        self.all_arrived = threading.Event()
+
+    def expect_burst(self, size: int) -> None:
+        """Reset the counters right before a burst of `size` logins.
+
+        Registration also calls the lookup, so reset after the setup.
+        """
+        self.wrong = self.correct = self.arrived = 0
+        self.burst = size
+        self.all_arrived.clear()
+
+
 @pytest.fixture
-def verify_spy(monkeypatch, db):
+def verify_spy(monkeypatch: pytest.MonkeyPatch, db: Db) -> _LoginBurstSpy:
     """Make a login burst deterministic and count the password evaluations.
 
     * Every request is held after the initial lock check until the whole burst
-      has passed it (``burst`` requests have returned from the user lookup), so
+      has passed it (`burst` requests have returned from the user lookup), so
       all of them see an unlocked account, as in a real burst that arrives
       faster than one Argon2 verify takes. The wait has a timeout and then
       proceeds, so a renamed lookup cannot hang the test.
@@ -254,28 +285,10 @@ def verify_spy(monkeypatch, db):
       guesses locked the account.
     The real Argon2 verify still runs behind the spy.
     """
-    import asyncio
-
-    import app.modules.auth.service as service
-    from app.modules.users import crud
-
-    original_verify = service.verify_password
     original_lookup = crud.get_user_by_username
+    state = _LoginBurstSpy()
 
-    class _State:
-        wrong = correct = arrived = burst = 0
-        all_arrived = threading.Event()
-
-        def expect_burst(self, size: int) -> None:
-            """Reset the counters right before a burst of `size` logins
-            (registration also calls the lookup, so reset after the setup)."""
-            self.wrong = self.correct = self.arrived = 0
-            self.burst = size
-            self.all_arrived.clear()
-
-    state = _State()
-
-    async def lookup(db_session, username):
+    async def lookup(db_session: AsyncSession, username: str) -> User | None:
         user = await original_lookup(db_session, username)
         state.arrived += 1  # no await between this and the caller's lock check
         if state.arrived >= state.burst:
@@ -298,7 +311,7 @@ def verify_spy(monkeypatch, db):
             await loop.run_in_executor(None, _wait_until_locked)
         else:
             state.wrong += 1
-        return await original_verify(password, password_hash)
+        return await verify_password(password, password_hash)
 
     monkeypatch.setattr(crud, "get_user_by_username", lookup)
     monkeypatch.setattr(service, "verify_password", spy)
@@ -306,12 +319,14 @@ def verify_spy(monkeypatch, db):
 
 
 class TestLoginBurst:
+    @pytest.mark.usefixtures("captured_emails")
     def test_burst_at_the_threshold_evaluates_few_guesses_and_never_logs_in(
-        self, client, captured_emails, db, verify_spy
-    ):
-        """30 parallel logins at attempts=4, one with the correct password, all
-        past the initial lock check before the first verify finishes.
+        self, client: TestClient, db: Db, verify_spy: _LoginBurstSpy
+    ) -> None:
+        """30 parallel logins at the last attempt evaluate few guesses, log none in.
 
+        One login has the correct password; all pass the initial lock check
+        before the first verify finishes.
         Once the lock is set no login may succeed, and the number of evaluated
         wrong guesses must stay near the threshold instead of the burst size.
         Allowed: the one guess that locks the account plus the evaluations that
@@ -320,11 +335,9 @@ class TestLoginBurst:
         after the Argon2 slot wait (or the attempt to be reserved atomically
         before the verify) plus the conditional success UPDATE.
         """
-        from app.core.config import get_settings
-
         settings = get_settings()
 
-        _alice(client)
+        register_ok(client, username="alice")
         burst, correct_index = 30, 0
         allowed_evaluations = 1 + 2 * settings.PASSWORD_HASH_CONCURRENCY
 
@@ -348,8 +361,10 @@ class TestLoginBurst:
 
             assert verify_spy.wrong <= allowed_evaluations, (
                 round_no,
-                f"{verify_spy.wrong} wrong guesses were evaluated "
-                f"(allowed {allowed_evaluations})",
+                (
+                    f"{verify_spy.wrong} wrong guesses were evaluated "
+                    f"(allowed {allowed_evaluations})"
+                ),
             )
             statuses = sorted(r.status_code for r in results)
             assert statuses == [401] * burst, (round_no, statuses)
@@ -360,12 +375,16 @@ class TestLoginBurst:
             assert row["is_locked"] is True, (round_no, dict(row))
             assert row["failed_login_attempts"] >= MAXIMUM_LOGIN_ATTEMPTS
 
+    @pytest.mark.usefixtures("captured_emails")
     def test_correct_password_after_the_lock_never_creates_a_session(
-        self, client, captured_emails, db, verify_spy
-    ):
-        """The correct password is evaluated while the account is already locked
-        (held by the spy): the success path must re-check and refuse."""
-        _alice(client)
+        self, client: TestClient, db: Db, verify_spy: _LoginBurstSpy
+    ) -> None:
+        """The success path re-checks the lock before it creates a session.
+
+        The spy holds the correct password's evaluation until the other
+        guesses have locked the account.
+        """
+        register_ok(client, username="alice")
         db.execute(
             "UPDATE users SET failed_login_attempts = :n WHERE username = 'alice'",
             n=MAXIMUM_LOGIN_ATTEMPTS - 1,
@@ -390,20 +409,28 @@ class TestLoginBurst:
 class TestConcurrentRegistration:
     @pytest.mark.parametrize("duplicate", ["email", "username"])
     def test_parallel_duplicate_registration_yields_one_201_and_no_500(
-        self, client, captured_emails, db, caplog, duplicate
-    ):
+        self,
+        client: TestClient,
+        captured_emails: CapturedEmails,
+        db: Db,
+        caplog: pytest.LogCaptureFixture,
+        duplicate: str,
+    ) -> None:
         caplog.set_level(logging.DEBUG)
         racers = 8
         for round_no in range(ROUNDS):
             shared_email = f"race{round_no}.mail@example.com"
             shared_name = f"racer{round_no}x"
 
-            def _register(i: int, _e=shared_email, _n=shared_name):
+            def _register(
+                i: int,
+                prefix: str = f"u{round_no}n",
+                email: str = shared_email,
+                name: str = shared_name,
+            ) -> Response:
                 if duplicate == "email":
-                    return register(client, username=f"u{round_no}n{i}", email=_e)
-                return register(
-                    client, username=_n, email=f"u{round_no}n{i}@example.com"
-                )
+                    return register(client, username=f"{prefix}{i}", email=email)
+                return register(client, username=name, email=f"{prefix}{i}@example.com")
 
             results = run_parallel(racers, _register)
 
@@ -433,36 +460,36 @@ class TestConcurrentRegistration:
                     == 1
                 )
 
-        text = _log_text(caplog)
+        text = log_text(caplog)
         assert caplog.records, "no log records captured; test is not observing logs"
         assert "race0.mail@example.com" not in text
         assert "racer0x" not in text
         assert "DETAIL" not in text, "raw database error text reached the logs"
 
     def test_email_change_confirmation_racing_a_registration_never_fails_with_500(
-        self, client, captured_emails, db, caplog
-    ):
-        """Confirming an email change while the address is being registered:
-        exactly one account gets it; the loser gets 409 (pre-check or unique
-        constraint), never a 500, and the address never reaches the logs."""
+        self,
+        client: TestClient,
+        captured_emails: CapturedEmails,
+        db: Db,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """An email change confirmed while the address is being registered.
+
+        Exactly one account gets it; the loser gets 409 (pre-check or unique
+        constraint), never a 500, and the address never reaches the logs.
+        """
         caplog.set_level(logging.DEBUG)
-        _alice(client)
+        register_ok(client, username="alice")
         token = login_tokens(client, "alice").access
         shared = "contested.mail@example.com"
-        r = client.put(
-            "/api/v1/users/me/email",
-            json={"current_password": PASSWORD, "new_email": shared},
-            headers=bearer(token),
-        )
+        r = change_email(client, token, shared)
         assert r.status_code == 202, r.text
         change_token = captured_emails.latest_token(shared, "change_email")
 
-        def _act(i: int):
+        def _act(i: int) -> Response:
             if i == 0:
                 return register(client, username="bob", email=shared)
-            return client.post(
-                "/api/v1/auth/email/verify", json={"token": change_token}
-            )
+            return verify_email(client, change_token)
 
         results = run_parallel(2, _act)
         client.cookies.clear()
@@ -470,7 +497,7 @@ class TestConcurrentRegistration:
         statuses = sorted(r.status_code for r in results)
         assert statuses in ([201, 409], [204, 409]), statuses
         assert db.scalar("SELECT count(*) FROM users WHERE email = :e", e=shared) == 1
-        assert shared not in _log_text(caplog)
+        assert shared not in log_text(caplog)
 
 
 _DISABLE = {
@@ -480,14 +507,21 @@ _DISABLE = {
 
 
 class TestAccountDisabledRefresh:
+    @pytest.mark.usefixtures("captured_emails")
     @pytest.mark.parametrize("disable_sql", _DISABLE.values(), ids=_DISABLE.keys())
     def test_retry_after_denied_refresh_is_not_reported_as_token_reuse(
-        self, client, captured_emails, db, caplog, disable_sql
-    ):
-        """Only session of a disabled account: the denied refresh ends it, and a
-        retry with the same cookie is a plain 401, not a theft signal."""
+        self,
+        client: TestClient,
+        db: Db,
+        caplog: pytest.LogCaptureFixture,
+        disable_sql: str,
+    ) -> None:
+        """A retry after a denied refresh is a plain 401, not a theft signal.
+
+        The only session of a disabled account ends with the denied refresh.
+        """
         caplog.set_level(logging.DEBUG)
-        _alice(client)
+        register_ok(client, username="alice")
         t0 = login_tokens(client, "alice")
         db.execute(f"UPDATE users SET {disable_sql} WHERE username = 'alice'")
 
@@ -507,20 +541,27 @@ class TestAccountDisabledRefresh:
             )
             == 0
         )
-        assert "auth.token_reuse_detected" not in _log_text(caplog)
+        assert "auth.token_reuse_detected" not in log_text(caplog)
 
+    @pytest.mark.usefixtures("captured_emails")
     @pytest.mark.parametrize("disable_sql", _DISABLE.values(), ids=_DISABLE.keys())
     def test_denied_refresh_persists_the_revocation_without_the_audit_write(
-        self, client, captured_emails, db, monkeypatch, disable_sql
-    ):
-        """revoke_family must commit on its own: today the rotation is only
-        persisted as a side effect of the audit insert that follows it.
-        `_audit` is stubbed to isolate exactly that commit path."""
-        _alice(client)
+        self,
+        client: TestClient,
+        db: Db,
+        monkeypatch: pytest.MonkeyPatch,
+        disable_sql: str,
+    ) -> None:
+        """`revoke_family` commits the revocation on its own.
+
+        `_audit` is stubbed, so no later audit insert can commit it as a side
+        effect.
+        """
+        register_ok(client, username="alice")
         t0 = login_tokens(client, "alice")
         db.execute(f"UPDATE users SET {disable_sql} WHERE username = 'alice'")
 
-        async def _no_audit(*_args, **_kwargs) -> None:
+        async def _no_audit(*_args: object, **_kwargs: object) -> None:
             return None
 
         monkeypatch.setattr("app.modules.auth.service._audit", _no_audit)
@@ -530,3 +571,65 @@ class TestAccountDisabledRefresh:
 
         assert r.status_code == 401
         assert db.scalar("SELECT count(*) FROM sessions WHERE NOT is_revoked") == 0
+
+
+class TestEmailTokensSingleUse:
+    def test_parallel_redemption_of_reset_token_succeeds_exactly_once(
+        self, client: TestClient, captured_emails: CapturedEmails, db: Db
+    ) -> None:
+        register_ok(client, username="alice")
+        for round_no in range(REDEMPTION_ROUNDS):
+            client.post(
+                "/api/v1/auth/password/forgot", json={"email": "alice@example.com"}
+            )
+            token = captured_emails.latest_token("alice@example.com", "reset")
+
+            def _redeem(i: int, token: str = token) -> Response:
+                return reset_password(client, token, f"ParallelPass{i}!")
+
+            results = run_parallel(8, _redeem)
+
+            statuses = sorted(r.status_code for r in results)
+            assert statuses.count(204) == 1, (round_no, statuses)
+            assert statuses.count(400) == 7, (round_no, statuses)
+        assert audit_count(db, "password_reset_completed", "alice") == REDEMPTION_ROUNDS
+
+    def test_parallel_redemption_of_verify_token_succeeds_exactly_once(
+        self, client: TestClient, captured_emails: CapturedEmails, db: Db
+    ) -> None:
+        for round_no in range(REDEMPTION_ROUNDS):
+            name = f"user{round_no}"
+            register(client, username=name)
+            token = captured_emails.latest_token(f"{name}@example.com", "verify")
+
+            def _verify(_i: int, token: str = token) -> Response:
+                return verify_email(client, token)
+
+            results = run_parallel(8, _verify)
+
+            statuses = sorted(r.status_code for r in results)
+            assert statuses.count(204) == 1, (round_no, statuses)
+            assert statuses.count(400) == 7, (round_no, statuses)
+        assert audit_count(db, "email_verified") == REDEMPTION_ROUNDS
+
+    def test_parallel_redemption_of_email_change_token_succeeds_exactly_once(
+        self, client: TestClient, captured_emails: CapturedEmails, db: Db
+    ) -> None:
+        register_ok(client, username="alice")
+        t = login_tokens(client, "alice")
+        for round_no in range(REDEMPTION_ROUNDS):
+            new_email = f"alice{round_no}@example.org"
+            r = change_email(client, t.access, new_email)
+            assert r.status_code == 202, r.text
+            token = captured_emails.latest_token(new_email, "change_email")
+
+            def _verify(_i: int, token: str = token) -> Response:
+                return verify_email(client, token)
+
+            results = run_parallel(8, _verify)
+
+            statuses = sorted(r.status_code for r in results)
+            assert statuses.count(204) == 1, (round_no, statuses)
+            assert statuses.count(400) == 7, (round_no, statuses)
+            assert db.scalar("SELECT email FROM users") == new_email
+        assert audit_count(db, "email_changed", "alice") == REDEMPTION_ROUNDS

@@ -1,7 +1,5 @@
 """Startup guard, admin opt-in and Argon2 bounds, all decided at `Settings` time.
 
-Target contract:
-
 * `Settings(...)` raises (`ValueError`, pydantic `ValidationError` or
   `RuntimeError`) when ENVIRONMENT is not dev/unittest and JWT_SECRET_KEY,
   ADMIN_PASSWORD or ADMIN_SECRET_KEY is still the code default, or
@@ -18,7 +16,7 @@ import sys
 
 import pytest
 
-from tests.helpers import BACKEND_DIR
+from tests.helpers import BACKEND_DIR, SettingsFactory
 
 STRONG = {
     "JWT_SECRET_KEY": "k" * 48,
@@ -39,8 +37,8 @@ class TestStartupGuard:
         "unset", ["JWT_SECRET_KEY", "ADMIN_PASSWORD", "ADMIN_SECRET_KEY"]
     )
     def test_default_secret_outside_dev_refuses_to_start(
-        self, settings_factory, env, unset
-    ):
+        self, settings_factory: SettingsFactory, env: str, unset: str
+    ) -> None:
         kwargs = {
             k: v for k, v in STRONG.items() if k != unset
         }  # `unset` keeps its default
@@ -51,8 +49,12 @@ class TestStartupGuard:
     @pytest.mark.parametrize("env", ["prod", "stage", "test"])
     @pytest.mark.parametrize("admin_enabled", [False, None], ids=["false", "unset"])
     def test_admin_disabled_with_default_admin_secrets_starts(
-        self, settings_factory, env, admin_enabled
-    ):
+        self,
+        settings_factory: SettingsFactory,
+        env: str,
+        *,
+        admin_enabled: bool | None,
+    ) -> None:
         """Admin secrets are only checked when the admin is enabled."""
         # An explicit None overrides the process-wide ADMIN_ENABLED=true of conftest.
         s = settings_factory(
@@ -66,8 +68,8 @@ class TestStartupGuard:
 
     @pytest.mark.parametrize("env", ["prod", "stage", "test"])
     def test_admin_disabled_still_requires_strong_jwt_secret(
-        self, settings_factory, env
-    ):
+        self, settings_factory: SettingsFactory, env: str
+    ) -> None:
         with pytest.raises((ValueError, RuntimeError)):
             settings_factory(ENVIRONMENT=env, ADMIN_ENABLED=False)
 
@@ -75,14 +77,16 @@ class TestStartupGuard:
         "unset", ["JWT_SECRET_KEY", "ADMIN_PASSWORD", "ADMIN_SECRET_KEY"]
     )
     def test_explicitly_passing_the_default_value_is_also_refused(
-        self, settings_factory, unset
-    ):
+        self, settings_factory: SettingsFactory, unset: str
+    ) -> None:
         kwargs = dict(STRONG, **{unset: DEFAULTS[unset]})
 
         with pytest.raises((ValueError, RuntimeError)):
             settings_factory(ENVIRONMENT="prod", ADMIN_ENABLED=True, **kwargs)
 
-    def test_short_jwt_secret_outside_dev_refuses_to_start(self, settings_factory):
+    def test_short_jwt_secret_outside_dev_refuses_to_start(
+        self, settings_factory: SettingsFactory
+    ) -> None:
         with pytest.raises((ValueError, RuntimeError)):
             settings_factory(
                 ENVIRONMENT="prod", **dict(STRONG, JWT_SECRET_KEY="k" * 31)
@@ -91,14 +95,16 @@ class TestStartupGuard:
     @pytest.mark.parametrize("name", ["ADMIN_PASSWORD", "ADMIN_SECRET_KEY"])
     @pytest.mark.parametrize("env", ["prod", "stage", "test"])
     def test_short_admin_secret_with_admin_enabled_refuses_to_start(
-        self, settings_factory, env, name
-    ):
+        self, settings_factory: SettingsFactory, env: str, name: str
+    ) -> None:
         with pytest.raises((ValueError, RuntimeError), match=f"{name} is shorter"):
             settings_factory(
                 ENVIRONMENT=env, ADMIN_ENABLED=True, **dict(STRONG, **{name: "x" * 31})
             )
 
-    def test_admin_secrets_of_32_characters_start(self, settings_factory):
+    def test_admin_secrets_of_32_characters_start(
+        self, settings_factory: SettingsFactory
+    ) -> None:
         s = settings_factory(
             ENVIRONMENT="prod",
             ADMIN_ENABLED=True,
@@ -106,7 +112,9 @@ class TestStartupGuard:
         )
         assert s.admin_enabled is True
 
-    def test_prod_with_strong_secrets_starts(self, settings_factory):
+    def test_prod_with_strong_secrets_starts(
+        self, settings_factory: SettingsFactory
+    ) -> None:
         s = settings_factory(ENVIRONMENT="prod", **STRONG)
         assert s.is_production
 
@@ -121,10 +129,13 @@ class TestStartupGuard:
         ids=["unset", "default", "http"],
     )
     def test_frontend_url_outside_dev_must_be_https_and_not_the_default(
-        self, settings_factory, env, frontend_url, problem
-    ):
-        """Email links carry tokens: they must not point at a dev server or
-        travel over plain http."""
+        self,
+        settings_factory: SettingsFactory,
+        env: str,
+        frontend_url: str | None,
+        problem: str,
+    ) -> None:
+        """Email links carry tokens: no dev server, no plain http."""
         kwargs = {k: v for k, v in STRONG.items() if k != "FRONTEND_URL"}
         if frontend_url is not None:
             kwargs["FRONTEND_URL"] = frontend_url
@@ -134,19 +145,23 @@ class TestStartupGuard:
 
     @pytest.mark.parametrize("env", ["dev", "unittest"])
     def test_defaults_are_still_allowed_in_dev_and_unittest(
-        self, settings_factory, env
-    ):
-        """GUARD: local development and the test suite keep working."""
+        self, settings_factory: SettingsFactory, env: str
+    ) -> None:
+        """Local development and the test suite keep working."""
         assert settings_factory(ENVIRONMENT=env).ENVIRONMENT.value == env
 
-    def test_secrets_are_not_exposed_by_repr_or_str(self, settings_factory):
+    def test_secrets_are_not_exposed_by_repr_or_str(
+        self, settings_factory: SettingsFactory
+    ) -> None:
         s = settings_factory(**STRONG)
         text = repr(s) + str(s)
         for name, value in STRONG.items():
             if name != "FRONTEND_URL":  # not a secret
                 assert value not in text
 
-    def test_default_secrets_are_not_exposed_by_repr(self, settings_factory):
+    def test_default_secrets_are_not_exposed_by_repr(
+        self, settings_factory: SettingsFactory
+    ) -> None:
         text = repr(settings_factory())
         for value in (DEFAULTS["JWT_SECRET_KEY"], DEFAULTS["ADMIN_SECRET_KEY"]):
             assert value not in text
@@ -164,7 +179,8 @@ def _admin_status_in_subprocess(env_overrides: dict[str, str | None]) -> list[in
         "from fastapi.testclient import TestClient\n"
         "from app.main import app\n"
         "c = TestClient(app, follow_redirects=False)\n"
-        "print('STATUS', c.get('/admin/login').status_code, c.get('/admin/').status_code)\n"
+        "login, root = c.get('/admin/login'), c.get('/admin/')\n"
+        "print('STATUS', login.status_code, root.status_code)\n"
     )
     env = dict(os.environ)
     for key, value in env_overrides.items():
@@ -179,6 +195,7 @@ def _admin_status_in_subprocess(env_overrides: dict[str, str | None]) -> list[in
         capture_output=True,
         text=True,
         timeout=120,
+        check=False,
     )
     match = re.search(r"STATUS (\d+) (\d+)", proc.stdout)
     assert match, f"subprocess failed:\n{proc.stdout[-500:]}\n{proc.stderr[-1500:]}"
@@ -186,17 +203,17 @@ def _admin_status_in_subprocess(env_overrides: dict[str, str | None]) -> list[in
 
 
 class TestAdminOptIn:
-    def test_admin_is_not_mounted_when_admin_enabled_is_false(self):
+    def test_admin_is_not_mounted_when_admin_enabled_is_false(self) -> None:
         statuses = _admin_status_in_subprocess({"ADMIN_ENABLED": "false"})
         assert statuses == [404, 404]
 
-    def test_admin_is_not_mounted_by_default_outside_dev(self):
+    def test_admin_is_not_mounted_by_default_outside_dev(self) -> None:
         """ADMIN_ENABLED unset: true only in dev. ENVIRONMENT here is unittest."""
         statuses = _admin_status_in_subprocess({"ADMIN_ENABLED": None})
         assert statuses == [404, 404]
 
-    def test_admin_is_mounted_when_explicitly_enabled(self):
-        """GUARD (control): the 404 above is caused by the flag, not by a broken import."""
+    def test_admin_is_mounted_when_explicitly_enabled(self) -> None:
+        """Control: the 404 above is caused by the flag, not by a broken import."""
         statuses = _admin_status_in_subprocess({"ADMIN_ENABLED": "true"})
         assert 404 not in statuses
 
@@ -216,12 +233,14 @@ class TestPasswordHashSettings:
         ],
         ids=lambda o: "-".join(f"{k}={v}" for k, v in o.items()),
     )
-    def test_value_below_the_bound_is_rejected(self, settings_factory, env, override):
-        with pytest.raises(ValueError):
+    def test_value_below_the_bound_is_rejected(
+        self, settings_factory: SettingsFactory, env: str, override: dict[str, int]
+    ) -> None:
+        with pytest.raises(ValueError, match=next(iter(override))):
             settings_factory(ENVIRONMENT=env, ADMIN_ENABLED=True, **STRONG, **override)
 
-    def test_owasp_minimum_is_accepted(self, settings_factory):
-        """GUARD (control): the rejections above are caused by the bound only."""
+    def test_owasp_minimum_is_accepted(self, settings_factory: SettingsFactory) -> None:
+        """Control: the rejections above are caused by the bound only."""
         s = settings_factory(
             ARGON2_TIME_COST=2,
             ARGON2_MEMORY_KIB=19456,
@@ -234,13 +253,13 @@ class TestPasswordHashSettings:
             1,
         )
 
-    def test_defaults_are_accepted(self, settings_factory):
-        """GUARD: the shipped defaults must satisfy their own bounds."""
+    def test_defaults_are_accepted(self, settings_factory: SettingsFactory) -> None:
+        """The shipped defaults must satisfy their own bounds."""
         settings_factory()
 
 
 class TestHarness:
-    def test_settings_object_is_the_unittest_one(self):
+    def test_settings_object_is_the_unittest_one(self) -> None:
         """No imported module may replace the settings with the dev ones."""
         from app.core.config import get_settings
 

@@ -1,19 +1,23 @@
-"""Security notices: the account-locked mail and the notices to the old
-address of an email change.
+"""Security notices: the account-locked mail and the email-change notices.
 
-The tasks run for real: in-process for the `client` fixture, so a request
-returns after its notice task ran; through the Redis stream for the
+The email-change notices go to the old address. The tasks run for real:
+in-process for the `client` fixture, so a request returns after its notice
+task ran; through the Redis stream for the
 transport tests, where no worker consumes the entries.
 """
 
 import json
 import logging
-import os
 import uuid
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+from typing import Any, Never
 
 import pytest
-import redis as redis_sync
+from fastapi.testclient import TestClient
+from httpx2 import Response
+from sqlalchemy.ext.asyncio import AsyncSession
+from taskiq import BrokerMessage
 
 from app.core.security import hash_token
 from app.core.tasks import TASK_STREAM
@@ -26,19 +30,25 @@ from app.modules.auth.tasks import (
 )
 from tests.helpers import (
     MAXIMUM_LOGIN_ATTEMPTS,
-    PASSWORD,
+    PII_EMAIL,
+    PII_USERNAME,
+    CapturedEmails,
+    CapturingMailer,
+    Db,
+    app_of,
+    assert_nothing_personal_in_redis,
     audit_count,
-    bearer,
+    call_in_app,
+    change_email,
+    change_password,
+    log_events,
     login,
     login_tokens,
+    redis_from_env,
     register_ok,
+    run_task,
     user_id_of,
-)
-from tests.integration.conftest import CapturedEmails, CapturingMailer, run_task
-from tests.integration.modules.auth.test_token_emails import (
-    ZEBRA_MAIL,
-    ZEBRA_USER,
-    _assert_nothing_personal_in_redis,
+    verify_email,
 )
 
 OLD_MAIL = "alice@example.com"
@@ -46,23 +56,15 @@ NEW_MAIL = "new.alice@example.com"
 NOTICE_SENT = "account_locked_notice_sent"
 
 
-def _events(caplog, name: str) -> list[dict]:
-    return [
-        r.msg
-        for r in caplog.records
-        if isinstance(r.msg, dict) and r.msg.get("event") == name
-    ]
-
-
-def _not_sent_reasons(caplog, purpose: str) -> list[str]:
+def _not_sent_reasons(caplog: pytest.LogCaptureFixture, purpose: str) -> list[str]:
     return [
         e["reason"]
-        for e in _events(caplog, "email.not_sent")
+        for e in log_events(caplog, "email.not_sent")
         if e.get("purpose") == purpose
     ]
 
 
-def _register_verified(client, db, username: str = "alice") -> None:
+def _register_verified(client: TestClient, db: Db, username: str = "alice") -> None:
     """Register; mark the address verified, as notices need (no token mail)."""
     register_ok(client, username=username)
     db.execute(
@@ -70,7 +72,7 @@ def _register_verified(client, db, username: str = "alice") -> None:
     )
 
 
-def _lock_by_login(client, username: str = "alice") -> list:
+def _lock_by_login(client: TestClient, username: str = "alice") -> list[Response]:
     """Send wrong passwords until the timed lock is set; return the answers."""
     return [
         login(client, username=username, password="wrong-password")
@@ -78,7 +80,7 @@ def _lock_by_login(client, username: str = "alice") -> list:
     ]
 
 
-def _lift_timed_lock(db, username: str = "alice") -> None:
+def _lift_timed_lock(db: Db, username: str = "alice") -> None:
     db.execute(
         "UPDATE users SET is_locked = false, locked_until = NULL, "
         "failed_login_attempts = 0 WHERE username = :u",
@@ -86,15 +88,22 @@ def _lift_timed_lock(db, username: str = "alice") -> None:
     )
 
 
-def _admin(client, action, user_id: str) -> None:
+def _admin(
+    client: TestClient,
+    action: Callable[..., Awaitable[bool]],
+    user_id: str,
+) -> None:
+    """Run an admin service action on the app's loop, as the admin panel does."""
+
     async def _run() -> None:
-        async with client.app.state.session_factory() as session:
+        session: AsyncSession
+        async with app_of(client).state.session_factory() as session:
             assert await action(session, uuid.UUID(user_id), actor="admin")
 
-    client.portal.call(_run)
+    call_in_app(client, _run)
 
 
-def _change_token_id(db, username: str = "alice") -> str:
+def _change_token_id(db: Db, username: str = "alice") -> str:
     return str(
         db.scalar(
             "SELECT t.id FROM email_tokens t JOIN users u ON u.id = t.user_id "
@@ -105,18 +114,10 @@ def _change_token_id(db, username: str = "alice") -> str:
     )
 
 
-def _request_change(client, access: str, new_email: str = NEW_MAIL):
-    return client.put(
-        "/api/v1/users/me/email",
-        json={"current_password": PASSWORD, "new_email": new_email},
-        headers=bearer(access),
-    )
-
-
 class TestAccountLockedNotice:
     def test_login_lock_mails_the_user_once_with_the_lock_end(
-        self, client, captured_emails, db
-    ):
+        self, client: TestClient, captured_emails: CapturedEmails, db: Db
+    ) -> None:
         _register_verified(client, db)
         captured_emails.clear()
 
@@ -135,8 +136,8 @@ class TestAccountLockedNotice:
         assert audit_count(db, NOTICE_SENT, "alice") == 1
 
     def test_locking_answer_equals_any_other_wrong_password_answer(
-        self, client, captured_emails, db
-    ):
+        self, client: TestClient, captured_emails: CapturedEmails, db: Db
+    ) -> None:
         _register_verified(client, db)
 
         *before, locking = _lock_by_login(client)
@@ -157,18 +158,14 @@ class TestAccountLockedNotice:
         )
 
     def test_password_confirmation_lock_mails_the_user_once(
-        self, client, captured_emails, db
-    ):
+        self, client: TestClient, captured_emails: CapturedEmails, db: Db
+    ) -> None:
         _register_verified(client, db)
         tokens = login_tokens(client, "alice")
         captured_emails.clear()
 
         for _ in range(MAXIMUM_LOGIN_ATTEMPTS):
-            r = client.put(
-                "/api/v1/users/me/password",
-                json={"current_password": "wrong", "new_password": "N3w-Password!"},
-                headers=bearer(tokens.access),
-            )
+            r = change_password(client, tokens.access, "wrong", "N3w-Password!")
             assert r.status_code == 400
             assert r.json()["code"] == "wrong_password"
 
@@ -176,7 +173,9 @@ class TestAccountLockedNotice:
         assert mail.to == OLD_MAIL
         assert audit_count(db, NOTICE_SENT, "alice") == 1
 
-    def test_admin_lock_sends_no_mail(self, client, captured_emails, db):
+    def test_admin_lock_sends_no_mail(
+        self, client: TestClient, captured_emails: CapturedEmails, db: Db
+    ) -> None:
         _register_verified(client, db)
         captured_emails.clear()
 
@@ -187,8 +186,12 @@ class TestAccountLockedNotice:
         assert audit_count(db, NOTICE_SENT, "alice") == 0
 
     def test_lock_replaced_by_an_admin_lock_is_not_mailed(
-        self, client, captured_emails, db, caplog
-    ):
+        self,
+        client: TestClient,
+        captured_emails: CapturedEmails,
+        db: Db,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
         """The admin lock has no end; a notice would state a wrong one."""
         _register_verified(client, db)
         captured_emails.clear()
@@ -205,8 +208,12 @@ class TestAccountLockedNotice:
         assert _not_sent_reasons(caplog, "account_locked") == ["admin_locked"]
 
     def test_throttle_holds_across_two_locks_and_ends_after_a_day(
-        self, client, captured_emails, db, caplog
-    ):
+        self,
+        client: TestClient,
+        captured_emails: CapturedEmails,
+        db: Db,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
         _register_verified(client, db)
         captured_emails.clear()
         caplog.set_level(logging.INFO)
@@ -221,7 +228,8 @@ class TestAccountLockedNotice:
         assert _not_sent_reasons(caplog, "account_locked") == ["recently_notified"]
 
         db.execute(
-            "UPDATE auth_audit_log SET created_at = now() - interval '24 hours 1 minute' "
+            "UPDATE auth_audit_log "
+            "SET created_at = now() - interval '24 hours 1 minute' "
             "WHERE event_type = 'ACCOUNT_LOCKED_NOTICE_SENT'"
         )
         _lift_timed_lock(db)
@@ -230,8 +238,8 @@ class TestAccountLockedNotice:
         assert len(captured_emails.of_kind("account_locked")) == 2
 
     def test_recent_admin_lock_does_not_throttle_the_notice(
-        self, client, captured_emails, db
-    ):
+        self, client: TestClient, captured_emails: CapturedEmails, db: Db
+    ) -> None:
         _register_verified(client, db)
         user_id = user_id_of(db, "alice")
         _admin(client, service.admin_lock_user, user_id)
@@ -243,8 +251,8 @@ class TestAccountLockedNotice:
         assert len(captured_emails.of_kind("account_locked")) == 1
 
     def test_unsent_notice_does_not_throttle_the_next_one(
-        self, client, db, monkeypatch
-    ):
+        self, client: TestClient, db: Db, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Only a sent notice is recorded; a lock without mail does not count."""
         _register_verified(client, db)
         _lock_by_login(client)  # mail is not configured: nothing is sent
@@ -271,8 +279,14 @@ class TestAccountLockedNotice:
         ],
     )
     def test_nothing_is_sent_when_the_lock_is_gone_or_the_account_inactive(
-        self, client, captured_emails, db, caplog, state, reason
-    ):
+        self,
+        client: TestClient,
+        captured_emails: CapturedEmails,
+        db: Db,
+        caplog: pytest.LogCaptureFixture,
+        state: str,
+        reason: str,
+    ) -> None:
         _register_verified(client, db)
         user_id = user_id_of(db, "alice")
         db.execute(
@@ -291,8 +305,12 @@ class TestAccountLockedNotice:
         assert audit_count(db, NOTICE_SENT, "alice") == 0
 
     def test_unverified_address_gets_no_lock_notice(
-        self, client, captured_emails, db, caplog
-    ):
+        self,
+        client: TestClient,
+        captured_emails: CapturedEmails,
+        db: Db,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
         register_ok(client, username="alice")
         captured_emails.clear()
         caplog.set_level(logging.INFO)
@@ -304,30 +322,34 @@ class TestAccountLockedNotice:
         assert audit_count(db, "account_locked", "alice") == 1
         assert audit_count(db, NOTICE_SENT, "alice") == 0
 
-    def test_enqueue_failure_keeps_the_answer(self, client, db, caplog):
+    def test_enqueue_failure_keeps_the_answer(
+        self, client: TestClient, db: Db, caplog: pytest.LogCaptureFixture
+    ) -> None:
         _register_verified(client, db)
         caplog.set_level(logging.INFO)
 
-        async def _kick(_message):
+        async def _kick(_message: BrokerMessage) -> Never:
             raise ConnectionError("broker down")
 
-        client.app.state.broker.kick = _kick
+        app_of(client).state.broker.kick = _kick
         *_, locking = _lock_by_login(client)
 
         assert locking.status_code == 401
         assert locking.json()["code"] == "invalid_credentials"
-        [event] = _events(caplog, "auth.email_enqueue_failed")
+        [event] = log_events(caplog, "auth.email_enqueue_failed")
         assert event["purpose"] == "account_locked"
         assert event["user_id"] == user_id_of(db, "alice")
 
 
 class TestEmailChangeNotices:
-    def test_request_notifies_the_current_address(self, client, captured_emails, db):
+    def test_request_notifies_the_current_address(
+        self, client: TestClient, captured_emails: CapturedEmails, db: Db
+    ) -> None:
         _register_verified(client, db)
         tokens = login_tokens(client, "alice")
         captured_emails.clear()
 
-        assert _request_change(client, tokens.access).status_code == 202
+        assert change_email(client, tokens.access, NEW_MAIL).status_code == 202
 
         [notice] = captured_emails.of_kind("email_change_requested")
         assert (notice.to, notice.username, notice.token) == (OLD_MAIL, "alice", None)
@@ -336,11 +358,11 @@ class TestEmailChangeNotices:
         assert confirmation.to == NEW_MAIL
 
     def test_confirmation_stores_and_notifies_the_old_address(
-        self, client, captured_emails, db
-    ):
+        self, client: TestClient, captured_emails: CapturedEmails, db: Db
+    ) -> None:
         _register_verified(client, db)
         tokens = login_tokens(client, "alice")
-        _request_change(client, tokens.access)
+        change_email(client, tokens.access, NEW_MAIL)
         token_id = _change_token_id(db)
         assert (
             db.scalar(
@@ -350,7 +372,7 @@ class TestEmailChangeNotices:
         )
         token = captured_emails.latest_token(NEW_MAIL, "change_email")
 
-        r = client.post("/api/v1/auth/email/verify", json={"token": token})
+        r = verify_email(client, token)
 
         assert r.status_code == 204
         assert db.scalar("SELECT email FROM users") == NEW_MAIL
@@ -364,26 +386,29 @@ class TestEmailChangeNotices:
         assert (notice.to, notice.username, notice.token) == (OLD_MAIL, "alice", None)
 
     def test_verification_tokens_get_no_previous_email(
-        self, client, captured_emails, db
-    ):
+        self, client: TestClient, captured_emails: CapturedEmails, db: Db
+    ) -> None:
         register_ok(client, username="alice")
         token = captured_emails.latest_token(OLD_MAIL, "verify")
 
-        client.post("/api/v1/auth/email/verify", json={"token": token})
+        verify_email(client, token)
 
         assert db.scalar("SELECT count(*) FROM email_tokens") == 1
         assert db.scalar("SELECT previous_email FROM email_tokens") is None
         assert captured_emails.of_kind("email_change_completed") == []
 
     def test_unverified_current_address_gets_no_request_notice(
-        self, client, captured_emails, db, caplog
-    ):
+        self,
+        client: TestClient,
+        captured_emails: CapturedEmails,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
         register_ok(client, username="alice")
         tokens = login_tokens(client, "alice")
         captured_emails.clear()
         caplog.set_level(logging.INFO)
 
-        assert _request_change(client, tokens.access).status_code == 202
+        assert change_email(client, tokens.access, NEW_MAIL).status_code == 202
 
         assert [m.kind for m in captured_emails] == ["change_email"]
         assert _not_sent_reasons(caplog, "email_change_requested") == [
@@ -391,16 +416,20 @@ class TestEmailChangeNotices:
         ]
 
     def test_unverified_old_address_is_neither_stored_nor_notified(
-        self, client, captured_emails, db, caplog
-    ):
+        self,
+        client: TestClient,
+        captured_emails: CapturedEmails,
+        db: Db,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
         register_ok(client, username="alice")
         tokens = login_tokens(client, "alice")
-        _request_change(client, tokens.access)
+        change_email(client, tokens.access, NEW_MAIL)
         token = captured_emails.latest_token(NEW_MAIL, "change_email")
         captured_emails.clear()
         caplog.set_level(logging.INFO)
 
-        r = client.post("/api/v1/auth/email/verify", json={"token": token})
+        r = verify_email(client, token)
 
         assert r.status_code == 204
         assert db.scalar("SELECT email FROM users") == NEW_MAIL
@@ -418,14 +447,14 @@ class TestEmailChangeNotices:
         ]
 
     def test_late_request_notice_goes_to_the_replaced_address(
-        self, client, captured_emails, db
-    ):
+        self, client: TestClient, captured_emails: CapturedEmails, db: Db
+    ) -> None:
         """The change was confirmed before the requested notice ran."""
         _register_verified(client, db)
         tokens = login_tokens(client, "alice")
-        _request_change(client, tokens.access)
+        change_email(client, tokens.access, NEW_MAIL)
         token = captured_emails.latest_token(NEW_MAIL, "change_email")
-        client.post("/api/v1/auth/email/verify", json={"token": token})
+        verify_email(client, token)
         captured_emails.clear()
 
         run_task(client, send_email_change_requested_notice_task, _change_token_id(db))
@@ -434,11 +463,15 @@ class TestEmailChangeNotices:
         assert (notice.kind, notice.to) == ("email_change_requested", OLD_MAIL)
 
     def test_completed_notice_needs_a_confirmed_change(
-        self, client, captured_emails, db, caplog
-    ):
+        self,
+        client: TestClient,
+        captured_emails: CapturedEmails,
+        db: Db,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
         _register_verified(client, db)
         tokens = login_tokens(client, "alice")
-        _request_change(client, tokens.access)
+        change_email(client, tokens.access, NEW_MAIL)
         captured_emails.clear()
         caplog.set_level(logging.INFO)
 
@@ -447,21 +480,24 @@ class TestEmailChangeNotices:
         assert captured_emails == []
         assert _not_sent_reasons(caplog, "email_change_completed") == ["not_completed"]
 
-    @pytest.mark.parametrize(
-        "task",
-        [
-            send_email_change_requested_notice_task,
-            send_email_change_completed_notice_task,
-        ],
-    )
+    @pytest.mark.parametrize("notice", ["requested", "completed"])
     def test_inactive_account_gets_no_notice(
-        self, client, captured_emails, db, caplog, task
-    ):
+        self,
+        client: TestClient,
+        captured_emails: CapturedEmails,
+        db: Db,
+        caplog: pytest.LogCaptureFixture,
+        notice: str,
+    ) -> None:
+        task = {
+            "requested": send_email_change_requested_notice_task,
+            "completed": send_email_change_completed_notice_task,
+        }[notice]
         _register_verified(client, db)
         tokens = login_tokens(client, "alice")
-        _request_change(client, tokens.access)
+        change_email(client, tokens.access, NEW_MAIL)
         token = captured_emails.latest_token(NEW_MAIL, "change_email")
-        client.post("/api/v1/auth/email/verify", json={"token": token})
+        verify_email(client, token)
         db.execute("UPDATE users SET is_active = false")
         captured_emails.clear()
         caplog.set_level(logging.INFO)
@@ -469,16 +505,16 @@ class TestEmailChangeNotices:
         run_task(client, task, _change_token_id(db))
 
         assert captured_emails == []
-        reasons = [e["reason"] for e in _events(caplog, "email.not_sent")]
+        reasons = [e["reason"] for e in log_events(caplog, "email.not_sent")]
         assert reasons == ["account_inactive"]
 
     def test_admin_locked_account_still_gets_the_notice(
-        self, client, captured_emails, db
-    ):
+        self, client: TestClient, captured_emails: CapturedEmails, db: Db
+    ) -> None:
         """Only an inactive account is skipped: a locked owner should know."""
         _register_verified(client, db)
         tokens = login_tokens(client, "alice")
-        _request_change(client, tokens.access)
+        change_email(client, tokens.access, NEW_MAIL)
         db.execute("UPDATE users SET is_locked = true, locked_until = NULL")
         captured_emails.clear()
 
@@ -487,26 +523,30 @@ class TestEmailChangeNotices:
         [notice] = captured_emails
         assert notice.to == OLD_MAIL
 
-    def test_enqueue_failure_keeps_the_answers(self, client, db, caplog):
+    def test_enqueue_failure_keeps_the_answers(
+        self, client: TestClient, db: Db, caplog: pytest.LogCaptureFixture
+    ) -> None:
         _register_verified(client, db)
         tokens = login_tokens(client, "alice")
         caplog.set_level(logging.INFO)
 
-        async def _kick(_message):
+        async def _kick(_message: BrokerMessage) -> Never:
             raise ConnectionError("broker down")
 
-        client.app.state.broker.kick = _kick
-        assert _request_change(client, tokens.access).status_code == 202
+        app_of(client).state.broker.kick = _kick
+        assert change_email(client, tokens.access, NEW_MAIL).status_code == 202
         db.execute(
             "UPDATE email_tokens SET token_hash = :h WHERE id = :t",
             h=hash_token("known"),
             t=_change_token_id(db),
         )
-        r = client.post("/api/v1/auth/email/verify", json={"token": "known"})
+        r = verify_email(client, "known")
 
         assert r.status_code == 204
         assert db.scalar("SELECT email FROM users") == NEW_MAIL
-        purposes = [e["purpose"] for e in _events(caplog, "auth.email_enqueue_failed")]
+        purposes = [
+            e["purpose"] for e in log_events(caplog, "auth.email_enqueue_failed")
+        ]
         assert purposes == [
             "change_email",
             "email_change_requested",
@@ -516,42 +556,45 @@ class TestEmailChangeNotices:
 
 class TestRedisHoldsOnlyIds:
     @staticmethod
-    def _stream_messages() -> list[dict]:
-        with redis_sync.Redis.from_url(os.environ["TASKIQ_BROKER_URL"]) as r:
-            return [
-                json.loads(fields[b"data"]) for _id, fields in r.xrange(TASK_STREAM)
-            ]
+    def _stream_messages() -> list[dict[str, Any]]:
+        """The task messages in the stream; Any: decoded JSON."""
+        messages: list[dict[str, Any]] = []
+        with redis_from_env("TASKIQ_BROKER_URL") as r:
+            for _id, fields in r.xrange(TASK_STREAM) or []:
+                assert fields is not None
+                messages.append(json.loads(fields[b"data"]))
+        return messages
 
-    def test_lock_notice_carries_only_the_user_id(self, redis_broker_client, db):
-        register_ok(redis_broker_client, username=ZEBRA_USER, email=ZEBRA_MAIL)
+    def test_lock_notice_carries_only_the_user_id(
+        self, redis_broker_client: TestClient, db: Db
+    ) -> None:
+        register_ok(redis_broker_client, username=PII_USERNAME, email=PII_EMAIL)
 
-        _lock_by_login(redis_broker_client, ZEBRA_USER)
+        _lock_by_login(redis_broker_client, PII_USERNAME)
 
         [message] = [
             m
             for m in self._stream_messages()
             if m["task_name"] == "email.send_account_locked_notice"
         ]
-        assert message["args"] == [user_id_of(db, ZEBRA_USER)]
+        assert message["args"] == [user_id_of(db, PII_USERNAME)]
         assert message["kwargs"] == {}
-        _assert_nothing_personal_in_redis()
+        assert_nothing_personal_in_redis()
 
     def test_email_change_notices_carry_only_the_token_id(
-        self, redis_broker_client, db
-    ):
+        self, redis_broker_client: TestClient, db: Db
+    ) -> None:
         new_mail = "zebra.new91@example.com"
-        register_ok(redis_broker_client, username=ZEBRA_USER, email=ZEBRA_MAIL)
-        tokens = login_tokens(redis_broker_client, ZEBRA_USER)
-        _request_change(redis_broker_client, tokens.access, new_mail)
-        token_id = _change_token_id(db, ZEBRA_USER)
+        register_ok(redis_broker_client, username=PII_USERNAME, email=PII_EMAIL)
+        tokens = login_tokens(redis_broker_client, PII_USERNAME)
+        change_email(redis_broker_client, tokens.access, new_mail)
+        token_id = _change_token_id(db, PII_USERNAME)
         db.execute(
             "UPDATE email_tokens SET token_hash = :h WHERE id = :t",
             h=hash_token("known"),
             t=token_id,
         )
-        r = redis_broker_client.post(
-            "/api/v1/auth/email/verify", json={"token": "known"}
-        )
+        r = verify_email(redis_broker_client, "known")
         assert r.status_code == 204
 
         notices = {
@@ -566,29 +609,28 @@ class TestRedisHoldsOnlyIds:
         for message in notices.values():
             assert message["args"] == [token_id]
             assert message["kwargs"] == {}
-        _assert_nothing_personal_in_redis(new_mail)
+        assert_nothing_personal_in_redis(new_mail)
 
 
 class TestRelockAfterAnExpiredLock:
-    """An expired timed lock counts as no lock: the next failures start a new
-    series that locks again, records the lock and enqueues a notice."""
+    """An expired timed lock counts as no lock.
+
+    The next failures start a new series that locks again, records the lock
+    and enqueues a notice.
+    """
 
     @staticmethod
-    def _expire_lock(db) -> None:
+    def _expire_lock(db: Db) -> None:
         db.execute(
             "UPDATE users SET locked_until = now() - interval '1 second' "
             "WHERE username = 'alice'"
         )
 
     @staticmethod
-    def _wrong_confirmation(client, access: str):
-        return client.put(
-            "/api/v1/users/me/password",
-            json={"current_password": "wrong", "new_password": "N3w-Password!"},
-            headers=bearer(access),
-        )
+    def _wrong_confirmation(client: TestClient, access: str) -> Response:
+        return change_password(client, access, "wrong", "N3w-Password!")
 
-    def _assert_locked_again(self, db, caplog) -> None:
+    def _assert_locked_again(self, db: Db, caplog: pytest.LogCaptureFixture) -> None:
         row = db.one(
             "SELECT is_locked, failed_login_attempts, "
             "locked_until > now() AS lock_running FROM users"
@@ -601,8 +643,12 @@ class TestRelockAfterAnExpiredLock:
         assert _not_sent_reasons(caplog, "account_locked") == ["recently_notified"]
 
     def test_password_confirmations_lock_again(
-        self, client, captured_emails, db, caplog
-    ):
+        self,
+        client: TestClient,
+        captured_emails: CapturedEmails,
+        db: Db,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
         _register_verified(client, db)
         tokens = login_tokens(client, "alice")
         for _ in range(MAXIMUM_LOGIN_ATTEMPTS):
@@ -623,7 +669,13 @@ class TestRelockAfterAnExpiredLock:
         self._assert_locked_again(db, caplog)
         assert len(captured_emails.of_kind("account_locked")) == 1
 
-    def test_logins_lock_again(self, client, captured_emails, db, caplog):
+    @pytest.mark.usefixtures("captured_emails")
+    def test_logins_lock_again(
+        self,
+        client: TestClient,
+        db: Db,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
         _register_verified(client, db)
         _lock_by_login(client)
         self._expire_lock(db)
@@ -633,19 +685,20 @@ class TestRelockAfterAnExpiredLock:
 
         self._assert_locked_again(db, caplog)
 
-    def test_admin_lock_is_never_weakened(self, client, db):
+    def test_admin_lock_is_never_weakened(self, client: TestClient, db: Db) -> None:
         _register_verified(client, db)
         user_id = user_id_of(db, "alice")
         _admin(client, service.admin_lock_user, user_id)
 
         async def _fail() -> None:
-            async with client.app.state.session_factory() as session:
+            session: AsyncSession
+            async with app_of(client).state.session_factory() as session:
                 await crud.register_failed_login(
                     session, uuid.UUID(user_id), MAXIMUM_LOGIN_ATTEMPTS, 900
                 )
 
         for _ in range(MAXIMUM_LOGIN_ATTEMPTS + 1):
-            client.portal.call(_fail)
+            call_in_app(client, _fail)
 
         row = db.one("SELECT is_locked, locked_until FROM users")
         assert (row["is_locked"], row["locked_until"]) == (True, None)

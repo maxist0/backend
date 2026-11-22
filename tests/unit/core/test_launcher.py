@@ -8,12 +8,18 @@ import uvicorn
 from app.core.config import get_settings
 
 
-def test_uvicorn_trusts_only_the_configured_proxies(monkeypatch, fresh_settings):
+def test_uvicorn_trusts_only_the_configured_proxies(
+    monkeypatch: pytest.MonkeyPatch, fresh_settings: pytest.MonkeyPatch
+) -> None:
     import run
 
     fresh_settings.setenv("FORWARDED_ALLOW_IPS", "10.0.0.2,10.0.0.3")
-    calls: list[dict] = []
-    monkeypatch.setattr(uvicorn, "run", lambda *args, **kwargs: calls.append(kwargs))
+    calls: list[dict[str, object]] = []
+
+    def _run(*_args: object, **kwargs: object) -> None:
+        calls.append(kwargs)
+
+    monkeypatch.setattr(uvicorn, "run", _run)
     monkeypatch.setattr(sys, "argv", ["run.py", "unittest"])
 
     run.main()
@@ -26,7 +32,7 @@ def test_uvicorn_trusts_only_the_configured_proxies(monkeypatch, fresh_settings)
 
 
 @pytest.fixture(autouse=True)
-def _keep_environment(monkeypatch):
+def _keep_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     """`run.main()` writes ENVIRONMENT into os.environ; restore it afterwards."""
     monkeypatch.setenv("ENVIRONMENT", "unittest")
 
@@ -34,14 +40,18 @@ def _keep_environment(monkeypatch):
 class TestDevChildren:
     """`run.py dev` starts the worker and the scheduler and stops them again."""
 
-    def test_windows_worker_runs_the_selector_loop_entry_point(self, monkeypatch):
+    def test_windows_worker_runs_the_selector_loop_entry_point(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         import run
 
         monkeypatch.setattr(sys, "platform", "win32")
 
         assert run.worker_command(4, "INFO") == [sys.executable, "-m", "app.worker"]
 
-    def test_other_platforms_run_the_taskiq_worker_cli(self, monkeypatch):
+    def test_other_platforms_run_the_taskiq_worker_cli(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         import run
 
         monkeypatch.setattr(sys, "platform", "linux")
@@ -51,7 +61,7 @@ class TestDevChildren:
         assert command[1:5] == ["-m", "taskiq", "worker", "app.worker:broker"]
         assert "--workers=4" in command
 
-    def test_scheduler_reads_retries_more_often_than_once_a_minute(self):
+    def test_scheduler_reads_retries_more_often_than_once_a_minute(self) -> None:
         """Retries are timed schedules; taskiq's default update is 60 s."""
         import run
 
@@ -61,7 +71,7 @@ class TestDevChildren:
         assert f"--update-interval={run.SCHEDULER_UPDATE_INTERVAL_SECONDS}" in command
         assert run.SCHEDULER_UPDATE_INTERVAL_SECONDS < 60
 
-    def test_stop_process_ends_a_running_child(self):
+    def test_stop_process_ends_a_running_child(self) -> None:
         import subprocess
 
         import run

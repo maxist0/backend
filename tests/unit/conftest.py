@@ -5,12 +5,13 @@ unit test that reaches for a database or Redis fails instead of hitting a
 developer's own instance.
 """
 
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 
 import pytest
 
-from app.core.config import Settings, get_settings
+from app.core.config import get_settings
 from app.core.logging import setup_logging
+from tests.helpers import SettingsFactory, build_settings
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -24,20 +25,12 @@ def configured_logging() -> None:
 
 
 @pytest.fixture
-def settings_factory() -> Callable[..., Settings]:
+def settings_factory() -> SettingsFactory:
     """Build `Settings` for one test: `settings_factory(APP_NAME="x")`.
 
-    The result ignores dotenv files. `ENVIRONMENT` defaults to `unittest` and
-    the admin panel to off (sqladmin keeps the session factory on its view
-    classes, so a second admin-enabled app would rebind the shared views).
-    Every default can be overridden, `None` included.
+    See `tests.helpers.build_settings`.
     """
-
-    def _build(**overrides: object) -> Settings:
-        values = {"ENVIRONMENT": "unittest", "ADMIN_ENABLED": False, **overrides}
-        return Settings(_env_file=None, **values)
-
-    return _build
+    return build_settings
 
 
 @pytest.fixture

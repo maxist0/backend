@@ -24,26 +24,29 @@ user sessions first and call `admin_login(client)` last.
 
 import logging
 import uuid
+from typing import Any, Never
 
 import pytest
+from fastapi.testclient import TestClient
 
 from tests.helpers import (
     PASSWORD,
+    SAME_ORIGIN,
+    Db,
     active_session_count,
+    admin_login,
     bearer,
+    log_events,
     login,
     login_tokens,
     refresh_with,
     register_ok,
-    secret_value,
+    run_action,
     user_id_of,
 )
 
-
-@pytest.fixture(autouse=True)
-def _no_real_email_dispatch(captured_emails):
-    """Every test here registers users; record their mails instead of skipping them."""
-    return captured_emails
+# Every test here registers users; record their mails instead of skipping them.
+pytestmark = pytest.mark.usefixtures("captured_emails")
 
 
 @pytest.fixture
@@ -53,44 +56,19 @@ def actor() -> str:
     return get_settings().ADMIN_USERNAME
 
 
-SAME_ORIGIN = {"Sec-Fetch-Site": "same-origin"}
-
-
-def admin_login(client) -> None:
-    from app.core.config import get_settings
-
-    settings = get_settings()
-    client.headers.update(SAME_ORIGIN)
-
-    r = client.post(
-        "/admin/login",
-        data={
-            "username": settings.ADMIN_USERNAME,
-            "password": secret_value(settings.ADMIN_PASSWORD),
-        },
-        follow_redirects=False,
-    )
-    assert r.status_code == 302, f"admin login failed: {r.status_code} {r.text[:200]}"
-
-
-def run_action(client, identity: str, slug: str, pks: list[str], **kwargs):
-    return client.get(
-        f"/admin/{identity}/action/{slug}",
-        params={"pks": ",".join(pks)},
-        follow_redirects=False,
-        **kwargs,
-    )
-
-
-def fail_audit_writes(monkeypatch) -> None:
-    async def _fail(*_args, **_kwargs):
+def fail_audit_writes(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def _fail(*_args: object, **_kwargs: object) -> Never:
         raise RuntimeError("audit store down")
 
     monkeypatch.setattr("app.modules.auth.crud.create_audit_log", _fail)
 
 
-def audit_rows(db, event: str) -> list[dict]:
-    """Audit rows of one event type (the enum label, e.g. `ACCOUNT_LOCKED`)."""
+def audit_rows(db: Db, event: str) -> list[dict[str, Any]]:
+    """Audit rows of one event type (the enum label, e.g. `ACCOUNT_LOCKED`).
+
+    Any: the values are the columns `user_id` and `detail` as the driver
+    returns them.
+    """
     return [
         dict(row)
         for row in db.rows(
@@ -102,7 +80,9 @@ def audit_rows(db, event: str) -> list[dict]:
 
 
 class TestUserActions:
-    def test_lock_locks_selected_users_indefinitely_and_audits(self, client, db, actor):
+    def test_lock_locks_selected_users_indefinitely_and_audits(
+        self, client: TestClient, db: Db, actor: str
+    ) -> None:
         for name in ("alice", "bob", "carol"):
             register_ok(client, username=name)
         ids = [user_id_of(db, "alice"), user_id_of(db, "bob")]
@@ -115,8 +95,10 @@ class TestUserActions:
             row["username"]: row
             for row in db.rows("SELECT username, is_locked, locked_until FROM users")
         }
-        assert rows["alice"]["is_locked"] and rows["alice"]["locked_until"] is None
-        assert rows["bob"]["is_locked"] and rows["bob"]["locked_until"] is None
+        assert rows["alice"]["is_locked"]
+        assert rows["alice"]["locked_until"] is None
+        assert rows["bob"]["is_locked"]
+        assert rows["bob"]["locked_until"] is None
         assert not rows["carol"]["is_locked"], "unselected user must be untouched"
         audits = audit_rows(db, "ACCOUNT_LOCKED")
         assert sorted(a["user_id"] for a in audits) == sorted(ids)
@@ -129,7 +111,9 @@ class TestUserActions:
             == "testclient"
         )
 
-    def test_lock_ends_sessions_refresh_and_access_tokens(self, client, db):
+    def test_lock_ends_sessions_refresh_and_access_tokens(
+        self, client: TestClient, db: Db
+    ) -> None:
         register_ok(client, username="alice")
         t = login_tokens(client, "alice")
         assert active_session_count(db, "alice") == 1
@@ -145,10 +129,13 @@ class TestUserActions:
             client.get("/api/v1/users/me", headers=bearer(t.access)).status_code == 401
         )
 
-    def test_lock_turns_a_timed_lock_into_an_indefinite_one(self, client, db):
+    def test_lock_turns_a_timed_lock_into_an_indefinite_one(
+        self, client: TestClient, db: Db
+    ) -> None:
         register_ok(client, username="alice")
         db.execute(
-            "UPDATE users SET is_locked = true, locked_until = now() + interval '1 hour'"
+            "UPDATE users SET is_locked = true, "
+            "locked_until = now() + interval '1 hour'"
         )
         admin_login(client)
 
@@ -158,9 +145,10 @@ class TestUserActions:
         assert row["is_locked"] is True
         assert row["locked_until"] is None
 
-    def test_admin_locked_user_cannot_log_in_with_correct_password(self, client, db):
-        """End to end: admin lock followed by a login attempt (the lock must
-        not lift itself)."""
+    def test_admin_locked_user_cannot_log_in_with_correct_password(
+        self, client: TestClient, db: Db
+    ) -> None:
+        """End to end: admin lock, then a login attempt; the lock stays."""
         register_ok(client, username="alice")
         admin_login(client)
         run_action(client, "user", "lock-users", [user_id_of(db, "alice")])
@@ -170,7 +158,9 @@ class TestUserActions:
         assert r.status_code == 401
         assert db.scalar("SELECT is_locked FROM users") is True
 
-    def test_unlock_clears_lock_and_failed_attempts_and_audits(self, client, db, actor):
+    def test_unlock_clears_lock_and_failed_attempts_and_audits(
+        self, client: TestClient, db: Db, actor: str
+    ) -> None:
         register_ok(client, username="alice")
         db.execute(
             "UPDATE users SET is_locked = true, failed_login_attempts = 5, "
@@ -188,7 +178,9 @@ class TestUserActions:
             {"user_id": user_id_of(db, "alice"), "detail": f"Unlocked by admin {actor}"}
         ]
 
-    def test_deactivate_deactivates_ends_sessions_and_audits(self, client, db, actor):
+    def test_deactivate_deactivates_ends_sessions_and_audits(
+        self, client: TestClient, db: Db, actor: str
+    ) -> None:
         register_ok(client, username="alice")
         t = login_tokens(client, "alice")
         admin_login(client)
@@ -209,7 +201,9 @@ class TestUserActions:
             client.get("/api/v1/users/me", headers=bearer(t.access)).status_code == 401
         )
 
-    def test_reactivate_lets_the_user_log_in_again_and_audits(self, client, db, actor):
+    def test_reactivate_lets_the_user_log_in_again_and_audits(
+        self, client: TestClient, db: Db, actor: str
+    ) -> None:
         register_ok(client, username="alice")
         db.execute("UPDATE users SET is_active = false")
         assert login(client, username="alice").status_code == 401
@@ -226,7 +220,7 @@ class TestUserActions:
         ]
         assert login(client, username="alice", password=PASSWORD).status_code == 200
 
-    def test_reactivate_keeps_an_admin_lock(self, client, db):
+    def test_reactivate_keeps_an_admin_lock(self, client: TestClient, db: Db) -> None:
         register_ok(client, username="alice")
         db.execute("UPDATE users SET is_active = false, is_locked = true")
         admin_login(client)
@@ -235,9 +229,12 @@ class TestUserActions:
 
         row = db.one("SELECT is_active, is_locked, locked_until FROM users")
         assert row["is_active"] is True
-        assert row["is_locked"] is True and row["locked_until"] is None
+        assert row["is_locked"] is True
+        assert row["locked_until"] is None
 
-    def test_force_password_change_sets_must_change_and_audits(self, client, db, actor):
+    def test_force_password_change_sets_must_change_and_audits(
+        self, client: TestClient, db: Db, actor: str
+    ) -> None:
         register_ok(client, username="alice")
         admin_login(client)
 
@@ -251,7 +248,9 @@ class TestUserActions:
             }
         ]
 
-    def test_force_password_change_without_credential_changes_nothing(self, client, db):
+    def test_force_password_change_without_credential_changes_nothing(
+        self, client: TestClient, db: Db
+    ) -> None:
         register_ok(client, username="alice")
         db.execute("DELETE FROM password_credentials")
         admin_login(client)
@@ -273,7 +272,9 @@ class TestUserActions:
             ("force-password-change", "PASSWORD_CHANGE_FORCED"),
         ],
     )
-    def test_a_user_that_no_longer_exists_is_skipped(self, client, db, slug, event):
+    def test_a_user_that_no_longer_exists_is_skipped(
+        self, client: TestClient, db: Db, slug: str, event: str
+    ) -> None:
         register_ok(client, username="alice")
         alice = user_id_of(db, "alice")
         admin_login(client)
@@ -286,8 +287,8 @@ class TestUserActions:
 
 class TestSessionActions:
     def test_revoke_revokes_only_the_selected_session_and_audits(
-        self, client, db, actor
-    ):
+        self, client: TestClient, db: Db, actor: str
+    ) -> None:
         register_ok(client, username="alice")
         first = login_tokens(client, "alice")
         second = login_tokens(client, "alice")
@@ -314,8 +315,8 @@ class TestSessionActions:
         assert refresh_with(client, second.refresh)[0].status_code == 200
 
     def test_revoking_a_revoked_session_keeps_its_reason_and_audits_nothing(
-        self, client, db
-    ):
+        self, client: TestClient, db: Db
+    ) -> None:
         register_ok(client, username="alice")
         login_tokens(client, "alice")
         db.execute(
@@ -331,7 +332,9 @@ class TestSessionActions:
         assert db.scalar("SELECT revoke_reason FROM sessions") == "reuse_detected"
         assert audit_rows(db, "SESSION_REVOKED") == []
 
-    def test_a_session_that_no_longer_exists_is_skipped(self, client, db):
+    def test_a_session_that_no_longer_exists_is_skipped(
+        self, client: TestClient, db: Db
+    ) -> None:
         register_ok(client, username="alice")
         login_tokens(client, "alice")
         session_id = str(db.scalar("SELECT id FROM sessions"))
@@ -359,8 +362,15 @@ class TestOneTransactionPerAction:
         [("lock-users", "is_locked", False), ("deactivate-users", "is_active", True)],
     )
     def test_user_action_persists_nothing_when_the_audit_fails(
-        self, client, db, monkeypatch, slug, column, unchanged
-    ):
+        self,
+        client: TestClient,
+        db: Db,
+        monkeypatch: pytest.MonkeyPatch,
+        slug: str,
+        column: str,
+        *,
+        unchanged: bool,
+    ) -> None:
         register_ok(client, username="alice")
         login_tokens(client, "alice")
         admin_login(client)
@@ -369,7 +379,7 @@ class TestOneTransactionPerAction:
         r = run_action(client, "user", slug, [user_id_of(db, "alice")])
 
         assert r.status_code == 500
-        assert db.scalar(f"SELECT {column} FROM users") is unchanged  # noqa: S608
+        assert db.scalar(f"SELECT {column} FROM users") is unchanged
         assert active_session_count(db, "alice") == 1
         assert (
             db.scalar(
@@ -379,8 +389,8 @@ class TestOneTransactionPerAction:
         )
 
     def test_session_revoke_persists_nothing_when_the_audit_fails(
-        self, client, db, monkeypatch
-    ):
+        self, client: TestClient, db: Db, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         register_ok(client, username="alice")
         login_tokens(client, "alice")
         session_id = str(db.scalar("SELECT id FROM sessions"))
@@ -394,7 +404,9 @@ class TestOneTransactionPerAction:
 
 
 class TestActionSecurity:
-    def test_admin_session_cookie_is_strict_and_expires(self, client):
+    def test_admin_session_cookie_is_strict_and_expires(
+        self, client: TestClient
+    ) -> None:
         from app.core.config import get_settings
 
         settings = get_settings()
@@ -409,7 +421,7 @@ class TestActionSecurity:
             "/admin/login",
             data={
                 "username": settings.ADMIN_USERNAME,
-                "password": secret_value(settings.ADMIN_PASSWORD),
+                "password": settings.ADMIN_PASSWORD.get_secret_value(),
             },
             headers=SAME_ORIGIN,
             follow_redirects=False,
@@ -424,7 +436,9 @@ class TestActionSecurity:
         assert "httponly" in attributes
         assert f"max-age={8 * 60 * 60}" in attributes
 
-    def test_cross_site_action_is_rejected_without_effect(self, client, db):
+    def test_cross_site_action_is_rejected_without_effect(
+        self, client: TestClient, db: Db
+    ) -> None:
         register_ok(client, username="alice")
         admin_login(client)
 
@@ -440,7 +454,9 @@ class TestActionSecurity:
         assert db.scalar("SELECT is_locked FROM users") is False
         assert audit_rows(db, "ACCOUNT_LOCKED") == []
 
-    def test_action_without_fetch_metadata_is_rejected(self, client, db):
+    def test_action_without_fetch_metadata_is_rejected(
+        self, client: TestClient, db: Db
+    ) -> None:
         """Fail safe: a client that does not say where it comes from is refused."""
         register_ok(client, username="alice")
         admin_login(client)
@@ -451,7 +467,9 @@ class TestActionSecurity:
         assert r.status_code == 403
         assert db.scalar("SELECT is_locked FROM users") is False
 
-    def test_admin_logins_are_logged_without_the_typed_username(self, client, caplog):
+    def test_admin_logins_are_logged_without_the_typed_username(
+        self, client: TestClient, caplog: pytest.LogCaptureFixture
+    ) -> None:
         from app.core.config import get_settings
 
         caplog.set_level(logging.INFO)
@@ -464,17 +482,16 @@ class TestActionSecurity:
         admin_login(client)
 
         events = {
-            r.msg["event"]: r.msg
-            for r in caplog.records
-            if isinstance(r.msg, dict)
-            and r.msg.get("event", "").startswith("admin.login")
+            e["event"]: e
+            for e in log_events(caplog)
+            if e["event"].startswith("admin.login")
         }
         assert events["admin.login_failed"]["client_ip"] == "testclient"
         assert "typed-name-91" not in str(events["admin.login_failed"])
         assert events["admin.login_succeeded"]["client_ip"] == "testclient"
         assert events["admin.login_succeeded"]["admin"] == get_settings().ADMIN_USERNAME
 
-    def test_same_origin_action_runs(self, client, db):
+    def test_same_origin_action_runs(self, client: TestClient, db: Db) -> None:
         register_ok(client, username="alice")
         admin_login(client)
 
@@ -489,7 +506,7 @@ class TestActionSecurity:
         assert r.status_code == 303
         assert db.scalar("SELECT is_locked FROM users") is True
 
-    def test_cross_site_login_is_rejected(self, client):
+    def test_cross_site_login_is_rejected(self, client: TestClient) -> None:
         from app.core.config import get_settings
 
         settings = get_settings()
@@ -498,7 +515,7 @@ class TestActionSecurity:
             "/admin/login",
             data={
                 "username": settings.ADMIN_USERNAME,
-                "password": secret_value(settings.ADMIN_PASSWORD),
+                "password": settings.ADMIN_PASSWORD.get_secret_value(),
             },
             headers={"Sec-Fetch-Site": "cross-site"},
             follow_redirects=False,
@@ -507,8 +524,10 @@ class TestActionSecurity:
         assert r.status_code == 403
         assert "set-cookie" not in r.headers
 
-    def test_action_without_admin_login_changes_nothing(self, client, db):
-        """GUARD: unauthenticated callers are redirected to login, no effect."""
+    def test_action_without_admin_login_changes_nothing(
+        self, client: TestClient, db: Db
+    ) -> None:
+        """Unauthenticated callers are redirected to login, no effect."""
         register_ok(client, username="alice")
         client.cookies.clear()
 
@@ -521,7 +540,9 @@ class TestActionSecurity:
         assert db.scalar("SELECT is_locked FROM users") is False
         assert audit_rows(db, "ACCOUNT_LOCKED") == []
 
-    def test_action_redirect_ignores_referer_header(self, client, db):
+    def test_action_redirect_ignores_referer_header(
+        self, client: TestClient, db: Db
+    ) -> None:
         register_ok(client, username="alice")
         admin_login(client)
 
@@ -538,7 +559,7 @@ class TestActionSecurity:
         assert "evil.example" not in location
         assert "/admin" in location
 
-    def test_action_with_garbage_pks_does_not_crash(self, client):
+    def test_action_with_garbage_pks_does_not_crash(self, client: TestClient) -> None:
         """Malformed ids must not surface as an unhandled server error."""
         admin_login(client)
         try:

@@ -30,7 +30,7 @@ def _module_dirs() -> list[Path]:
     )
 
 
-def test_modules_use_only_the_file_vocabulary():
+def test_modules_use_only_the_file_vocabulary() -> None:
     module_dirs = _module_dirs()
     assert module_dirs, f"no modules found under {MODULES_DIR}"
 
@@ -46,7 +46,7 @@ def test_modules_use_only_the_file_vocabulary():
     assert unexpected == []
 
 
-def test_module_templates_are_flat_and_do_not_shadow_the_core_layout():
+def test_module_templates_are_flat_and_do_not_shadow_the_core_layout() -> None:
     problems = [
         f"{module.name}/templates/{entry.name}"
         for module in _module_dirs()

@@ -12,52 +12,41 @@ service nor the database layer is mocked. `captured_emails` is needed for
 register and email change.
 """
 
-from tests.helpers import PASSWORD, audit_count, bearer, login, register
+import pytest
+from fastapi.testclient import TestClient
+
+from tests.helpers import (
+    PASSWORD,
+    CapturedEmails,
+    Db,
+    audit_count,
+    bearer,
+    change_email,
+    change_password,
+    login,
+    register,
+    register_and_login,
+    reset_password,
+)
 
 PASSWORD_URL = "/api/v1/users/me/password"
 EMAIL_URL = "/api/v1/users/me/email"
 VERIFY_URL = "/api/v1/auth/email/verify"
 
 
-def register_and_login(
-    client, *, username: str = "alice", email: str | None = None
-) -> str:
-    """Register a user, log in, and return the access token."""
-    register(client, username=username, email=email)
-    r = login(client, username=username)
-    assert r.status_code == 200, f"Login failed: {r.text}"
-    return r.json()["access_token"]
-
-
-def change_password(client, token: str | None, current: str, new: str):
-    headers = bearer(token) if token else {}
-    return client.put(
-        PASSWORD_URL,
-        json={"current_password": current, "new_password": new},
-        headers=headers,
-    )
-
-
-def change_email(client, token: str | None, new_email: str, password: str = PASSWORD):
-    headers = bearer(token) if token else {}
-    return client.put(
-        EMAIL_URL,
-        json={"current_password": password, "new_email": new_email},
-        headers=headers,
-    )
-
-
 class TestChangeMyPassword:
+    @pytest.mark.usefixtures("captured_emails")
     def test_change_password_succeeds_with_correct_current_password(
-        self, client, captured_emails
-    ):
+        self, client: TestClient
+    ) -> None:
         token = register_and_login(client)
         r = change_password(client, token, PASSWORD, "NewSecure456!")
 
         assert r.status_code == 204
         assert r.content == b""
 
-    def test_can_login_with_new_password_after_change(self, client, captured_emails):
+    @pytest.mark.usefixtures("captured_emails")
+    def test_can_login_with_new_password_after_change(self, client: TestClient) -> None:
         token = register_and_login(client)
         change_password(client, token, PASSWORD, "NewSecure456!")
 
@@ -65,13 +54,15 @@ class TestChangeMyPassword:
             login(client, username="alice", password="NewSecure456!").status_code == 200
         )
 
-    def test_old_password_rejected_after_change(self, client, captured_emails):
+    @pytest.mark.usefixtures("captured_emails")
+    def test_old_password_rejected_after_change(self, client: TestClient) -> None:
         token = register_and_login(client)
         change_password(client, token, PASSWORD, "NewSecure456!")
 
         assert login(client, username="alice", password=PASSWORD).status_code == 401
 
-    def test_wrong_current_password_returns_400(self, client, captured_emails):
+    @pytest.mark.usefixtures("captured_emails")
+    def test_wrong_current_password_returns_400(self, client: TestClient) -> None:
         token = register_and_login(client)
         r = change_password(client, token, "WrongPassword!", "ShouldNotWork1!")
 
@@ -79,22 +70,25 @@ class TestChangeMyPassword:
         assert r.json()["code"] == "wrong_password"
         assert "incorrect" in r.json()["detail"].lower()
 
+    @pytest.mark.usefixtures("captured_emails")
     def test_wrong_current_password_does_not_change_password(
-        self, client, captured_emails
-    ):
+        self, client: TestClient
+    ) -> None:
         token = register_and_login(client)
         change_password(client, token, "WrongPassword!", "ShouldNotWork1!")
 
         assert login(client, username="alice", password=PASSWORD).status_code == 200
 
-    def test_new_password_too_short_returns_422(self, client, captured_emails):
+    @pytest.mark.usefixtures("captured_emails")
+    def test_new_password_too_short_returns_422(self, client: TestClient) -> None:
         token = register_and_login(client)
         r = change_password(client, token, PASSWORD, "short")
 
         assert r.status_code == 422
         assert [e["field"] for e in r.json()["errors"]] == ["new_password"]
 
-    def test_missing_current_password_returns_422(self, client, captured_emails):
+    @pytest.mark.usefixtures("captured_emails")
+    def test_missing_current_password_returns_422(self, client: TestClient) -> None:
         token = register_and_login(client)
         r = client.put(
             PASSWORD_URL, json={"new_password": "NewSecure456!"}, headers=bearer(token)
@@ -102,7 +96,8 @@ class TestChangeMyPassword:
 
         assert r.status_code == 422
 
-    def test_missing_new_password_returns_422(self, client, captured_emails):
+    @pytest.mark.usefixtures("captured_emails")
+    def test_missing_new_password_returns_422(self, client: TestClient) -> None:
         token = register_and_login(client)
         r = client.put(
             PASSWORD_URL, json={"current_password": PASSWORD}, headers=bearer(token)
@@ -110,19 +105,22 @@ class TestChangeMyPassword:
 
         assert r.status_code == 422
 
-    def test_returns_401_without_token(self, client, captured_emails):
+    @pytest.mark.usefixtures("captured_emails")
+    def test_returns_401_without_token(self, client: TestClient) -> None:
         register_and_login(client)
         r = change_password(client, None, PASSWORD, "NewSecure456!")
 
         assert r.status_code == 401
 
-    def test_returns_401_with_invalid_token(self, client, captured_emails):
+    @pytest.mark.usefixtures("captured_emails")
+    def test_returns_401_with_invalid_token(self, client: TestClient) -> None:
         register_and_login(client)
         r = change_password(client, "garbage.token.here", PASSWORD, "NewSecure456!")
 
         assert r.status_code == 401
 
-    def test_patch_is_no_longer_routed(self, client, captured_emails):
+    @pytest.mark.usefixtures("captured_emails")
+    def test_patch_is_no_longer_routed(self, client: TestClient) -> None:
         token = register_and_login(client)
         r = client.patch(
             PASSWORD_URL,
@@ -133,7 +131,8 @@ class TestChangeMyPassword:
         assert r.status_code == 405
         assert r.json()["code"] == "method_not_allowed"
 
-    def test_password_change_is_user_specific(self, client, captured_emails):
+    @pytest.mark.usefixtures("captured_emails")
+    def test_password_change_is_user_specific(self, client: TestClient) -> None:
         """Changing alice's password must not affect bob's credentials."""
         token_alice = register_and_login(client, username="alice")
         register_and_login(client, username="bob")
@@ -145,8 +144,8 @@ class TestChangeMyPassword:
 
 class TestChangeMyEmail:
     def test_full_flow_switches_and_verifies_the_address(
-        self, client, captured_emails, db
-    ):
+        self, client: TestClient, captured_emails: CapturedEmails, db: Db
+    ) -> None:
         token = register_and_login(client)
         captured_emails.clear()
 
@@ -170,7 +169,9 @@ class TestChangeMyEmail:
         assert r.json()["user"]["email"] == "new.alice@example.com"
         assert audit_count(db, "email_changed", "alice") == 1
 
-    def test_old_address_stays_until_confirmed(self, client, captured_emails, db):
+    def test_old_address_stays_until_confirmed(
+        self, client: TestClient, captured_emails: CapturedEmails, db: Db
+    ) -> None:
         token = register_and_login(client)
 
         assert change_email(client, token, "new@example.com").status_code == 202
@@ -184,7 +185,10 @@ class TestChangeMyEmail:
         assert captured_emails.of_kind("change_email")[0].to == "new@example.com"
         assert audit_count(db, "email_changed", "alice") == 0
 
-    def test_request_is_audited_as_verification_sent(self, client, captured_emails, db):
+    @pytest.mark.usefixtures("captured_emails")
+    def test_request_is_audited_as_verification_sent(
+        self, client: TestClient, db: Db
+    ) -> None:
         token = register_and_login(client)
         before = audit_count(db, "email_verification_sent", "alice")
 
@@ -197,7 +201,9 @@ class TestChangeMyEmail:
         )
         assert detail == "Email change requested"
 
-    def test_token_is_single_use(self, client, captured_emails, db):
+    def test_token_is_single_use(
+        self, client: TestClient, captured_emails: CapturedEmails, db: Db
+    ) -> None:
         token = register_and_login(client)
         change_email(client, token, "new@example.com")
         mail_token = captured_emails.latest_token("new@example.com", "change_email")
@@ -210,8 +216,8 @@ class TestChangeMyEmail:
         assert audit_count(db, "email_changed", "alice") == 1
 
     def test_confirmed_change_invalidates_reset_links_sent_before(
-        self, client, captured_emails, db
-    ):
+        self, client: TestClient, captured_emails: CapturedEmails
+    ) -> None:
         """A reset link mailed to the old address must not outlive the change."""
         token = register_and_login(client)
         client.post("/api/v1/auth/password/forgot", json={"email": "alice@example.com"})
@@ -220,32 +226,28 @@ class TestChangeMyEmail:
         mail_token = captured_emails.latest_token("new@example.com", "change_email")
 
         assert client.post(VERIFY_URL, json={"token": mail_token}).status_code == 204
-        r = client.post(
-            "/api/v1/auth/password/reset",
-            json={"token": reset_token, "new_password": "AttackerPass789!"},
-        )
+        r = reset_password(client, reset_token, "AttackerPass789!")
 
         assert r.status_code == 400
         assert r.json()["code"] == "invalid_token"
         assert login(client, username="alice").status_code == 200
 
-    def test_unconfirmed_change_keeps_reset_links_valid(self, client, captured_emails):
+    def test_unconfirmed_change_keeps_reset_links_valid(
+        self, client: TestClient, captured_emails: CapturedEmails
+    ) -> None:
         """Only the confirmation switches the address, so only it ends them."""
         token = register_and_login(client)
         client.post("/api/v1/auth/password/forgot", json={"email": "alice@example.com"})
         reset_token = captured_emails.latest_token("alice@example.com", "reset")
         change_email(client, token, "new@example.com")
 
-        r = client.post(
-            "/api/v1/auth/password/reset",
-            json={"token": reset_token, "new_password": "NewPassword456!"},
-        )
+        r = reset_password(client, reset_token, "NewPassword456!")
 
         assert r.status_code == 204
 
     def test_a_new_request_invalidates_the_previous_link(
-        self, client, captured_emails, db
-    ):
+        self, client: TestClient, captured_emails: CapturedEmails, db: Db
+    ) -> None:
         token = register_and_login(client)
         change_email(client, token, "first@example.com")
         first = captured_emails.latest_token("first@example.com", "change_email")
@@ -257,8 +259,8 @@ class TestChangeMyEmail:
         assert db.scalar("SELECT email FROM users") == "second@example.com"
 
     def test_address_taken_between_request_and_confirm_returns_409(
-        self, client, captured_emails, db
-    ):
+        self, client: TestClient, captured_emails: CapturedEmails, db: Db
+    ) -> None:
         token = register_and_login(client)
         change_email(client, token, "contested@example.com")
         mail_token = captured_emails.latest_token(
@@ -281,7 +283,9 @@ class TestChangeMyEmail:
         )
         assert audit_count(db, "email_changed", "alice") == 0
 
-    def test_wrong_password_returns_400(self, client, captured_emails, db):
+    def test_wrong_password_returns_400(
+        self, client: TestClient, captured_emails: CapturedEmails, db: Db
+    ) -> None:
         token = register_and_login(client)
         captured_emails.clear()
 
@@ -297,9 +301,10 @@ class TestChangeMyEmail:
             == 0
         )
 
+    @pytest.mark.usefixtures("captured_emails")
     def test_wrong_password_hides_whether_the_address_is_taken(
-        self, client, captured_emails
-    ):
+        self, client: TestClient
+    ) -> None:
         register(client, username="bob", email="bob@example.com")
         token = register_and_login(client)
 
@@ -308,7 +313,9 @@ class TestChangeMyEmail:
         assert r.status_code == 400
         assert r.json()["code"] == "wrong_password"
 
-    def test_address_of_another_account_returns_409(self, client, captured_emails):
+    def test_address_of_another_account_returns_409(
+        self, client: TestClient, captured_emails: CapturedEmails
+    ) -> None:
         register(client, username="bob", email="bob@example.com")
         token = register_and_login(client)
         captured_emails.clear()
@@ -319,7 +326,9 @@ class TestChangeMyEmail:
         assert r.json()["code"] == "email_taken"
         assert captured_emails == []
 
-    def test_current_address_returns_400_email_unchanged(self, client, captured_emails):
+    def test_current_address_returns_400_email_unchanged(
+        self, client: TestClient, captured_emails: CapturedEmails
+    ) -> None:
         token = register_and_login(client)
         captured_emails.clear()
 
@@ -329,14 +338,16 @@ class TestChangeMyEmail:
         assert r.json()["code"] == "email_unchanged"
         assert captured_emails == []
 
-    def test_invalid_address_returns_422(self, client, captured_emails):
+    @pytest.mark.usefixtures("captured_emails")
+    def test_invalid_address_returns_422(self, client: TestClient) -> None:
         token = register_and_login(client)
         r = change_email(client, token, "not-an-email")
 
         assert r.status_code == 422
         assert [e["field"] for e in r.json()["errors"]] == ["new_email"]
 
-    def test_returns_401_without_token(self, client, captured_emails):
+    @pytest.mark.usefixtures("captured_emails")
+    def test_returns_401_without_token(self, client: TestClient) -> None:
         register_and_login(client)
         r = change_email(client, None, "new@example.com")
 

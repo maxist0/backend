@@ -6,19 +6,23 @@ cases are in `tests/integration/core/test_health.py`.
 
 import asyncio
 import logging
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from httpx2 import Response
 
-import app.main as main
+from app import main
 from app.core.config import get_settings
-from tests.helpers import new_test_client
+from tests.helpers import SettingsFactory, log_events, new_test_client
 
 _SECRET_DETAIL = "FATAL: password authentication failed for user alice@example.com"
 
 
 class _Connection:
-    async def execute(self, statement):
+    async def execute(self, _statement: object) -> None:
         return None
 
 
@@ -29,7 +33,7 @@ class _Engine:
         self.mode = mode
 
     @asynccontextmanager
-    async def connect(self):
+    async def connect(self) -> AsyncGenerator[_Connection]:
         if self.mode == "fail":
             raise ConnectionRefusedError(_SECRET_DETAIL)
         if self.mode == "hang":
@@ -50,23 +54,25 @@ class _Redis:
 
 
 @pytest.fixture
-def app(settings_factory):
+def app(settings_factory: SettingsFactory) -> FastAPI:
     return main.create_app(settings_factory())
 
 
 @pytest.fixture
-def client(app):
+def client(app: FastAPI) -> TestClient:
     return new_test_client(app, follow_redirects=False)
 
 
-def _ready(app, client, *, database: str = "ok", redis: str = "ok"):
+def _ready(
+    app: FastAPI, client: TestClient, *, database: str = "ok", redis: str = "ok"
+) -> Response:
     app.state.engine = _Engine(database)
     app.state.redis = _Redis(redis)
     return client.get("/health/ready")
 
 
 class TestLiveness:
-    def test_ok_without_any_dependency(self, client):
+    def test_ok_without_any_dependency(self, client: TestClient) -> None:
         """No lifespan ran: no engine, no Redis. Liveness still answers."""
         r = client.get("/health")
 
@@ -77,7 +83,7 @@ class TestLiveness:
 
 
 class TestReadiness:
-    def test_ok_when_both_answer(self, app, client):
+    def test_ok_when_both_answer(self, app: FastAPI, client: TestClient) -> None:
         r = _ready(app, client)
 
         assert r.status_code == 200
@@ -91,8 +97,14 @@ class TestReadiness:
         [("fail", "ok", "database"), ("ok", "fail", "redis")],
     )
     def test_503_names_the_failed_check_without_error_text(
-        self, app, client, caplog, database, redis, failed
-    ):
+        self,
+        app: FastAPI,
+        client: TestClient,
+        caplog: pytest.LogCaptureFixture,
+        database: str,
+        redis: str,
+        failed: str,
+    ) -> None:
         caplog.set_level(logging.WARNING)
 
         r = _ready(app, client, database=database, redis=redis)
@@ -102,15 +114,13 @@ class TestReadiness:
         assert body["status"] == "error"
         assert body["checks"][failed] == "error"
         assert _SECRET_DETAIL not in r.text
-        [event] = [
-            rec.msg
-            for rec in caplog.records
-            if isinstance(rec.msg, dict) and rec.msg["event"] == "health.check_failed"
-        ]
+        [event] = log_events(caplog, "health.check_failed")
         assert event["check"] == failed
         assert _SECRET_DETAIL not in caplog.text
 
-    def test_a_hanging_dependency_fails_after_the_timeout(self, app, client):
+    def test_a_hanging_dependency_fails_after_the_timeout(
+        self, app: FastAPI, client: TestClient
+    ) -> None:
         fast = get_settings().model_copy(update={"READINESS_TIMEOUT_SECONDS": 0.05})
         app.dependency_overrides[get_settings] = lambda: fast
 
@@ -121,7 +131,7 @@ class TestReadiness:
 
 
 class TestMetricsEndpoint:
-    def test_prometheus_text_with_default_collectors(self, client):
+    def test_prometheus_text_with_default_collectors(self, client: TestClient) -> None:
         client.get("/health")
 
         r = client.get("/metrics")
@@ -134,16 +144,20 @@ class TestMetricsEndpoint:
         assert "python_info" in r.text
         assert "python_gc_objects_collected_total" in r.text
 
-    def test_trailing_slash_redirects_to_the_exact_path(self, client):
+    def test_trailing_slash_redirects_to_the_exact_path(
+        self, client: TestClient
+    ) -> None:
         r = client.get("/metrics/")
 
         assert r.status_code == 307
         assert r.headers["location"].endswith("/metrics")
 
-    def test_not_in_the_openapi_document(self, app):
+    def test_not_in_the_openapi_document(self, app: FastAPI) -> None:
         assert "/metrics" not in app.openapi()["paths"]
 
-    def test_disabled_metrics_are_not_mounted(self, settings_factory):
+    def test_disabled_metrics_are_not_mounted(
+        self, settings_factory: SettingsFactory
+    ) -> None:
         app = main.create_app(settings_factory(METRICS_ENABLED=False))
 
         r = new_test_client(app).get("/metrics")

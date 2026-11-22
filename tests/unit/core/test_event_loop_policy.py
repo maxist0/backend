@@ -5,9 +5,11 @@ from pathlib import Path
 from tests.helpers import BACKEND_DIR
 
 
-def test_nothing_sets_the_deprecated_event_loop_policy():
-    """asyncio's policy system is deprecated (removal in 3.16): loops are made
-    through loop factories only."""
+def test_nothing_sets_the_deprecated_event_loop_policy() -> None:
+    """Loops are made through loop factories only.
+
+    Asyncio's policy system is deprecated (removal in 3.16).
+    """
     needle = "set_event_loop" + "_policy("
     selector_policy = "WindowsSelector" + "EventLoopPolicy("
     offenders = [

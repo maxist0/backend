@@ -39,7 +39,7 @@ METRICS_DIR = Path(
 )
 METRICS_DIR.mkdir(parents=True, exist_ok=True)
 
-import app.modules  # noqa: E402, F401 - after the env var; registers every module's tasks
+import app.modules  # noqa: E402, F401  # pyright: ignore[reportUnusedImport] - after the env var; registers every module's tasks
 from app.core import get_settings  # noqa: E402 - after PROMETHEUS_MULTIPROC_DIR
 from app.core.tasks import (  # noqa: E402 - after PROMETHEUS_MULTIPROC_DIR
     build_retry_source,

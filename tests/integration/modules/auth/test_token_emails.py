@@ -9,11 +9,16 @@ for the transport test.
 
 import json
 import logging
-import os
 import uuid
+from collections.abc import Sequence
+from typing import Never
 
 import pytest
-import redis as redis_sync
+from fastapi.testclient import TestClient
+from fastapi_mail import MessageSchema
+from sqlalchemy import RowMapping
+from sqlalchemy.ext.asyncio import AsyncSession
+from taskiq import BrokerMessage
 from taskiq.receiver import Receiver
 
 from app.core.config import get_settings
@@ -25,32 +30,37 @@ from app.core.tasks import (
     build_retry_middleware,
     build_retry_source,
 )
-from app.modules.auth import service
+from app.modules.auth import crud, service
+from app.modules.auth.models import EmailToken
 from app.modules.auth.tasks import send_token_email_task
 from tests.helpers import (
     PASSWORD,
+    PII_EMAIL,
+    PII_USERNAME,
+    CapturedEmail,
+    CapturedEmails,
+    Db,
+    app_of,
+    assert_nothing_personal_in_redis,
     bearer,
+    call_in_app,
+    change_email,
+    log_events,
     login_tokens,
+    redis_from_env,
+    redis_keys,
     register_ok,
+    reset_password,
     run_async,
+    run_task,
     user_id_of,
+    verify_email,
 )
-from tests.integration.conftest import CapturedEmail, run_task
 
-ZEBRA_USER = "zebra_user_91"
-ZEBRA_MAIL = "zebra.mail91@example.com"
 ENQUEUE_FAILED = "auth.email_enqueue_failed"
 
 
-def _events(caplog, name: str) -> list[dict]:
-    return [
-        r.msg
-        for r in caplog.records
-        if isinstance(r.msg, dict) and r.msg.get("event") == name
-    ]
-
-
-def _open_tokens(db, username: str, purpose: str) -> list:
+def _open_tokens(db: Db, username: str, purpose: str) -> Sequence[RowMapping]:
     return db.rows(
         "SELECT t.* FROM email_tokens t JOIN users u ON u.id = t.user_id "
         "WHERE u.username = :u AND lower(t.purpose::text) = :p "
@@ -60,7 +70,7 @@ def _open_tokens(db, username: str, purpose: str) -> list:
     )
 
 
-def _latest_token_id(db, username: str, purpose: str) -> str:
+def _latest_token_id(db: Db, username: str, purpose: str) -> str:
     """Id of the user's newest token of `purpose`, open or not."""
     return str(
         db.scalar(
@@ -73,61 +83,30 @@ def _latest_token_id(db, username: str, purpose: str) -> str:
     )
 
 
-def _redis_dump() -> bytes:
-    """Every key and value in every Redis database the app uses."""
-    port = int(os.environ["CACHE_PORT"])
-    chunks: list[bytes] = []
-    for db_index in range(16):
-        with redis_sync.Redis(port=port, db=db_index) as r:
-            for key in r.scan_iter():
-                chunks.append(key)
-                kind = r.type(key)
-                if kind == b"string":
-                    chunks.append(r.get(key) or b"")
-                elif kind == b"list":
-                    chunks.extend(r.lrange(key, 0, -1))
-                elif kind == b"stream":
-                    for _id, fields in r.xrange(key):
-                        chunks.extend(fields.values())
-                elif kind == b"hash":
-                    chunks.extend(r.hgetall(key).values())
-                elif kind == b"set":
-                    chunks.extend(r.smembers(key))
-                elif kind == b"zset":
-                    chunks.extend(r.zrange(key, 0, -1))
-                else:
-                    raise AssertionError(f"unexpected Redis type {kind!r}")
-    return b"\n".join(chunks)
-
-
-def _assert_nothing_personal_in_redis(*secrets: str) -> None:
-    dump = _redis_dump()
-    for secret in (ZEBRA_USER, ZEBRA_MAIL, *secrets):
-        assert secret.encode() not in dump, secret
-        assert secret.lower().encode() not in dump.lower(), secret
-
-
 class TestRedisHoldsNothingPersonal:
     def test_stream_entry_and_retry_schedule_carry_only_the_token_id(
-        self, redis_broker_client, db, monkeypatch
-    ):
-        register_ok(redis_broker_client, username=ZEBRA_USER, email=ZEBRA_MAIL)
-        [placeholder] = _open_tokens(db, ZEBRA_USER, "verify_email")
+        self, redis_broker_client: TestClient, db: Db, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        register_ok(redis_broker_client, username=PII_USERNAME, email=PII_EMAIL)
+        [placeholder] = _open_tokens(db, PII_USERNAME, "verify_email")
         token_id = str(placeholder["id"])
 
         # Before any worker consumed it (acknowledged entries are deleted).
-        with redis_sync.Redis.from_url(os.environ["TASKIQ_BROKER_URL"]) as r:
-            [(_entry_id, fields)] = r.xrange(TASK_STREAM)
+        with redis_from_env("TASKIQ_BROKER_URL") as r:
+            entries = r.xrange(TASK_STREAM)
+        assert entries
+        [(_entry_id, fields)] = entries
+        assert fields is not None
         message = json.loads(fields[b"data"])
         assert message["task_name"] == "email.send_token_email"
         assert message["args"] == [token_id]
         assert message["kwargs"] == {}
-        _assert_nothing_personal_in_redis(placeholder["token_hash"])
+        assert_nothing_personal_in_redis(placeholder["token_hash"])
 
         attempted: list[CapturedEmail] = []
 
         class _TimingOutMailer:
-            async def send_message(self, message) -> None:
+            async def send_message(self, message: MessageSchema) -> None:
                 attempted.append(CapturedEmail.from_message(message))
                 raise TimeoutError()
 
@@ -154,57 +133,69 @@ class TestRedisHoldsNothingPersonal:
         run_async(_worker_takes_the_entry())
 
         [mail] = attempted
-        assert mail.to == ZEBRA_MAIL
-        with redis_sync.Redis.from_url(os.environ["TASKIQ_BROKER_URL"]) as r:
-            [data_key] = r.keys(f"{RETRY_SCHEDULE_PREFIX}:data:*")
-            schedule = json.loads(r.get(data_key))
+        assert mail.to == PII_EMAIL
+        with redis_from_env("TASKIQ_BROKER_URL") as r:
+            [data_key] = redis_keys(r, f"{RETRY_SCHEDULE_PREFIX}:data:*")
+            raw_schedule = r.get(data_key)
+            assert raw_schedule is not None
+            schedule = json.loads(raw_schedule)
             assert r.xlen(TASK_STREAM) == 0
         assert schedule["task_name"] == "email.send_token_email"
         assert schedule["args"] == [token_id]
         assert schedule["kwargs"] == {}
-        _assert_nothing_personal_in_redis(mail.token, hash_token(mail.token))
+        assert mail.token
+        assert_nothing_personal_in_redis(mail.token, hash_token(mail.token))
 
 
 class TestRekeying:
     def test_each_run_mails_a_new_token_and_only_the_last_one_redeems(
-        self, client, captured_emails, db
-    ):
+        self, client: TestClient, captured_emails: CapturedEmails, db: Db
+    ) -> None:
         register_ok(client, username="alice")
-        first = captured_emails["alice@example.com"]
+        first = captured_emails.latest_token("alice@example.com")
 
         run_task(
             client, send_token_email_task, _latest_token_id(db, "alice", "verify_email")
         )
 
-        second = captured_emails["alice@example.com"]
+        second = captured_emails.latest_token("alice@example.com")
         assert len(captured_emails.of_kind("verify")) == 2
         assert first != second
-        r = client.post("/api/v1/auth/email/verify", json={"token": first})
+        r = verify_email(client, first)
         assert r.status_code == 400
-        r = client.post("/api/v1/auth/email/verify", json={"token": second})
+        r = verify_email(client, second)
         assert r.status_code == 204
 
     def test_request_stores_a_hash_that_no_mail_carries(
-        self, client, captured_emails, db, monkeypatch
-    ):
+        self,
+        client: TestClient,
+        captured_emails: CapturedEmails,
+        db: Db,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         """The worker re-keys: the request's own hash is never redeemable."""
         hashes: list[str] = []
-        real_open = service._open_email_token
+        real_create = crud.create_email_token
 
-        async def _spy(db_session, *args, **kwargs):
-            token_id = await real_open(db_session, *args, **kwargs)
-            hashes.extend(o.token_hash for o in db_session.new)
-            return token_id
+        async def _spy(
+            db_session: AsyncSession, token: EmailToken, *, commit: bool = True
+        ) -> EmailToken:
+            hashes.append(token.token_hash)
+            return await real_create(db_session, token, commit=commit)
 
-        monkeypatch.setattr(service, "_open_email_token", _spy)
+        monkeypatch.setattr(crud, "create_email_token", _spy)
         register_ok(client, username="alice")
 
         [token] = _open_tokens(db, "alice", "verify_email")
-        mail_token = captured_emails["alice@example.com"]
+        mail_token = captured_emails.latest_token("alice@example.com")
         assert token["token_hash"] == hash_token(mail_token)
-        assert hashes and token["token_hash"] not in hashes
+        assert hashes
+        assert token["token_hash"] not in hashes
 
-    def test_expiry_stays_as_the_request_set_it(self, client, captured_emails, db):
+    @pytest.mark.usefixtures("captured_emails")
+    def test_expiry_stays_as_the_request_set_it(
+        self, client: TestClient, db: Db
+    ) -> None:
         register_ok(client, username="alice")
         [before] = _open_tokens(db, "alice", "verify_email")
 
@@ -217,15 +208,11 @@ class TestRekeying:
         assert after["token_hash"] != before["token_hash"]
 
     def test_change_email_goes_to_the_new_address_from_the_token(
-        self, client, captured_emails, db
-    ):
+        self, client: TestClient, captured_emails: CapturedEmails
+    ) -> None:
         register_ok(client, username="alice")
         tokens = login_tokens(client, "alice")
-        r = client.put(
-            "/api/v1/users/me/email",
-            json={"current_password": PASSWORD, "new_email": "new@example.com"},
-            headers=bearer(tokens.access),
-        )
+        r = change_email(client, tokens.access, "new@example.com")
         assert r.status_code == 202
 
         [mail] = captured_emails.of_kind("change_email")
@@ -233,11 +220,13 @@ class TestRekeying:
 
 
 class TestOneTokenPerMail:
-    """Parallel requests can leave two open tokens of one purpose; each task
-    keys its own token, and a redemption ends the other one."""
+    """Each task keys its own token, and a redemption ends the other one.
+
+    Parallel requests can leave two open tokens of one purpose.
+    """
 
     @staticmethod
-    def _second_open_token(db, username: str, purpose: str) -> str:
+    def _second_open_token(db: Db, username: str, purpose: str) -> str:
         """Copy the user's open token of `purpose` as an older, open row."""
         token_id = str(uuid.uuid4())
         db.execute(
@@ -251,7 +240,9 @@ class TestOneTokenPerMail:
         )
         return token_id
 
-    def test_task_keys_only_its_own_token(self, client, captured_emails, db):
+    def test_task_keys_only_its_own_token(
+        self, client: TestClient, captured_emails: CapturedEmails, db: Db
+    ) -> None:
         register_ok(client, username="alice")
         older = self._second_open_token(db, "alice", "verify_email")
         newest = _latest_token_id(db, "alice", "verify_email")
@@ -264,17 +255,18 @@ class TestOneTokenPerMail:
             str(row["id"]): row["token_hash"]
             for row in _open_tokens(db, "alice", "verify_email")
         }
+        assert mail.token
         assert hashes[older] == hash_token(mail.token)
         assert hashes[newest] != hash_token(mail.token)
 
     def test_redeeming_one_token_ends_the_other_open_one(
-        self, client, captured_emails, db
-    ):
+        self, client: TestClient, captured_emails: CapturedEmails, db: Db
+    ) -> None:
         register_ok(client, username="alice")
         older = self._second_open_token(db, "alice", "verify_email")
-        token = captured_emails["alice@example.com"]
+        token = captured_emails.latest_token("alice@example.com")
 
-        r = client.post("/api/v1/auth/email/verify", json={"token": token})
+        r = verify_email(client, token)
 
         assert r.status_code == 204
         assert _open_tokens(db, "alice", "verify_email") == []
@@ -283,17 +275,14 @@ class TestOneTokenPerMail:
         assert captured_emails == []
 
     def test_redeeming_a_reset_token_ends_the_other_open_one(
-        self, client, captured_emails, db
-    ):
+        self, client: TestClient, captured_emails: CapturedEmails, db: Db
+    ) -> None:
         register_ok(client, username="alice")
         client.post("/api/v1/auth/password/forgot", json={"email": "alice@example.com"})
         self._second_open_token(db, "alice", "reset_password")
         token = captured_emails.latest_token("alice@example.com", "reset")
 
-        r = client.post(
-            "/api/v1/auth/password/reset",
-            json={"token": token, "new_password": "N3w-Password!"},
-        )
+        r = reset_password(client, token, "N3w-Password!")
 
         assert r.status_code == 204
         assert _open_tokens(db, "alice", "reset_password") == []
@@ -301,8 +290,12 @@ class TestOneTokenPerMail:
 
 class TestNothingToSend:
     def test_stale_retry_after_expiry_sends_nothing(
-        self, client, captured_emails, db, caplog
-    ):
+        self,
+        client: TestClient,
+        captured_emails: CapturedEmails,
+        db: Db,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
         register_ok(client, username="alice")
         captured_emails.clear()
         token_id = _latest_token_id(db, "alice", "verify_email")
@@ -318,13 +311,13 @@ class TestNothingToSend:
         )
 
         assert captured_emails == []
-        [event] = _events(caplog, "email.not_sent")
+        [event] = log_events(caplog, "email.not_sent")
         assert event["reason"] == "no_open_token"
         assert event["token_id"] == token_id
 
     def test_token_cancelled_by_a_password_change_is_not_mailed(
-        self, client, captured_emails, db
-    ):
+        self, client: TestClient, captured_emails: CapturedEmails, db: Db
+    ) -> None:
         register_ok(client, username="alice")
         tokens = login_tokens(client, "alice")
         r = client.post(
@@ -351,19 +344,19 @@ class TestNothingToSend:
         assert captured_emails == []
 
     def test_token_cancelled_by_an_admin_lock_is_not_mailed(
-        self, client, captured_emails, db
-    ):
+        self, client: TestClient, captured_emails: CapturedEmails, db: Db
+    ) -> None:
         register_ok(client, username="alice")
         captured_emails.clear()
         user_id = user_id_of(db, "alice")
 
         async def _admin_lock() -> None:
-            async with client.app.state.session_factory() as session:
+            async with app_of(client).state.session_factory() as session:
                 assert await service.admin_lock_user(
                     session, uuid.UUID(user_id), actor="admin"
                 )
 
-        client.portal.call(_admin_lock)
+        call_in_app(client, _admin_lock)
         run_task(
             client, send_token_email_task, _latest_token_id(db, "alice", "verify_email")
         )
@@ -374,10 +367,17 @@ class TestNothingToSend:
         "block", ["is_active = false", "is_locked = true, locked_until = NULL"]
     )
     def test_blocked_account_gets_no_mail_and_its_token_ends(
-        self, client, captured_emails, db, caplog, block
-    ):
-        """A token left open for a blocked account (a request that raced the
-        block) is not mailed and is invalidated."""
+        self,
+        client: TestClient,
+        captured_emails: CapturedEmails,
+        db: Db,
+        caplog: pytest.LogCaptureFixture,
+        block: str,
+    ) -> None:
+        """A token left open for a blocked account is not mailed; it ends.
+
+        Such a token comes from a request that raced the block.
+        """
         register_ok(client, username="alice")
         captured_emails.clear()
         user_id = user_id_of(db, "alice")
@@ -390,12 +390,16 @@ class TestNothingToSend:
 
         assert captured_emails == []
         assert _open_tokens(db, "alice", "verify_email") == []
-        [event] = _events(caplog, "email.not_sent")
+        [event] = log_events(caplog, "email.not_sent")
         assert event["reason"] == "account_blocked"
 
     def test_verified_address_gets_no_verification_mail(
-        self, client, captured_emails, db, caplog
-    ):
+        self,
+        client: TestClient,
+        captured_emails: CapturedEmails,
+        db: Db,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
         register_ok(client, username="alice")
         captured_emails.clear()
         user_id = user_id_of(db, "alice")
@@ -408,17 +412,21 @@ class TestNothingToSend:
 
         assert captured_emails == []
         assert _open_tokens(db, "alice", "verify_email") == []
-        [event] = _events(caplog, "email.not_sent")
+        [event] = log_events(caplog, "email.not_sent")
         assert event["reason"] == "already_verified"
 
 
 class TestMailNotConfigured:
     def test_task_logs_one_clear_event_and_leaves_the_token(
-        self, client, db, caplog, monkeypatch
-    ):
+        self,
+        client: TestClient,
+        db: Db,
+        caplog: pytest.LogCaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         """No `captured_emails`: the test process has no mail configuration."""
 
-        async def _no_rekey(*_args):
+        async def _no_rekey(*_args: object) -> Never:
             raise AssertionError("the token must not be re-keyed")
 
         # A call would fail the task, and the `client` fixture the test.
@@ -427,32 +435,39 @@ class TestMailNotConfigured:
 
         register_ok(client, username="alice")
 
-        [event] = _events(caplog, "email.not_sent")
+        [event] = log_events(caplog, "email.not_sent")
         assert event["reason"] == "mail_not_configured"
         assert event["token_id"] == _latest_token_id(db, "alice", "verify_email")
-        assert _events(caplog, "email.sent") == []
+        assert log_events(caplog, "email.sent") == []
         assert len(_open_tokens(db, "alice", "verify_email")) == 1
 
 
 class TestEnqueueFailure:
-    """The token row is committed before the enqueue; a broker failure after
-    the commit answers as on success and is logged with its type."""
+    """A broker failure after the commit answers as on success and is logged.
+
+    The token row is committed before the enqueue; the log names the error
+    type only.
+    """
 
     @staticmethod
-    def _break_broker(client) -> None:
-        async def _kick(_message):
+    def _break_broker(client: TestClient) -> None:
+        async def _kick(_message: BrokerMessage) -> Never:
             raise ConnectionError("broker down")
 
-        client.app.state.broker.kick = _kick
+        app_of(client).state.broker.kick = _kick
 
-    def _assert_logged(self, caplog, db, username: str, purpose: str) -> None:
-        [event] = _events(caplog, ENQUEUE_FAILED)
+    def _assert_logged(
+        self, caplog: pytest.LogCaptureFixture, db: Db, username: str, purpose: str
+    ) -> None:
+        [event] = log_events(caplog, ENQUEUE_FAILED)
         assert event["user_id"] == user_id_of(db, username)
         assert event["purpose"] == purpose
         assert event["error_type"] == "ConnectionError"
         assert len(_open_tokens(db, username, purpose)) == 1
 
-    def test_register_answers_201(self, client, db, caplog):
+    def test_register_answers_201(
+        self, client: TestClient, db: Db, caplog: pytest.LogCaptureFixture
+    ) -> None:
         caplog.set_level(logging.INFO)
         self._break_broker(client)
 
@@ -464,7 +479,9 @@ class TestEnqueueFailure:
         assert r.status_code == 201
         self._assert_logged(caplog, db, "alice", "verify_email")
 
-    def test_forgot_password_answers_202(self, client, db, caplog):
+    def test_forgot_password_answers_202(
+        self, client: TestClient, db: Db, caplog: pytest.LogCaptureFixture
+    ) -> None:
         register_ok(client, username="alice")
         caplog.set_level(logging.INFO)
         self._break_broker(client)
@@ -476,7 +493,9 @@ class TestEnqueueFailure:
         assert r.status_code == 202
         self._assert_logged(caplog, db, "alice", "reset_password")
 
-    def test_resend_and_email_change_answer_202(self, client, db, caplog):
+    def test_resend_and_email_change_answer_202(
+        self, client: TestClient, db: Db, caplog: pytest.LogCaptureFixture
+    ) -> None:
         register_ok(client, username="alice")
         tokens = login_tokens(client, "alice")
         caplog.set_level(logging.INFO)
@@ -486,14 +505,10 @@ class TestEnqueueFailure:
             "/api/v1/auth/email/verify/resend", headers=bearer(tokens.access)
         )
         assert r.status_code == 202
-        r = client.put(
-            "/api/v1/users/me/email",
-            json={"current_password": PASSWORD, "new_email": "new@example.com"},
-            headers=bearer(tokens.access),
-        )
+        r = change_email(client, tokens.access, "new@example.com")
         assert r.status_code == 202
 
-        events = _events(caplog, ENQUEUE_FAILED)
+        events = log_events(caplog, ENQUEUE_FAILED)
         assert [e["purpose"] for e in events] == [
             "verify_email",
             "change_email",
@@ -512,8 +527,13 @@ class TestForgotPasswordForBlockedAccounts:
         ],
     )
     def test_answers_202_without_token_or_mail(
-        self, client, captured_emails, db, block, detail
-    ):
+        self,
+        client: TestClient,
+        captured_emails: CapturedEmails,
+        db: Db,
+        block: str,
+        detail: str,
+    ) -> None:
         register_ok(client, username="alice")
         captured_emails.clear()
         db.execute(f"UPDATE users SET {block} WHERE username = 'alice'")
@@ -532,7 +552,9 @@ class TestForgotPasswordForBlockedAccounts:
         )
         assert row["detail"] == detail
 
-    def test_timed_lock_still_gets_a_reset_link(self, client, captured_emails, db):
+    def test_timed_lock_still_gets_a_reset_link(
+        self, client: TestClient, captured_emails: CapturedEmails, db: Db
+    ) -> None:
         """Only the admin lock blocks; a lock from failed logins does not."""
         register_ok(client, username="alice")
         db.execute(
@@ -549,7 +571,9 @@ class TestForgotPasswordForBlockedAccounts:
 
 
 class TestMailLinks:
-    def test_links_are_absolute_frontend_urls(self, client, captured_emails, db):
+    def test_links_are_absolute_frontend_urls(
+        self, client: TestClient, captured_emails: CapturedEmails
+    ) -> None:
         register_ok(client, username="alice")
         client.post("/api/v1/auth/password/forgot", json={"email": "alice@example.com"})
 
