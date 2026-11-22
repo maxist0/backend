@@ -68,4 +68,4 @@ Chosen option: "`RedisStreamBroker` with `SmartRetryMiddleware` and a Redis sche
 * taskiq middlewares, including `SmartRetryMiddleware` and its `schedule_source`: <https://taskiq-python.github.io/available-components/middlewares.html> (checked 2026-11-17).
 * Installed sources (checked 2026-11-17): taskiq 0.13.0 `middlewares/smart_retry_middleware.py`, `receiver/receiver.py` (acknowledgement after `set_result`); taskiq-redis 1.2.4 `redis_broker.py` (`RedisStreamBroker`), `list_schedule_source.py`.
 * taskiq-redis 1.2.4 lets every redis-py error escape `RedisStreamBroker.listen`, so a worker died and restarted when Redis was briefly unreachable. The app's `ReconnectingStreamBroker` waits and reads again.
-* Conventions: [AGENTS.md → Caching and background jobs](../../AGENTS.md#caching-and-background-jobs-target).
+* Conventions: [AGENTS.md → Caching and background jobs](../../AGENTS.md#caching-and-background-jobs).

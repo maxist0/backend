@@ -56,4 +56,4 @@ Chosen option: "two folders, unit and integration", because the rule "needs no D
 
 ## More Information
 
-Conventions: [AGENTS.md → Testing](../../AGENTS.md#testing-target).
+Conventions: [AGENTS.md → Testing](../../AGENTS.md#testing). The shared helpers in `tests/helpers.py` and the OpenAPI snapshot (`UPDATE_OPENAPI_SNAPSHOT=1`) are described in [Testing](../testing.md).

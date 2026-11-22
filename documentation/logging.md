@@ -1,308 +1,80 @@
-# Logging Architecture
+# Logging
 
-## Overview
+How the backend writes logs, which fields and events exist, and what must never be logged. Form: explanation with reference tables. The decision is [ADR 0004](adr/0004-logging-stdout-only.md); the rules for code are in [AGENTS.md → Security rules](../AGENTS.md#security-rules) and [Code style](../AGENTS.md#code-style).
 
-This project uses **structlog** for structured logging with optional OpenTelemetry Protocol (OTLP) export to Grafana Alloy for centralized log collection and analysis. Logging is configured separately for development and production environments.
+## Pipeline
 
-## Logging Stack
+The application writes logs to **stdout only**. A collector (Alloy and Loki in the monitoring stack, or the Docker log driver) reads the container output; the application exports nothing itself.
 
-```
-Application Code
-    ↓ (structlog.get_logger())
-Structlog Processors (timestamp, log_level, exc_info, context)
-    ↓
-stdlib logging bridge (ProcessorFormatter)
-    ├→ StreamHandler (console output)
-    │   ├ DEV:  Rich ConsoleRenderer (colored, human-readable)
-    │   └ PROD: JSONRenderer (machine-readable)
-    │
-    └→ OTLP Handler (when OTLP_LOGS_ENABLED=True)
-        ├ opentelemetry-sdk
-        └ OTLPLogExporter → HTTP → Grafana Alloy → Loki
-```
+`setup_logging(settings)` in `src/app/core/logging.py` configures structlog and the stdlib root logger with one handler, so records from structlog and from stdlib loggers (uvicorn, SQLAlchemy, taskiq) share one pipeline:
 
-## Configuration
+| `ENVIRONMENT` | Output |
+|---|---|
+| `dev` | coloured console renderer (colour only on a TTY; on Windows only when `colorama` is installed) |
+| everything else | one JSON object per line |
 
-Logging is configured in [src/common/logging.py](../src/common/logging.py) and controlled by environment variables in `.env` or `.env.{environment}`.
+Each process calls it once: the API in its lifespan, a worker process in the `WORKER_STARTUP` hook, the scheduler in `CLIENT_STARTUP`. Importing a module configures nothing.
 
-### Environment Variables
+Level and switches:
 
-```ini
-# src/common/config.py defaults
-LOG_LEVEL=INFO                              # DEBUG, INFO, WARNING, ERROR
-ACCESS_LOG_ENABLED=True                     # Enable request access logging
-OTLP_LOGS_ENABLED=True                      # Export logs to OTLP endpoint
-OTLP_ENDPOINT=http://localhost:4318         # Grafana Alloy endpoint
-OTLP_SERVICE_NAME=api                       # Service identifier
-OTLP_HEADERS=                                # Comma-separated: key=value,key2=value2
-```
+| Setting | Default | Effect |
+|---|---|---|
+| `LOG_LEVEL` | `INFO` | Level of the root logger. An unknown name falls back to `INFO` |
+| `ACCESS_LOG_ENABLED` | `true` | One `http.access` event per request |
 
-## Getting a Logger
+Fixed adjustments: uvicorn's own handlers are removed and its access log is replaced by `http.access`; `sqlalchemy` and `python_multipart` stay at `WARNING`; the `taskiq` logger never goes below `INFO`, whatever `LOG_LEVEL` says, because taskiq logs whole task messages at DEBUG.
 
-### Standard Pattern
+## Writing log events
 
 ```python
-from src.common.logging import get_logger
+from app.core import get_logger
 
 logger = get_logger(__name__)
 
-# Structured logging with context
-logger.info("user.created", user_id=user.id, email=user.email)
-logger.warning("cache.miss", key="user:123", duration_ms=45)
-logger.error("db.query.failed", table="users", query_time=1240, error=str(e))
+logger.info("notes.word_count_stored", note_id=note_id, found=found)
 ```
 
-### Using Module Const
+- An event is a stable name, `area.action`, plus key-value fields. Do not write sentences or format values into the name.
+- `user_id` is the only user context. Never log request bodies, query strings, `Authorization`, cookies, emails or usernames.
+- Log an unexpected exception with `log_unexpected_error(logger, "area.event", exc)` or `error_type=type(exc).__name__`, never `error=str(exc)`: database and SMTP error text can contain user data. `log_unexpected_error` adds `error_type` and, for database errors, `db_error_type`, `sqlstate` and `constraint`, and no traceback for database errors.
+- Do not log task arguments that hold anything but ids.
 
-```python
-# At module top-level
-logger: structlog.BoundLogger = structlog.get_logger("src.api.auth")
-```
+## Fields on every record
 
-## Log Events and Structure
+| Field | Source |
+|---|---|
+| `timestamp` | ISO 8601 |
+| `level`, `logger` | stdlib level and logger name |
+| `event` | the event name |
+| `hostname`, `environment` | added to every record |
+| `request_id` | bound by the request middleware for the request; the same value as the `X-Request-ID` header |
+| `user_id` | bound by `CurrentUser` after authentication |
 
-Each log event has:
+`http.access` carries `method`, `path` without the query string, `route` (the route template or `unmatched`), `status`, `duration_ms` and `client_ip` (from the ASGI scope; known gap: IPs are still logged, Roadmap Phase 3).
 
-- **Event name**: Dot-separated namespace (e.g., `app.startup`, `user.created`)
-- **Log level**: DEBUG, INFO, WARNING, ERROR
-- **Timestamp**: ISO 8601 with timezone
-- **Context fields**: Key-value pairs for structured data
+## Event names
 
-### Example Log Events
+The names that exist in the code (extracted from `src/app` on 2026-11-22; run `grep -rn 'logger\.' src/app` for the call sites):
 
-```python
-# Application startup
-logger.info(
-    "app.startup",
-    pid=12345,
-    app_name="api",
-    environment="prod",
-    host="0.0.0.0",
-    port=8000,
-)
+| Area | Events |
+|---|---|
+| App | `app.startup`, `app.shutdown`, `app.shutdown_complete`, `app.unhandled_exception` |
+| HTTP and health | `http.access`, `health.check_failed` |
+| Database and cache | `db.engine_creating`, `db.pool_init`, `db.pool_init_failed`, `db.pool_closed`, `cache.redis_connected`, `cache.connect_failed`, `cache.redis_closed` |
+| Auth | `auth.user_registered`, `auth.register_conflict`, `auth.user_logged_in`, `auth.login_success`, `auth.login_failed`, `auth.login_attempt_unknown_user`, `auth.login_attempt_inactive_account`, `auth.login_attempt_locked_account`, `auth.password_confirmation_failed`, `auth.account_locked`, `auth.account_unlocked`, `auth.token_refreshed`, `auth.token_reuse_detected`, `auth.refresh_denied_account_disabled`, `auth.user_logged_out`, `auth.logout_all`, `auth.password_changed`, `auth.password_rehashed`, `auth.password_reset_completed`, `auth.password_reset_refused_account_blocked`, `auth.email_change_requested`, `auth.email_change_conflict`, `auth.email_changed`, `auth.email_verified`, `auth.email_token_refused_account_blocked`, `auth.verification_email_resent`, `auth.email_enqueue_failed`, `auth.cleanup_done`, `auth.optional_auth_failed`, `jwt.decode_error`, `jwt.invalid_token`, `jwt.token_expired` |
+| Admin | `admin.login_succeeded`, `admin.login_failed`, `admin.cross_site_request_rejected`, `admin.user_locked`, `admin.user_unlocked`, `admin.user_deactivated`, `admin.user_reactivated`, `admin.password_change_forced`, `admin.session_revoked` |
+| Mail | `mail.configured`, `mail.not_configured`, `email.sent`, `email.not_sent` (with `reason`), `email.send_failed` |
+| Tasks | `taskiq.heartbeat`, `taskiq.broker_unavailable`, `taskiq.broker_reconnected` |
 
-# Request processing
-logger.info(
-    "request.start",
-    request_id="550e8400-e29b-41d4-a716-446655440000",
-    method="POST",
-    path="/api/auth/register",
-    ip_address="192.168.1.100",
-)
+## Reading logs in development
 
-# Database operations
-logger.info(
-    "db.query",
-    operation="SELECT",
-    table="users",
-    duration_ms=42,
-    rows_affected=1,
-)
+`run.py dev` prints the coloured console output of the API, the worker and the scheduler into one terminal. In a container, read `docker service logs` or `docker logs`; each line is JSON. Filter by `request_id` to follow one request across the API and, through the token id, the worker.
 
-# Authentication events
-logger.info(
-    "auth.login_success",
-    user_id="550e8400-e29b-41d4-a716-446655440000",
-    method="password",
-    ip_address="192.168.1.100",
-)
+## Testing log output
 
-logger.warning(
-    "auth.login_failed",
-    username="john_doe",
-    reason="invalid_password",
-    ip_address="192.168.1.100",
-    attempt=2,
-)
+`caplog` captures the records; `log_events(caplog, "event.name")` in `tests/helpers.py` returns the structlog event dicts, and `log_text(caplog)` returns everything as text, tracebacks included. Tests such as `tests/unit/modules/auth/test_logging_hygiene.py` and `tests/integration/modules/auth/test_logging_hygiene.py` assert that no username, email or token reaches a log line.
 
-# Cache operations
-logger.info(
-    "cache.hit",
-    key="user:123:profile",
-    duration_ms=1,
-    size_bytes=1024,
-)
-```
+## Not implemented yet
 
-## Development Environment Logging
-
-In development (`env='dev'`):
-
-- **Format**: Rich colored console output (human-readable)
-- **Output**: stdout with syntax highlighting
-- **Log Level**: Controlled by `LOG_LEVEL` (default: INFO)
-- **Example Output**:
-```
-2026-02-27 10:45:23.123 [INFO] app.startup 
-    pid=12345
-    app_name='api'
-    environment='dev'
-    host='localhost'
-    port=8000
-    reload=True
-```
-
-## Production Environment Logging
-
-In production (`env='prod'`):
-
-- **Format**: JSON Lines (one JSON object per line)
-- **Output**: stdout, typically collected by container orchestrator
-- **OTLP Export**: Enabled by default, sends logs to Grafana Alloy
-- **Example Output**:
-```json
-{"timestamp":"2026-02-27T10:45:23.123456Z","level":"info","event":"app.startup","pid":12345,"app_name":"api","environment":"prod"}
-```
-
-## OTLP Log Export
-
-Logs can be exported to OpenTelemetry Collector / Grafana Alloy for centralized collection.
-
-### Setup
-
-1. **Enable OTLP in configuration**:
-```ini
-# .env.prod or .env.stage
-OTLP_LOGS_ENABLED=True
-OTLP_ENDPOINT=http://grafana-alloy:4318
-OTLP_SERVICE_NAME=api
-OTLP_HEADERS=Authorization=Bearer my-token
-```
-
-2. **Grafana Alloy receives logs on**:
-   - HTTP endpoint: `http://localhost:4318/v1/logs`
-   - Batch processor collects logs before export
-
-3. **Logs flow**:
-   Structured logging → OTLP Exporter → Alloy → Loki → Grafana Dashboard
-
-### OTLP Handler Implementation
-
-See [src/common/logging.py](../src/common/logging.py) `_build_otlp_handler()` for details.
-
-Key components:
-- `OTLPLogExporter`: HTTP exporter to OTLP endpoint
-- `LoggerProvider`: Manages log processors
-- `BatchLogRecordProcessor`: Batches logs before export
-- `OtelLoggingHandler`: stdlib logging handler
-
-## Access Log Middleware
-
-HTTP request/response logging via `AccessLogMiddleware`:
-
-**Configuration**:
-```ini
-ACCESS_LOG_ENABLED=True
-```
-
-**Logged for each request**:
-- Request ID (trace ID)
-- Method, path, query string
-- Client IP address, user agent
-- Response status code
-- Response time (ms)
-- Request/response body size
-- User context (if authenticated)
-
-**Example**:
-```json
-{
-  "type": "access_log",
-  "request_id": "550e8400-e29b-41d4-a716-446655440000",
-  "method": "GET",
-  "path": "/api/users/123",
-  "status_code": 200,
-  "duration_ms": 42,
-  "client_ip": "192.168.1.100",
-  "user_agent": "Mozilla/5.0...",
-  "user_id": "550e8400-e29b-41d4-a716-446655440000"
-}
-```
-
-## Request Context & Tracing
-
-Each request gets a unique identifier (`request_id`) that:
-
-- Generated on request entry
-- Propagated through all logs in that request
-- Returned in response headers (`X-Request-ID`)
-- Enables end-to-end request tracing
-
-## Best Practices
-
-1. **Use structured logging**: Always include context fields
-   ```python
-   # Good
-   logger.info("user.created", user_id=user.id, email=user.email)
-   
-   # Avoid
-   logger.info(f"User {user.id} created with email {user.email}")
-   ```
-
-2. **Use consistent event names**: Dot-separated, descriptive
-   ```python
-   # Good: module.entity.action
-   logger.info("auth.user.login_success")
-   logger.error("db.connection.failed")
-   
-   # Avoid: vague names
-   logger.info("Something happened")
-   ```
-
-3. **Include relevant context**: User ID, request ID, duration, etc.
-   ```python
-   logger.info("db.query", user_id=user_id, table="orders", rows=15, ms=42)
-   ```
-
-4. **Log at appropriate levels**:
-   - **DEBUG**: Detailed runtime information (variable values)
-   - **INFO**: General events (login, cache hit, DB operation)
-   - **WARNING**: Unexpected but recoverable situations
-   - **ERROR**: Failures that impact functionality
-
-5. **Sensitive data**: Never log passwords, tokens, API keys
-   ```python
-   # Good
-   logger.info("login.attempt", user_id=user.id)
-   
-   # Bad
-   logger.info("login.attempt", password="secret123")
-   ```
-
-## Testing Logging
-
-In tests, capture logs to verify correct logging:
-
-```python
-import logging
-
-def test_user_creation(caplog):
-    with caplog.at_level(logging.INFO):
-        create_user(username="john")
-    
-    assert "user.created" in caplog.text
-    assert "john" in caplog.text
-```
-
-## Debugging Logs
-
-**Increase log level for verbose output**:
-```bash
-LOG_LEVEL=DEBUG python app.py dev
-```
-
-**Filter logs by event name**:
-```bash
-python app.py dev 2>&1 | grep "auth\."
-```
-
-**View OTLP logs in Grafana Loki**:
-```
-{job="api"} | json | event =~ "auth.*"
-```
-
----
-
-**Related Documentation:**
-- See [environment.md](environment.md) for environment-specific configuration
-- See [monitoring.md](monitoring.md) for metrics and observability
+- Trace and span ids in log records, OTLP export (Roadmap Phase 3; FastAPI's telemetry is switched off in `create_app()` because its log records would carry exception text).
+- Hashing or dropping client IPs.

@@ -35,6 +35,8 @@ Chosen option: "a `Module` dataclass plus an explicit `MODULES` tuple", because 
 * `create_app()` mounts every module router under `settings.API_PREFIX` (default `/api/v1`). The worker imports `module.tasks`, Alembic imports `module.models`, and the admin registers `module.admin_views`.
 * Auth offers modules only the `CurrentUser` and `OptionalUser` aliases for now. Roles and permissions (D3), user events and per-module settings are deferred.
 
+> **Correction, 2026-11-22.** [ADR 0008](0008-module-layout-and-users-auth-split.md) split the merged module. Modules import `CurrentUser`, `OptionalUser` and `User` from `app.modules.users`, not from `app.modules.auth`, and the built-in modules are `users` and `auth`. The first registration line is `MODULES = (users.module, auth.module, ...)`. The decision above is unchanged.
+
 ### Consequences
 
 * Good, because adding a module is one package plus one line in `MODULES`.
@@ -57,4 +59,4 @@ Chosen option: "a `Module` dataclass plus an explicit `MODULES` tuple", because 
 
 ## More Information
 
-Implemented in S1 of the 2026-11 cleanup. Procedure: [AGENTS.md → Adding a module](../../AGENTS.md#adding-a-module-target).
+Implemented in S1 of the 2026-11 cleanup. Procedure: [Adding a module](../modules.md); the rules are in [AGENTS.md → Adding a module](../../AGENTS.md#adding-a-module).

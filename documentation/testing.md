@@ -1,475 +1,95 @@
-# Testing Strategy
+# Testing
 
-## Overview
+How the test suite is organised, how to run it and how to write tests for a module. Form: reference and how-to. The decision is [ADR 0007](adr/0007-test-split-unit-integration.md); the rules are in [AGENTS.md → Testing](../AGENTS.md#testing). A module's complete example tests are in [modules.md](modules.md#step-12-the-tests).
 
-The project uses **pytest** for unit and integration testing with the following structure:
+## Two suites
 
-- **Unit tests** (`tests/unit/`): Pure logic, no Docker, run in seconds
-- **Integration tests** (`tests/integration/`): API endpoints and database operations against Postgres and Redis Testcontainers
-- **No backend end-to-end folder**: End-to-end journeys are covered by frontend Playwright ([ADR 0007](adr/0007-test-split-unit-integration.md))
-- **Test database**: Isolated PostgreSQL instance
-- **Test Redis**: Isolated Redis instance for cache testing
-- **Fixtures**: Reusable test setup (users, sessions, etc.)
+| Suite | Folder | Needs | Rule |
+|---|---|---|---|
+| Unit | `tests/unit/{core,modules/<name>}` | nothing | The code under test needs no database and no Redis |
+| Integration | `tests/integration/{core,contract,modules/<name>,admin}` | a running Docker daemon | `TestClient` against real Postgres and Redis (Testcontainers) |
 
-Testing is configured in `pytest.ini` to automatically use the **test environment**.
+`tests/conftest.py` marks every test `unit` or `integration` by its folder and stops the run for a test outside both folders. There is no backend end-to-end folder: frontend Playwright covers the journeys. Do not test third-party libraries; guard our own configuration of them.
 
-## Test Structure
+## Running tests
 
-```
-tests/
-├── conftest.py           # Environment setup and the unit/integration markers only
-├── helpers.py            # Shared helper functions
-├── unit/                 # No Docker
-│   ├── conftest.py       # settings_factory, fresh_settings
-│   ├── core/
-│   └── modules/auth/
-└── integration/          # Needs Docker (Testcontainers)
-    ├── conftest.py       # containers, client, db, captured_emails
-    ├── core/
-    ├── contract/
-    ├── modules/auth/
-    └── admin/
-```
-
-## Running Tests
-
-### All Tests
+Run from `backend/`.
 
 ```bash
-uv run pytest                          # unit + integration, coverage gate; needs Docker
-uv run pytest tests/unit --no-cov      # unit only, no Docker; --no-cov skips the gate
-uv run pytest tests/integration -x     # integration only
+uv run pytest                                   # everything, with the coverage gate; needs Docker
+uv run pytest tests/unit --no-cov               # fast loop, no Docker
+uv run pytest tests/integration/modules/users/test_me.py::TestGetMe -x
+uv run pytest tests/integration -k "refresh" -x
 ```
 
-### Specific Test File
+- `pyproject.toml` sets `addopts = "-v -ra --tb=short --cov=app --cov-report=term-missing"`. A unit-only run cannot reach the coverage threshold, so pass `--no-cov` for it.
+- The threshold is `fail_under` in `[tool.coverage.report]` (branch coverage; the value is in `pyproject.toml`). It applies to the full run. Do not lower it to make a change pass.
+- To prove the unit suite needs no Docker: `DOCKER_HOST=tcp://127.0.0.1:1 uv run pytest tests/unit --no-cov` (bash). On 2026-11-22 this ran green.
+- Warnings are errors: `filterwarnings` turns `DeprecationWarning`, `PendingDeprecationWarning`, `RuntimeWarning` and the FastAPI and Starlette deprecation warnings into failures, with one documented exception. Fix a new warning or list it in `pyproject.toml` with a reason and an exit condition.
+- Test files are named for the behaviour they cover, not for a review finding.
+
+## Environment of the tests
+
+`tests/conftest.py` runs before the first `app` import:
+
+- It sets `ENVIRONMENT=unittest` and `ADMIN_ENABLED=true`. `unittest` never reads `.env.local`.
+- It points `DATABASE_URL`, `CACHE_HOST`/`CACHE_PORT` and the `TASKIQ_*_URL` values at a closed port (`127.0.0.1:1`), so nothing imported early can reach your own Postgres or Redis. Unit tests keep these addresses for the whole run.
+
+The integration fixtures start the containers once per session and wire the real addresses:
+
+| Fixture | Scope | What it does |
+|---|---|---|
+| `postgres_container`, `redis_container` | session | Testcontainers with the images pinned in `tests/helpers.py` (the same as `compose.dev.yaml`; `test_dev_compose_parity.py` fails when they drift) |
+| `test_environment` | session, autouse | points the settings at the containers, clears the settings cache |
+| `sync_engine`, `migrated_db` | session | schema from **Alembic** (`upgrade head`, no `create_all`), as a deployment creates it |
+| `clean_db`, `flush_redis` | function, autouse | `TRUNCATE` of every application table and `FLUSHALL`, **before** each test |
+| `app`, `client` | function | a fresh app; a `TestClient` with its own cookie jar; tasks run in-process; a failed task fails the test |
+| `redis_broker_client` | function | tasks stay in the Redis stream; no worker runs |
+| `captured_emails` | function | replaces the mailer and records every sent mail |
+| `db` | function | the `Db` SQL helper |
+
+Unit fixtures: `settings_factory` builds `Settings` for a test (`unittest`, no admin; `settings_factory(APP_NAME="x")`) and `fresh_settings` clears the settings cache around a test.
+
+Database tests use the sync `TestClient` and one sync psycopg engine for fixtures and assertions, never `asyncio.run` with the app's engine. On Windows, event loops are created through `LOOP_FACTORY` (a `SelectorEventLoop`) because psycopg cannot use the `ProactorEventLoop`.
+
+## Tasks in tests
+
+The `app` fixture replaces the broker with taskiq's `InMemoryBroker` plus the worker's database hooks. `kiq()` therefore runs the task before the request answers, against the test database, and `captured_emails` sees the mail. `run_task(client, task, *args)` runs a task outside a request. A task that raises fails the test at teardown. Tests of the Redis transport (stream entries, retry schedules, "no personal data in Redis") use `redis_broker_client`.
+
+## Helpers
+
+Use the helpers in `tests/helpers.py`; add a shared helper there instead of copying one into a test module.
+
+| Group | Helpers |
+|---|---|
+| HTTP flows | `register`, `register_ok`, `login`, `register_and_login`, `bearer`, `login_tokens`, `refresh_with`, `change_password`, `change_email`, `verify_email`, `request_reset`, `reset_password` |
+| Database | `Db` (`rows`, `one`, `scalar`, `execute`), `user_id_of`, `active_session_count`, `audit_count` |
+| Mail | `CapturedEmails` (`to`, `of_kind`, `latest_token`) |
+| Tasks | `run_task`, `call_in_app`, `run_async` |
+| Logs | `log_events`, `log_text` |
+| Redis | `redis_from_env`, `redis_keys`, `redis_dump`, `assert_nothing_personal_in_redis` |
+| Admin | `admin_login`, `run_action` |
+| Concurrency | `run_parallel` (threads released by a barrier) |
+| Settings, tokens | `build_settings`, `forge_access_token`, `jwt_secret` |
+
+## What each endpoint test covers
+
+Every new endpoint gets a happy path, a validation error, an auth failure (missing, invalid, expired token), a not-found or conflict case and one test that proves the side effect (an audit row, an email, a cache invalidation). Every test must fail without the change it covers: break the code once and watch the test fail. Keep the suite deterministic: no sleeps, no real network; `time-machine` moves the clock where a test needs time.
+
+## OpenAPI snapshot
+
+`tests/unit/core/openapi_snapshot.json` is the committed API contract. The test compares the generated document with it exactly. After an intended contract change:
 
 ```bash
-uv run pytest tests/integration/modules/auth/test_auth.py
+UPDATE_OPENAPI_SNAPSHOT=1 uv run pytest tests/unit/core/test_openapi_contract.py
 ```
 
-### Specific Test Function
+Review the diff of the snapshot before you commit it.
 
-```bash
-uv run pytest tests/integration/modules/auth/test_auth.py::TestRegister
-```
+## Tests that list module contents
 
-### With Coverage Report
+`EXPECTED_TABLES` in `tests/unit/core/test_model_registry.py` and `TASK_NAMES` in `tests/unit/core/test_taskiq_and_logging.py` record the tables and the task names of the registered modules. A new module changes both ([modules.md](modules.md#step-13-update-the-core-tests-that-list-module-contents), README known issue 29).
 
-```bash
-pytest --cov=src --cov-report=html
-# View coverage in htmlcov/index.html
-```
+## Continuous integration
 
-### With Verbose Output
-
-```bash
-pytest -v -s
-```
-
-### Watch Mode (run on changes)
-
-```bash
-ptw  # Requires pytest-watch
-```
-
-## Test Database
-
-The **test environment** uses a separate PostgreSQL database:
-
-```ini
-# .env.test
-ENVIRONMENT=test
-DATABASE_URL=postgresql+asyncpg://test:test@localhost:5432/api_test
-CACHE_HOST=localhost
-CACHE_DB=1
-```
-
-### Database Setup for Testing
-
-Before tests run:
-
-```python
-# conftest.py
-@pytest.fixture(scope="session", autouse=True)
-async def setup_test_db():
-    """Create test database and run migrations."""
-    # 1. Create test database
-    # 2. Run alembic upgrade head
-    # 3. Run tests
-    # 4. Tear down test database
-```
-
-## Testing Your First Endpoint
-
-### Simple Health Check Test
-
-```python
-# tests/test_api.py
-import pytest
-import httpx
-from fastapi.testclient import TestClient
-from src.main import app
-
-@pytest.mark.asyncio
-async def test_health_check():
-    """Test basic health endpoint."""
-    async with TestClient(app) as client:
-        response = await client.get("/health")
-        assert response.status_code == 200
-        assert response.json()["success"] is True
-```
-
-### Test with Database
-
-```python
-# tests/integration/test_user_endpoints.py
-import pytest
-from src.common.dependencies import DbSession
-from src.api.auth.models import User
-from src.common.database import AsyncSessionFactory
-
-@pytest.mark.asyncio
-async def test_create_user(db: DbSession):
-    """Test user creation."""
-    user = User(username="testuser", email="test@example.com")
-    db.add(user)
-    await db.commit()
-    
-    # Verify in database
-    retrieved = await db.get(User, user.id)
-    assert retrieved.username == "testuser"
-```
-
-### Test with Authentication
-
-```python
-# tests/integration/test_auth_endpoints.py
-import pytest
-from fastapi.testclient import TestClient
-from src.main import app
-
-@pytest.mark.asyncio
-async def test_login_success():
-    """Test successful login."""
-    # 1. Register user
-    async with TestClient(app) as client:
-        register_response = await client.post(
-            "/api/auth/register",
-            json={
-                "username": "john",
-                "email": "john@example.com",
-                "password": "SecurePass123!",
-            }
-        )
-        assert register_response.status_code == 201
-        
-        # 2. Login
-        login_response = await client.post(
-            "/api/auth/login",
-            json={
-                "username": "john",
-                "password": "SecurePass123!",
-            }
-        )
-        assert login_response.status_code == 200
-        data = login_response.json()
-        assert "access_token" in data
-        assert "refresh_token" in data
-        
-        # 3. Use access token
-        headers = {"Authorization": f"Bearer {data['access_token']}"}
-        profile_response = await client.get("/api/user", headers=headers)
-        assert profile_response.status_code == 200
-```
-
-## Fixtures
-
-Reusable test setup defined in `conftest.py`:
-
-### Database Fixture
-
-```python
-# tests/conftest.py
-@pytest.fixture
-async def db():
-    """Provide isolated database session."""
-    async with AsyncSessionFactory() as session:
-        yield session
-        await session.rollback()  # Rollback after test
-```
-
-### User Fixture
-
-```python
-@pytest.fixture
-async def test_user(db: DbSession):
-    """Create test user."""
-    user = User(
-        username="testuser",
-        email="test@example.com",
-        is_active=True,
-        is_email_verified=True,
-    )
-    db.add(user)
-    await db.commit()
-    await db.refresh(user)
-    return user
-```
-
-### Authenticated Client Fixture
-
-```python
-@pytest.fixture
-async def authenticated_client(test_user):
-    """Provide TestClient with authentication."""
-    async with TestClient(app) as client:
-        # Generate token for test user
-        token = create_access_token(test_user.id)
-        client.headers["Authorization"] = f"Bearer {token}"
-        yield client
-```
-
-### Cache Fixture
-
-```python
-@pytest.fixture
-async def redis_client(app):
-    """Provide Redis client for cache testing."""
-    yield app.state.cache
-    await app.state.cache.flushdb()  # Clear after test
-```
-
-## Testing Patterns
-
-### Test Isolation
-
-Each test should be independent:
-
-```python
-# Good: Self-contained and idempotent
-@pytest.mark.asyncio
-async def test_user_creation(db: DbSession):
-    user = User(username=f"user_{uuid4()}", email=f"user_{uuid4()}@example.com")
-    db.add(user)
-    await db.commit()
-    assert user.id is not None
-
-# Bad: Depends on test execution order
-users_created = 0
-
-@pytest.mark.asyncio
-async def test_create_user_1(db: DbSession):
-    global users_created
-    users_created += 1
-    ...
-
-@pytest.mark.asyncio
-async def test_verify_users_created(db: DbSession):
-    assert users_created == 1  # Fails if tests run in different order
-```
-
-### Async Test Setup
-
-```python
-@pytest.mark.asyncio
-async def test_async_operation(app_with_db):
-    """Test async database and cache operations."""
-    db = app_with_db.state.db
-    redis = app_with_db.state.cache
-    
-    # All operations are awaited
-    user = await db.get(User, user_id)
-    await redis.set("key", "value")
-```
-
-### Mocking External Services
-
-```python
-import pytest
-from unittest.mock import AsyncMock, patch
-
-@pytest.mark.asyncio
-async def test_with_mock_email():
-    """Test auth without actually sending emails."""
-    with patch("src.api.auth.service.send_email") as mock_email:
-        mock_email.return_value = AsyncMock()
-        
-        # Test registration
-        result = await register_user(...)
-        
-        # Verify email was "sent"
-        mock_email.assert_called_once()
-        call_args = mock_email.call_args
-        assert "john@example.com" in call_args
-```
-
-### Testing Error Conditions
-
-```python
-@pytest.mark.asyncio
-async def test_login_invalid_password():
-    """Test login with wrong password."""
-    async with TestClient(app) as client:
-        response = await client.post(
-            "/api/auth/login",
-            json={
-                "username": "john",
-                "password": "WrongPassword!",
-            }
-        )
-        assert response.status_code == 401
-        data = response.json()
-        assert data["error"]["code"] == "INVALID_CREDENTIALS"
-```
-
-### Testing Validation
-
-```python
-@pytest.mark.asyncio
-async def test_register_invalid_email():
-    """Test registration with invalid email."""
-    async with TestClient(app) as client:
-        response = await client.post(
-            "/api/auth/register",
-            json={
-                "username": "john",
-                "email": "not-an-email",  # Invalid
-                "password": "SecurePass123!",
-            }
-        )
-        assert response.status_code == 422
-        # Pydantic validation error
-```
-
-## Continuous Integration
-
-### GitHub Actions Example
-
-```yaml
-# .github/workflows/test.yml
-name: Tests
-
-on: [push, pull_request]
-
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:15
-        env:
-          POSTGRES_DB: api_test
-          POSTGRES_USER: test
-          POSTGRES_PASSWORD: test
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
-      redis:
-        image: redis:latest
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
-    steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-python@v4
-        with:
-          python-version: "3.10"
-
-      - name: Install dependencies
-        run: |
-          pip install pytest pytest-asyncio httpx
-          pip install -e .
-
-      - name: Run migrations
-        run: alembic upgrade head
-
-      - name: Run tests
-        run: pytest --cov=src
-
-      - name: Upload coverage
-        uses: codecov/codecov-action@v3
-```
-
-## Best Practices
-
-1. **Test one thing**: Each test should verify one behavior
-2. **Use descriptive names**: Test name should describe what it tests
-3. **Setup and teardown**: Use fixtures for consistent state
-4. **Avoid magic numbers**: Use named constants
-5. **Test happy path and errors**: Test success cases and error conditions
-6. **Keep tests fast**: Mock slow operations (email, external APIs)
-7. **Isolate from external services**: Use test database/cache
-8. **Use parametrize for multiple cases**: Reduce duplicate test code
-
-### Example: Parametrized Tests
-
-```python
-@pytest.mark.parametrize("password,should_pass", [
-    ("ValidPassword123!", True),
-    ("short", False),
-    ("NOLOWERCASE123!", False),
-    ("nouppercase123!", False),
-    ("NoNumbers!", False),
-])
-@pytest.mark.asyncio
-async def test_password_validation(password, should_pass):
-    """Test password requirements."""
-    from src.api.auth.service import validate_password
-    
-    if should_pass:
-        assert validate_password(password) is True
-    else:
-        with pytest.raises(ValidationError):
-            validate_password(password)
-```
-
-## Debugging Failed Tests
-
-### Print Debug Info
-
-```python
-@pytest.mark.asyncio
-async def test_something(db: DbSession):
-    user = await db.get(User, user_id)
-    print(f"User: {user}")  # Will appear with -s flag
-    print(f"User dict: {user.__dict__}")
-```
-
-### Inspect with pdb
-
-```python
-@pytest.mark.asyncio
-async def test_something(db: DbSession):
-    user = await db.get(User, user_id)
-    breakpoint()  # Drops into debugger
-    assert user is not None
-```
-
-Run with:
-```bash
-pytest -s tests/test_something.py::test_something
-```
-
-### Log Capture
-
-```python
-@pytest.mark.asyncio
-async def test_something(caplog):
-    """Capture logs during test."""
-    with caplog.at_level(logging.INFO):
-        await some_operation()
-    
-    assert "expected_log_message" in caplog.text
-```
-
----
-
-**Related Documentation:**
-- See [environment.md](environment.md) for test environment configuration
-- See [api_structure.md](api_structure.md) for code organization
+There is no CI pipeline yet (open decision D5, Roadmap Phase 5). The gates in [README → Commands](../README.md#commands) are the checks a pipeline would run.

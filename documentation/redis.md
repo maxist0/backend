@@ -1,547 +1,90 @@
-# Redis Caching
+# Redis: cache and background jobs
 
-> **Status (2026-11-16):** this page is partly stale (it describes `fastapi-cache2`, which the project does not use; the route cache is `cashews`, see [README.md → Caching and background work](../README.md#caching-and-background-work)). One correction applies throughout: **refresh tokens and sessions are no longer stored in Redis.** They live only in Postgres. Redis serves the route cache and the taskiq broker (db 1) and result backend (db 2).
+What the application stores in Redis, how the cache works and how background jobs are delivered, retried and scheduled. Form: explanation with reference tables. Refresh tokens and sessions are **not** in Redis; they live only in Postgres ([authentication.md](authentication.md)).
 
-## Overview
+## What lives where
 
-Redis is used for **distributed caching** and **session storage** in this application. The project uses:
+One Redis server, three databases:
 
-- **redis-py** (async library): Low-level Redis client
-- **fastapi-cache2**: HTTP response caching decorator
-- **Connection pooling**: Reuse connections efficiently
+| Database | Settings | Holds |
+|---|---|---|
+| db 0 | `CACHE_HOST`, `CACHE_PORT`, `CACHE_DB` (default `0`), `CACHE_PASSWORD` | The `@cached` values and anything you store through `RedisDep` |
+| db 1 | `TASKIQ_BROKER_URL` | The task stream `taskiq:tasks` (consumer group `taskiq`) and the retry schedules (keys `taskiq_retry:*`) |
+| db 2 | `TASKIQ_RESULT_BACKEND_URL` | Task results, JSON, 1 hour TTL |
 
-Redis enables:
-- Fast data retrieval without database queries
-- ~~Session token storage and invalidation~~ (not used; sessions are in Postgres)
-- Rate limiting and throttling
-- Real-time counters and analytics
+The broker's Redis must not evict keys (`maxmemory-policy noeviction`): an evicted stream entry is a lost task. `compose.dev.yaml` runs `redis:7.4` without append-only persistence; it saves an RDB snapshot so a restart does not drop queued tasks.
 
-## Architecture
+## Cache
 
-```
-FastAPI Application
-    ↓
-fastapi-cache2
-    ↓ (cache hit)
-Returns cached response
-    ↓ (cache miss)
-    ├→ Execute route handler
-    ├→ Cache response
-    └→ Return response
-    ↓
-Redis (in-memory store)
-```
-
-## Configuration
-
-Redis settings in [src/common/config.py](../src/common/config.py):
+`@cached(ttl, key)` and `invalidate(pattern)` from `app.core` cache the return value of an async function ([ADR 0003](adr/0003-caching-via-cached-decorator.md)). The implementation is a thin wrapper over cashews (`src/app/core/cache.py`).
 
 ```python
-# Connection
-CACHE_HOST=localhost
-CACHE_PORT=6379
-CACHE_DB=0                           # Redis logical database (0-15)
-CACHE_PASSWORD=None                  # Set if Redis requires auth
+from app.core import cached, invalidate
 
-# Connection Pool
-CACHE_MAX_CONNECTIONS=10             # Max concurrent connections
 
-# Naming
-CACHE_KEY_PREFIX=fastapi-cache       # Prefix all keys with this
+@cached(ttl=300, key="profile:{user_id}")
+async def load_profile(user_id: str) -> dict[str, str]: ...
+
+
+async def rename(user_id: str) -> None:
+    ...  # write the change, commit
+    await invalidate(f"profile:{user_id}")
 ```
 
-### Environment-Specific Configuration
+- Values are stored as **JSON**, never pickled: a value read from Redis cannot run code. A cached function returns JSON types only (`dict`, `list`, `str`, `int`, `float`, `bool`, `None`); cache `model.model_dump(mode="json")`, not a Pydantic model.
+- The `key` is a template formatted with the function's arguments and must hold every argument that changes the result. A missing `{user_id}` serves one user's data to another.
+- `ttl` is seconds, or a string such as `"5m"`, or a callable that reads the TTL from `get_settings()` at call time. TTLs come from `Settings`, not from literals ([AGENTS.md](../AGENTS.md#caching-and-background-jobs)).
+- A mutation calls `invalidate(pattern)` (a glob, `*`) in the service.
+- There is no HTTP response cache and no ETag middleware.
+- No built-in route uses `@cached` today.
 
-```ini
-# .env.dev
-CACHE_HOST=localhost
-CACHE_PORT=6379
-CACHE_PASSWORD=
+`RedisDep` (`Annotated[redis.Redis, Depends(get_redis)]`) gives a route or dependency the async client for direct commands. The lifespan opens the client with a ping and closes it on shutdown. The cache opens its own connection pool from the same host, port and database, bounded by `CACHE_MAX_CONNECTIONS`.
 
-# .env.prod
-CACHE_HOST=redis.prod.internal
-CACHE_PORT=6379
-CACHE_PASSWORD=secure-password-here
-CACHE_MAX_CONNECTIONS=20             # Handle more concurrent requests
+## Background jobs
+
+Background work is a taskiq task ([ADR 0009](adr/0009-taskiq-redis-stream-broker-and-delayed-retries.md), [ADR 0010](adr/0010-token-emails-rekeyed-in-the-worker.md)). A task is declared in a module's `tasks.py` and enqueued with `await my_task.kiq(...)` after the commit. [modules.md](modules.md#step-7-the-task) shows one. Do not use FastAPI `BackgroundTasks`.
+
+**Processes.** The API only enqueues. A **worker** runs tasks; the **scheduler** sends cron tasks and delayed retries. Run exactly one scheduler. `run.py dev` starts one worker and one scheduler; the Swarm stack runs them as separate services ([general-structure.md](general-structure.md#runtime-topology)). The retry and Prometheus middlewares belong to the worker only (`app.worker`).
+
+**Delivery is at least once.** The broker is taskiq-redis' `RedisStreamBroker` on db 1, wrapped by `ReconnectingStreamBroker` (`src/app/core/tasks.py`):
+
+- A worker acknowledges a message after the task and its result are stored, and deletes the stream entry together with the acknowledgement, so no task arguments stay in the stream.
+- A message that is not acknowledged within 10 minutes (`REDELIVERY_IDLE_MS`) goes to another worker. A task can therefore run twice, and every task is idempotent.
+- The stream is trimmed approximately at 100,000 entries.
+- While Redis is unreachable, or the consumer group has vanished (`FLUSHALL`), the worker logs `taskiq.broker_unavailable` with the consecutive failures and the outage duration every few seconds, then `taskiq.broker_reconnected`, and resumes on its own. Wrong Redis credentials stop it.
+
+**What a task may receive.** Row ids and primitives, never ORM objects, personal data or secrets: arguments are stored in Redis while queued and logged by taskiq at DEBUG (the app keeps taskiq's loggers at INFO or above). The task reads the rest from the database. A test can prove it: `assert_nothing_personal_in_redis` in `tests/helpers.py`.
+
+**Database session.** A task takes `db: TaskDbSession = TaskiqDepends()`. Each worker process opens its own engine at startup with the API's settings (`DB_POOL_SIZE` per process) and closes it at shutdown. The API and the scheduler open none. The task's service owns the transaction.
+
+**Database errors.** The `task` decorator replaces a database error by `TaskDatabaseError`, whose message holds only the exception types and the SQLSTATE: taskiq logs a failed task's exception and stores it as the result, and PostgreSQL messages can quote row values. Lost connections (SQLSTATE class 08, or none), deadlocks (40P01), serialization failures (40001) and admin shutdowns (57P01) become `TransientTaskDatabaseError`.
+
+**Retries.** A task with `retry_on_error=True` that raises `TransientTaskError` (or a transient database error) runs again after `TASKIQ_RETRY_DELAY_SECONDS`, at most `TASKIQ_RETRY_COUNT` times. Raise `TransientTaskError` only for errors that may pass (network, timeouts, a busy server); everything else fails at once. Its message must hold no personal data. Mail tasks raise `mail_delivery_error(exc) from None`, which picks the transient or the permanent mail error. A delayed retry is a JSON schedule in Redis (`taskiq_retry:*` in db 1) that the scheduler sends, so **a worker without a running scheduler never retries**. Retry schedules never expire (known issue 24).
+
+**Scheduled tasks.** A task with the label `schedule=[{"cron": "0 3 * * *"}]` runs on the scheduler. taskiq 0.13 matches cron fields against UTC, so the time is UTC on every host; do not set `cron_offset`. A periodic task must still be idempotent. Batch large deletes (one transaction per batch, `FOR UPDATE SKIP LOCKED`, no user lock), as `auth.cleanup` does. The built-in scheduled tasks:
+
+| Task name | Schedule (UTC) | Purpose |
+|---|---|---|
+| `maintenance.taskiq_heartbeat` | every 5 minutes | logs `taskiq.heartbeat`, so worker and scheduler liveness is visible |
+| `auth.cleanup` | daily 03:00 | deletes ended sessions and closed email tokens after `AUTH_CLEANUP_RETENTION_DAYS` |
+
+**Known limits.** There is no dead-letter queue and no delivery cap (known issue 21). When the scheduler fails to send a due retry, it does not try again until it restarts (known issue 22).
+
+**Worker metrics.** The worker serves its own Prometheus endpoint; see [monitoring.md](monitoring.md#worker-metrics).
+
+## Inspecting Redis in development
+
+With the dev compose project (the container name depends on the project name; `compose exec` finds it):
+
+```bash
+docker compose -f compose.dev.yaml exec redis redis-cli -n 1 XLEN taskiq:tasks     # queued messages
+docker compose -f compose.dev.yaml exec redis redis-cli -n 1 --scan --pattern 'taskiq_retry:*'
+docker compose -f compose.dev.yaml exec redis redis-cli -n 0 --scan                 # cache keys
 ```
 
-## Redis Client
+Never run `FLUSHALL` against a shared Redis. The integration tests flush their own Testcontainers Redis before each test.
 
-Low-level Redis operations via `redis-py`:
+## Related
 
-```python
-from src.common.cache import get_cache_connection
-from fastapi import Request
-
-@app.get("/data")
-async def get_data(request: Request) -> dict:
-    redis = await get_cache_connection(request)
-    
-    # Get value
-    value = await redis.get("my_key")
-    
-    # Set value (with expiration)
-    await redis.setex("my_key", 3600, "my_value")  # 1 hour
-    
-    # Check existence
-    exists = await redis.exists("my_key")
-    
-    # Delete
-    await redis.delete("my_key")
-```
-
-## fastapi-cache2 Decorator
-
-High-level caching for route responses:
-
-```python
-from fastapi_cache.decorator import cache
-from datetime import timedelta
-
-@app.get("/users/{user_id}")
-@cache(expire=timedelta(minutes=5))  # Cache for 5 minutes
-async def get_user(user_id: UUID) -> UserResponse:
-    # This response is cached
-    user = await fetch_user(user_id)
-    return UserResponse.from_orm(user)
-```
-
-### Cache Key Generation
-
-Cache keys are auto-generated from:
-- Function name
-- Request parameters
-- Query string parameters
-
-**Example**:
-```python
-@cache(expire=300)  # 5 minutes
-async def get_user(user_id: UUID, include_posts: bool = False):
-    pass
-
-# Generated keys:
-# fastapi-cache:get_user(user_id=123, include_posts=False)
-# fastapi-cache:get_user(user_id=456, include_posts=True)
-```
-
-### Custom Cache Keys
-
-Specify custom key logic:
-
-```python
-from fastapi_cache.backends.redis import cache_key_builder
-
-def custom_key_builder(
-    func,
-    namespace: str = "",
-    request = None,
-    response = None,
-    *args,
-    **kwargs,
-):
-    return f"custom:{func.__name__}:{kwargs.get('user_id')}"
-
-@cache(expire=300, key_builder=custom_key_builder)
-async def get_user(user_id: UUID) -> UserResponse:
-    pass
-```
-
-### Cache Invalidation
-
-```python
-from fastapi_cache import FastAPICache
-
-# Invalidate specific cache entry
-await FastAPICache.clear(namespace="custom:get_user:123")
-
-# Invalidate all caches with prefix
-await FastAPICache.clear(namespace="fastapi-cache")
-```
-
-## Common Cache Patterns
-
-### User Profile Caching
-
-```python
-@app.get("/users/{user_id}")
-@cache(expire=timedelta(minutes=30))  # 30 min TTL
-async def get_user(user_id: UUID, db: DbSession) -> UserResponse:
-    user = await db.get(User, user_id)
-    return UserResponse.from_orm(user)
-
-@app.put("/users/{user_id}")
-async def update_user(user_id: UUID, updates: UpdateUserRequest, db: DbSession):
-    user = await db.get(User, user_id)
-    # ... apply updates and save ...
-    
-    # Invalidate cache on update
-    await FastAPICache.clear(namespace=f"fastapi-cache:get_user({user_id})")
-    
-    return UserResponse.from_orm(user)
-```
-
-### Expensive Query Caching
-
-```python
-@app.get("/reports/sales")
-@cache(expire=timedelta(hours=1))  # 1 hour TTL for expensive report
-async def get_sales_report(month: int, db: DbSession) -> SalesReport:
-    # Expensive multi-table join
-    report = await calculate_sales_by_month(month, db)
-    return report
-```
-
-### Search Result Caching
-
-```python
-@app.get("/search")
-@cache(expire=timedelta(minutes=10))  # 10 min TTL
-async def search_items(
-    q: str,
-    page: int = 1,
-    limit: int = 20,
-    db: DbSession = Depends(get_db),
-) -> list[ItemResponse]:
-    # Cache per search query + pagination
-    results = await db.execute(
-        select(Item).where(
-            Item.name.ilike(f"%{q}%")
-        ).offset((page-1)*limit).limit(limit)
-    )
-    return [ItemResponse.from_orm(r) for r in results.scalars()]
-```
-
-### Cache Warming (Pre-population)
-
-```python
-from contextlib import asynccontextmanager
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Startup: Warm cache
-    redis = app.state.cache
-    
-    # Pre-fetch popular items
-    await redis.setex(
-        "popular_users:top10",
-        3600,
-        json.dumps([user.dict() for user in await get_top_10_users()])
-    )
-    
-    yield
-    
-    # Shutdown
-    await redis.close()
-```
-
-## Redis Data Types
-
-### String
-
-For simple key-value storage:
-
-```python
-# Set and get
-await redis.set("feature_flag:new_ui", "true")
-value = await redis.get("feature_flag:new_ui")
-
-# Atomic counter
-await redis.incr("api_requests_total")
-await redis.decr("api_requests_total")
-await redis.incrby("api_requests_total", 5)
-```
-
-### Hash
-
-For object storage:
-
-```python
-# Store user session data
-await redis.hset(
-    f"session:{session_id}",
-    mapping={
-        "user_id": str(user_id),
-        "username": "john",
-        "ip_address": "192.168.1.1",
-        "created_at": datetime.now().isoformat(),
-    }
-)
-
-# Retrieve
-user_id = await redis.hget(f"session:{session_id}", "user_id")
-all_data = await redis.hgetall(f"session:{session_id}")
-```
-
-### Set
-
-For unique collections:
-
-```python
-# Online users
-await redis.sadd("online_users", user_id)
-await redis.srem("online_users", user_id)
-
-# Check membership
-is_online = await redis.sismember("online_users", user_id)
-
-# Get all
-online = await redis.smembers("online_users")
-```
-
-### List
-
-For ordered queues:
-
-```python
-# Queue operations
-await redis.rpush("email_queue", json.dumps({"to": "user@example.com"}))
-email = await redis.lpop("email_queue")
-
-# Get range
-first_10 = await redis.lrange("email_queue", 0, 9)
-```
-
-### Sorted Set
-
-For ranked data:
-
-```python
-# Leaderboard
-await redis.zadd("user_scores", {user_id: score})
-
-# Top 10
-top_10 = await redis.zrevrange("user_scores", 0, 9, withscores=True)
-
-# User rank
-rank = await redis.zrevrank("user_scores", user_id)
-```
-
-## Key Naming Conventions
-
-Use hierarchical, descriptive keys:
-
-```
-# User data
-user:{user_id}:profile          # User profile object
-user:{user_id}:settings         # User settings
-user:{user_id}:sessions         # Set of session IDs
-
-# Session data
-session:{session_id}            # Session object
-session:{session_id}:data       # Session data
-
-# Counters
-counter:api_requests_total      # Total requests
-counter:api_errors              # Total errors
-counter:users_online            # Online users
-
-# Temporary data
-temp:{request_id}:upload_status # Upload progress
-
-# Lists/Queues
-queue:email:pending             # Email queue
-queue:tasks:background          # Background job queue
-
-# Sets (unique collections)
-set:online_users                # Online user IDs
-set:admin_users                 # Admin user IDs
-
-# Sorted sets (leaderboards)
-leaderboard:daily_scores        # Daily top users
-leaderboard:monthly_scores      # Monthly top users
-```
-
-## Expiration and TTL
-
-Set expiration on all keys:
-
-```python
-# 1 hour expiration
-await redis.setex("key", 3600, "value")
-
-# 30 days expiration
-await redis.setex("key", 30*24*3600, "value")
-
-# Get remaining TTL
-ttl = await redis.ttl("key")  # Returns seconds, -1 if no expiration
-
-# Update expiration on existing key
-await redis.expire("key", 3600)
-
-# Remove expiration
-await redis.persist("key")
-```
-
-### TTL Guidelines
-
-| Data Type | TTL | Rationale |
-|-----------|-----|-----------|
-| User profile | 1 hour | Changes infrequently |
-| User settings | 24 hours | Rarely change |
-| API responses | 5-15 min | Need freshness |
-| Session data | Not stored in Redis (Postgres only) | n/a |
-| Rate limit counters | 1 minute | Per-minute limits |
-| Feature flags | No expiration | Rarely change |
-| Temporary data | 5 minutes | Clean up quickly |
-
-## Monitoring and Debugging
-
-### Redis Connection Status
-
-```python
-# In route handler
-redis = await get_cache_connection(request)
-info = await redis.ping()  # Returns True if connected
-```
-
-### Cache Statistics
-
-```python
-redis = request.app.state.cache
-
-# Get Redis info
-info = await redis.info()
-print(f"Memory used: {info['used_memory_human']}")
-print(f"Connected clients: {info['connected_clients']}")
-print(f"Keyspace: {info['db0']['keys']}")
-```
-
-### View All Keys (Development Only)
-
-```python
-# Get all keys with prefix (development debugging)
-keys = await redis.keys("fastapi-cache:*")
-for key in keys:
-    value = await redis.get(key)
-    logger.debug("cache_entry", key=key, value=value)
-```
-
-### Clear All Cache (Development)
-
-```python
-# Flush entire database (use with caution!)
-await redis.flushdb()
-
-# Flush all databases (use with extreme caution!)
-await redis.flushall()
-```
-
-## Error Handling
-
-### Connection Errors
-
-```python
-from redis.exceptions import RedisError
-
-@app.get("/data")
-async def get_data(request: Request) -> dict:
-    try:
-        redis = await get_cache_connection(request)
-        cached = await redis.get("key")
-        if cached:
-            return json.loads(cached)
-    except RedisError as e:
-        logger.error("cache.connection_failed", error=str(e))
-        # Fall back to database query
-    
-    return await get_data_from_db()
-```
-
-### Graceful Degradation
-
-If Redis is unavailable, the application continues functioning (without caching):
-
-```python
-# Typical pattern with fallback
-async def get_user(user_id: UUID, request: Request, db: DbSession):
-    try:
-        redis = await get_cache_connection(request)
-        cached = await redis.get(f"user:{user_id}")
-        if cached:
-            return json.loads(cached)
-    except RedisError:
-        logger.warning("cache.unavailable")
-        # Continue without cache
-    
-    # Query database
-    user = await db.get(User, user_id)
-    
-    # Try to cache
-    try:
-        redis = await get_cache_connection(request)
-        await redis.setex(f"user:{user_id}", 3600, user.json())
-    except RedisError:
-        pass  # Caching failed, but continue
-    
-    return user
-```
-
-## Redis in Docker
-
-### Docker Compose
-
-```yaml
-services:
-  redis:
-    image: redis:latest
-    container_name: redis
-    ports:
-      - "6379:6379"
-    command: redis-server --appendonly yes  # AOF persistence
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    volumes:
-      - redis_data:/data
-    restart: always
-
-volumes:
-  redis_data:
-```
-
-### Kubernetes
-
-```yaml
-apiVersion: v1
-kind: Service
-metadata:
-  name: redis-primary
-spec:
-  ports:
-    - port: 6379
-  selector:
-    app: redis
----
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: redis-primary
-spec:
-  serviceName: redis-primary
-  replicas: 1
-  selector:
-    matchLabels:
-      app: redis
-  template:
-    metadata:
-      labels:
-        app: redis
-    spec:
-      containers:
-      - name: redis
-        image: redis:latest
-        ports:
-        - containerPort: 6379
-        command:
-          - redis-server
-          - "--appendonly"
-          - "yes"
-```
-
----
-
-**Related Documentation:**
-- See [environment.md](environment.md) for environment-specific configuration
-- See [monitoring.md](monitoring.md) for cache performance monitoring
+- Configuration: [README → Configuration](../README.md#configuration).
+- Why a stream and not a list: [ADR 0009](adr/0009-taskiq-redis-stream-broker-and-delayed-retries.md).

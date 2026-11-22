@@ -64,5 +64,5 @@ Chosen option: "plain typed responses and RFC 9457 errors", because it removes t
 ## More Information
 
 * RFC 9457, Problem Details for HTTP APIs.
-* Conventions: [AGENTS.md → Errors and responses](../../AGENTS.md#errors-and-responses-target).
+* Conventions: [AGENTS.md → Errors and responses](../../AGENTS.md#errors-and-responses).
 * Implemented in S1 of the 2026-11 cleanup.

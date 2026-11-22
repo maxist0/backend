@@ -1,225 +1,109 @@
-# General Project Structure
+# General structure
 
-## Overview
+How the backend is assembled, how a request travels through it and which process runs what. For the file tree, see [README → Project layout](../README.md#project-layout). For the rules, see [AGENTS.md](../AGENTS.md). To add a feature, see [modules.md](modules.md).
 
-This is a FastAPI-based REST API application built with modern Python async patterns, structured for scalability, maintainability, and production readiness. The project is currently in **early alpha** and implements authentication, user management, caching, structured logging, and comprehensive monitoring.
+Form: explanation, with reference tables.
 
-## Project Root Structure
+## Core and modules
 
-```
-fastapi/
-├── src/                      # Main application source code
-├── alembic/                  # Database migrations
-├── deployment/               # Kubernetes and Docker deployment configs
-├── documentation/            # This documentation
-├── scripts/                  # Helper scripts for deployment
-├── tests/                    # Test suite
-├── app.py                    # Application entry point
-├── docker-compose.yml        # Local development environment
-├── Dockerfile               # Container image definition
-├── pyproject.toml           # Python project dependencies
-├── alembic.ini              # Alembic migration config
-├── .env*                    # Environment configuration files
-└── README.md                # Project readme
-```
-
-## Core Application Structure (`src/`)
-
-### Top-Level Module: `src/main.py`
-
-The FastAPI application instance is created and configured here. This module:
-
-- **Initializes middleware**: Access logging, metrics, security headers, CORS, compression, metadata handling
-- **Manages application lifecycle**: Startup (DB init, cache init, metrics setup) and shutdown (cleanup)
-- **Configures exception handlers**: Custom validation error responses using unified error envelope
-- **Sets up OpenAPI documentation**: Disabled in production, enabled in dev/test/staging
-
-**Key Components:**
-- `lifespan()` context manager: Handles startup/shutdown lifecycle events
-- `app`: FastAPI application instance with metadata (title, version, description)
-
-### `src/api/` - API Routes and Modules
-
-Organized by feature domain. Each module follows a consistent structure:
+`src/app/core/` is the infrastructure: settings, database, errors, security, middleware, health, cache, tasks, mail, logging and the admin base. `src/app/modules/` holds the features. Imports point one way:
 
 ```
-api/
-├── auth/                    # Authentication & authorization
-│   ├── models.py           # SQLAlchemy ORM + Pydantic schemas
-│   ├── router.py           # Endpoint definitions
-│   ├── service.py          # Business logic
-│   ├── crud.py             # Database operations
-│   ├── dependencies.py      # Route dependencies (JWT validation, etc.)
-│   └── jwt_utils.py        # JWT token utilities
-├── user/                    # User management
-│   ├── models.py           # Pydantic schemas (uses auth models for ORM)
-│   ├── router.py           # User endpoints
-│   ├── service.py          # User business logic
-│   ├── curd.py             # User database operations
-│   └── dependencies.py      # Route dependencies
-├── exampleRoute/            # Example module structure
-│   ├── models.py
-│   ├── router.py
-│   ├── service.py
-│   ├── curd.py
-│   └── dependencies.py
-├── metrics/                 # Prometheus metrics endpoints
-│   ├── router.py           # /metrics endpoint
-│   └── __init__.py
-└── __init__.py
+core ← users ← auth ← your modules
 ```
 
-**Module Pattern:**
-- **models.py**: SQLAlchemy ORM models + Pydantic request/response schemas
-- **router.py**: FastAPI routes (endpoints)
-- **service.py**: Business logic, orchestration
-- **curd.py**: Database CRUD operations (misspelled intentionally - stands for Create, Read, Update, Delete)
-- **dependencies.py**: FastAPI dependency injection (auth checks, DB session, etc.)
+- A module imports infrastructure from `app.core` only, never from its submodules. `tests/unit/core/test_import_direction.py` enforces it.
+- `users` never imports `auth`. A module never imports a module that depends on it.
+- The core never imports from `app.modules`.
 
-### `src/common/` - Shared Infrastructure
+A module is a package with a `module = Module(...)` object (`src/app/core/module.py`). `MODULES` in `src/app/modules/__init__.py` lists the modules in dependency order. Four composition roots read that tuple:
 
-Cross-cutting concerns used by all API modules:
+| Root | What it takes from each module |
+|---|---|
+| `create_app()` in `src/app/main.py` | `router` (mounted under `API_PREFIX`) and `admin_views` |
+| `src/app/worker.py` (worker and scheduler) | `tasks` (importing `app.modules` registers every task) |
+| `alembic/env.py` | `models` (importing `app.modules` fills `Base.metadata`) |
+| the admin panel (`create_admin`) | `admin_views` |
 
-```
-common/
-├── config.py               # Settings management (pydantic-settings)
-├── database.py             # SQLAlchemy async engine, session factory
-├── cache.py                # Redis connection pool, fastapi-cache2
-├── logging.py              # Structured logging with structlog + OTLP
-├── middleware.py           # FastAPI middleware (access log, metrics, etc.)
-├── metrics.py              # Prometheus metrics initialization
-├── dependencies.py         # Global dependencies (DbSession, cache, etc.)
-├── responses.py            # Standardized response envelopes
-├── models.py               # Shared Pydantic models (error codes, etc.)
-├── constants.py            # App-wide constants
-└── __init__.py
-```
+Importing `app.core` or `app.modules` reads no settings and opens no connection. A unit test starts a fresh interpreter without `ENVIRONMENT` to prove it (`tests/unit/core/test_model_registry.py`). The decisions are [ADR 0001](adr/0001-core-and-module-contract.md) and [ADR 0008](adr/0008-module-layout-and-users-auth-split.md).
 
-**Key Modules:**
-
-- **config.py**: Manages configuration for dev, test, stage, prod environments using pydantic-settings. Environment variables are loaded from `.env` and `.env.{env}` files.
-  
-- **database.py**: Provides SQLAlchemy 2.0 async engine with asyncpg driver, connection pooling, and session factory.
-
-- **cache.py**: Redis client setup with connection pooling and fastapi-cache2 integration.
-
-- **logging.py**: Structured logging via structlog with optional OTLP export to Grafana Alloy.
-
-- **middleware.py**: Custom middleware for access logging, request metrics, security headers, CORS.
-
-- **responses.py**: Standardized JSON response envelope for consistency across all endpoints.
-
-## Entry Points
-
-### `app.py` - Application Launcher
-
-CLI-based launcher that accepts environment argument:
-
-```bash
-python app.py dev       # Development (hot reload, verbose logging)
-python app.py test      # Test environment
-python app.py stage     # Staging
-python app.py prod      # Production
-```
-
-Options:
-- `--host`: Override server host
-- `--port`: Override server port
-- `--reload`: Enable auto-reload
-
-### Docker & Docker Compose
-
-- **Dockerfile**: Multi-stage build for production image
-- **docker-compose.yml**: Local development environment with API + Redis
-
-## Request/Response Pattern
-
-All endpoints follow a standardized response envelope:
-
-**Success Response (2xx):**
-```json
-{
-  "success": true,
-  "data": { ... },
-  "message": "Operation successful",
-  "timestamp": "2026-02-27T10:00:00Z",
-  "request_id": "uuid",
-  "path": "/api/users",
-  "method": "GET",
-  "status_code": 200
-}
-```
-
-**Error Response (4xx/5xx):**
-```json
-{
-  "success": false,
-  "error": {
-    "code": "VALIDATION_ERROR",
-    "message": "Email is required",
-    "field": "email",
-    "details": { ... }
-  },
-  "timestamp": "2026-02-27T10:00:00Z",
-  "request_id": "uuid",
-  "path": "/api/users",
-  "method": "POST",
-  "status_code": 422
-}
-```
-
-## Dependency Injection Pattern
-
-FastAPI's dependency injection system is used extensively:
-
-```python
-# In dependencies.py
-async def get_db() -> AsyncGenerator[AsyncSession, None]:
-    async with AsyncSessionFactory() as session:
-        yield session
-
-# In router.py
-from src.common.dependencies import DbSession
-
-@router.get("/users")
-async def list_users(db: DbSession) -> ...:
-    # db is automatically injected
-    pass
-```
-
-## Database Migrations
-
-Alembic is used for database schema management:
+## Runtime topology
 
 ```
-alembic/
-├── versions/
-│   └── 20260226_2120_37a0d49f8bbc_add_auth_user_tables.py
-├── env.py          # Alembic environment config
-├── script.py.mako  # Migration template
-└── __init__.py
+                         ┌──────────────┐
+   Internet ──HTTPS──▶   │   Traefik    │  TLS termination, routing
+                         └──────┬───────┘
+                                │ HTTP
+            ┌───────────────────┼────────────────────┐
+            ▼                   ▼                    ▼
+     ┌────────────┐      ┌────────────┐       ┌────────────┐
+     │  api       │      │  api       │       │  api       │   uvicorn, one process each
+     └─────┬──────┘      └─────┬──────┘       └─────┬──────┘
+           │  psycopg 3        │  redis-py          │
+           ▼                   ▼                    ▼
+     ┌────────────┐      ┌────────────┐       ┌──────────────────┐
+     │ PostgreSQL │      │   Redis    │◀──────│ taskiq worker(s) │  tasks
+     │            │      │ db0 cache  │       │ taskiq scheduler │  cron, retries
+     └────────────┘      │ db1 stream │       └──────────────────┘
+                         │ db2 results│
+                         └────────────┘
+           metrics at /metrics, logs on stdout (JSON)
+                         ▼
+        Prometheus ── Grafana ── Loki ── Tempo ── Alloy
 ```
 
-Create new migrations:
-```bash
-alembic revision --autogenerate -m "Description"
+The Swarm stack in `deployment/` runs three API replicas, two workers and one scheduler. Run exactly one scheduler. Each API process and each worker process has its own database pool (`DB_POOL_SIZE` + `DB_MAX_OVERFLOW`).
+
+`run.py dev` starts one API process, the worker and the scheduler on your machine ([README → Quick start](../README.md#quick-start)).
+
+## Lifespan
+
+`create_app()` assembles the app without I/O: error handlers, middleware, health and metrics routes, the routers of `MODULES` and, when enabled, the admin panel. The lifespan in `src/app/main.py` then opens the resources in this order and closes them in reverse order, also when a later step fails:
+
+1. Logging (`setup_logging`).
+2. Event-loop check (psycopg needs a `SelectorEventLoop` on Windows), database engine, connectivity check `SELECT 1`, binding of the session factory.
+3. The Redis client (`RedisDep`) and a ping.
+4. The cache (`@cached`) on the same Redis server.
+5. The taskiq broker, which the API only uses to enqueue.
+
+Lifespan is the only startup and shutdown mechanism. There is no `on_event` and no work at import time.
+
+## Request lifecycle
+
+The last middleware added runs first. For a request the effective order is:
+
+1. Starlette's `ServerErrorMiddleware`, the last resort for a failure in the middleware itself.
+2. `CORSMiddleware` with `CORS_ORIGINS`. It answers preflights itself.
+3. `RequestMiddleware` (`src/app/core/middleware.py`, pure ASGI, [ADR 0005](adr/0005-single-asgi-request-middleware.md)):
+   - validates the client's `X-Request-ID` (1 to 128 characters of `A-Za-z0-9._-`) or generates one, binds it to the structlog context and returns it as `X-Request-ID`;
+   - sets `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy` and `Permissions-Policy`, and `Cache-Control: no-store` under `API_PREFIX` unless the route set one;
+   - records `http_requests_total` and `http_request_duration_seconds` (never for `/metrics`) and writes one `http.access` event;
+   - logs an unhandled exception with `log_unexpected_error` and answers with the generic 500 problem, so the 500 carries the same headers and a `request_id`.
+4. Router, then dependencies (`DbSession`, `CurrentUser`), the route function, the service and crud.
+5. Exception handlers turn `AppError`, `RequestValidationError` and Starlette `HTTPException` into RFC 9457 problem responses ([api.md](api.md)).
+
+## Layers in a module
+
+```
+router → service → crud → models
 ```
 
-Apply migrations:
-```bash
-alembic upgrade head
-```
+- The router validates input through Pydantic, calls one service function and returns a typed model.
+- The service holds the business rules and owns the transaction. It enqueues tasks after the commit.
+- crud holds the queries and no rules.
+- Routers never query the database. Services never build HTTP responses.
 
-## Deployment Targets
+## Environments
 
-- **Local**: Docker Compose (see docker-compose.yml)
-- **Staging/Prod**: Kubernetes manifests in `deployment/k8n/` with Helm values
-- **Monitoring**: Prometheus, Grafana, Loki, Alloy in `deployment/docker/monitoring/`
+`ENVIRONMENT` selects behaviour; the table is in [README → Configuration](../README.md#configuration) and the details in [environment.md](environment.md). `run.py` takes the mode from its argument (`dev` or `unittest`) or from an injected `ENVIRONMENT`.
 
----
+## Migrations
 
-**Next Steps:**
-- See [logging.md](logging.md) for structured logging architecture
-- See [database.md](database.md) for database setup details
-- See [authentication.md](authentication.md) for auth implementation
-- See [environment.md](environment.md) for environment configuration
+Alembic uses an async `env.py` that reads `DATABASE_URL` only and builds no application settings, so a migration job needs no application secrets. Details: [database.md](database.md).
+
+## Related pages
+
+- [api.md](api.md): routes and the error format.
+- [authentication.md](authentication.md): the identity flows.
+- [redis.md](redis.md): cache, broker and scheduler.
+- [logging.md](logging.md), [monitoring.md](monitoring.md): logs, metrics, health.

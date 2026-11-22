@@ -1,8 +1,8 @@
 # Backend-Review 2026-11: konsolidierte Befunde und Umsetzungsplan
 
-> **Aktueller Stand und nächste Schritte:** Phase 0, 0b und Phase 1 bis Schritt 1.4 sind umgesetzt. Danach wurde das Cleanup S0–S3 eingeschoben (Core/Module, RFC 9457, `/api/v1`). S0 und S1 sind abgeschlossen. Plan, Arbeitsweise und Aufgaben für Frontend-Umstellung, S2 und S3 stehen in [cleanup-plan.md](cleanup-plan.md). Mit diesem Dokument beginnt jede neue Session.
+> **Aktueller Stand (22.11.2026): Das Cleanup S0–S3 ist abgeschlossen.** Phase 0, 0b und Phase 1 sind umgesetzt; das Cleanup (Core/Module, RFC 9457, `/api/v1`, zuverlässige Hintergrund-Jobs, strikte Checks, Doku) hat danach große Teile der Phasen 3 bis 6 vorweggenommen. Die Commit-Liste enthält [cleanup-plan.md](cleanup-plan.md) in §3. **Als Nächstes, nichts davon ist begonnen:** die Frontend-Umstellung auf den neuen Vertrag, die Deploy-Runde, die offenen Entscheidungen D2–D4, D8–D10 und D12 sowie der Rest der Review-Phasen 2–6 (Tabelle in §4). Mit [cleanup-plan.md](cleanup-plan.md) beginnt jede neue Session.
 
-Stand: 2026-11-16 · Status: **Phase 0 + 0b umgesetzt (uncommitted), verifiziert: 223 Tests grün**; D1–D12 werden vor Phase 2/3 einzeln besprochen; entschieden: N1 = psycopg 3, N2 = keine Echtdaten → neue Baseline, N3 = Postgres 18 überall, D6 = mypy strict als Gate + ty advisory · Scope: App-Code und DB, Tests, Observability (Docker/Swarm/CI nicht im Scope, außer kritisch)
+Stand der Analyse: 2026-11-16 (Phase 0 und 0b sind seitdem in `6c34199` committed) · Status damals: **Phase 0 + 0b umgesetzt, verifiziert: 223 Tests grün**; D1–D12 werden vor Phase 2/3 einzeln besprochen; entschieden: N1 = psycopg 3, N2 = keine Echtdaten → neue Baseline, N3 = Postgres 18 überall, D6 = mypy strict als Gate + ty advisory · Scope: App-Code und DB, Tests, Observability (Docker/Swarm/CI nicht im Scope, außer kritisch)
 
 Sechs Agents haben das Backend nur gelesen und nichts geändert: `backend-engineer`, `db-engineer`, `security-auditor`, `backend-tester`, `observability-engineer` und `researcher`. Die Einzelberichte mit Datei:Zeile, Belegen und Fix-Skizzen liegen unter [agent-reports/](agent-reports/). Die Berichte `review-security.md` und `review-researcher.md` sind verdichtet, weil diese beiden Agents keine Dateien schreiben dürfen.
 
@@ -126,6 +126,20 @@ Python 3.14 bringt `uuid.uuid7()` in der Standardbibliothek und PEP 649 (für Py
 ---
 
 ## 4. Umsetzungsplan
+
+### Stand der Phasen am 22.11.2026
+
+Die Spalte „Rest“ stammt aus der Roadmap und den Known issues im [Backend-README](../../README.md#roadmap). Die Beschreibungen der Phasen weiter unten sind der ursprüngliche Plan von 2026-11-16.
+
+| Phase | Stand | Rest |
+|---|---|---|
+| 0, 0b | umgesetzt, Commit `6c34199` | nichts |
+| 1 Fundament und Tooling | umgesetzt durch das Cleanup (Core/Module, Factory, Test-Harness, Upgrades, taskiq, ruff, mypy und pyright strict) | `.env`-Template (Known issue 28), Task-Runner, pre-commit |
+| 2 Datenschicht | offen; der Cleanup-Job ist erledigt (S2.3) | Unit of Work, UUIDv7 (D10), neue Baseline, Constraint-Namen, absolute Session-Lebensdauer (Known issue 26) |
+| 3 API-Vertrag | größtenteils umgesetzt durch S1.3 bis S1.5 (RFC 9457, `/api/v1`, `response_model`, E-Mail-Wechsel) | Cookie `Secure` (Known issue 8), `iss` und `aud`, eigene Token-Fehlercodes, Einladungen, `must_change` (Known issue 16) |
+| 4 Security-Features | offen | Rate-Limiting (D4, Known issues 17 und 23), Admin-Entscheidung (D2), RBAC (D3), HSTS und CSP, Body-Limit und Timeout |
+| 5 Observability | Middleware, Logging, Metriken und Health umgesetzt (S1.4) | Tracing, DB-Pool- und Cache-Metriken, Alerting |
+| 6 Erweiterbarkeit und Doku | Doku, ADRs und `modules.md` umgesetzt (S3.3) | Pagination-Helfer, Idempotency (D9), CHANGELOG, SECURITY.md (D8) |
 
 Leitlinien:
 - Jede Phase ist für sich lauffähig. Für jeden Bugfix wird zuerst ein roter Regressionstest geschrieben.
@@ -260,7 +274,7 @@ Offene Punkte für die Deploy-Runde, festgestellt von deploy-engineer am 2026-11
 | D2 | Admin-Panel | **Opt-in behalten**: `ADMIN_ENABLED=false` außer in `dev`, nie öffentlich routen, sqladmin 0.32, eigene Admin-Accounts über RBAC statt eines geteilten Logins, gehärtete Session, Audit. Ist das zu aufwendig, entfernen. |
 | D3 | Autorisierung | **Kleines generisches RBAC jetzt** (4 Tabellen, `require_permissions`, deny-by-default); die Platzhalter sofort entfernen; keine Rechte im JWT ohne `perm_ver` |
 | D4 | Rate-Limits | **Beides**: Traefik grob pro IP, die App fein (Account+IP, E-Mail, Family) mit `limits` und Redis; Trusted Proxies vorher |
-| D6 | Type-Checker | **mypy strict** als Gate, `ty` (Beta) als Hinweis; kein Pyright als drittes Gate |
+| D6 | Type-Checker | **mypy strict** als Gate, `ty` (Beta) als Hinweis; kein Pyright als drittes Gate. **Entschieden am 22.11.2026 (anders als empfohlen):** mypy und pyright strict sind beide Gates, `ty` bleibt Hinweis, siehe [ADR 0011](../adr/0011-type-checking-mypy-and-pyright-strict.md) |
 | D8 | Compliance | **CRA/NIS2-Deliverables als Pflicht behandeln**: SECURITY.md, SBOM, `uv audit`, sichere Defaults, Log-Minimierung |
 | D9 | Idempotency | **Phase 6, opt-in**: Datensatz in Postgres in derselben Transaktion; 422 bei abweichendem Payload (IETF-Draft) statt der 409 aus der Roadmap |
 | D10 | Primärschlüssel | **UUIDv7** über `uuid.uuid7()`; DB-Default `uuidv7()` erst, wenn Postgres 18 überall gesetzt ist; v4 als Opt-out pro Tabelle |

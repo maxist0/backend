@@ -1,6 +1,8 @@
 # Cleanup 2026-11: Stand und Übergabe (S0–S3)
 
-Dieses Dokument enthält alles, was eine neue Session braucht, um das Backend-Cleanup fortzusetzen. Eingeschoben wurde es am 16.11.2026 vor Schritt 1.5 des [Review-Plans](README.md#4-umsetzungsplan). Gemeint ist eine Claude-Code-Session, die im Workspace-Root `Prooduction/` startet und die Projekt-Agents nutzt.
+> **Status: abgeschlossen (22.11.2026).** Die Schritte S0 bis S3 sind umgesetzt; S3.3 (Doku) wartet nur noch auf den Commit durch den Owner. Die Commit-Liste steht in §3. **Offen und nicht Teil des Cleanups:** die Frontend-Umstellung auf den neuen Vertrag (§4), die Deploy-Runde (§7), die offenen Entscheidungen D2–D4, D8–D10 und D12 sowie die Review-Phasen 2–6 (§7). Die Abschnitte §4 bis §6 bleiben als Nachweis stehen, was jeweils geplant war.
+
+Dieses Dokument enthielt alles, was eine neue Session brauchte, um das Backend-Cleanup fortzusetzen. Eingeschoben wurde es am 16.11.2026 vor Schritt 1.5 des [Review-Plans](README.md#4-umsetzungsplan). Gemeint ist eine Claude-Code-Session, die im Workspace-Root `Prooduction/` startet und die Projekt-Agents nutzt.
 
 **Ziel des Cleanups:** Das Backend ist ein **Modul-Boilerplate**. User-Management, Skalierung und Production-Features stecken im Core. Eine neue App fügt nur Module hinzu und ändert den Core nicht. Einfachheit hat Vorrang: Mechanik wird nur gebaut, wenn es den Fall, für den sie gedacht ist, auch wirklich gibt.
 
@@ -8,8 +10,8 @@ Dieses Dokument enthält alles, was eine neue Session braucht, um das Backend-Cl
 
 | Was | Wo |
 |---|---|
-| Konventionen (einzige Quelle): Modul-Layout, Core vs. Module, Fehler und Responses, Hausstil für Kommentare, Testaufteilung, Boundaries | [`backend/AGENTS.md`](../../AGENTS.md) |
-| Entscheidungen mit Begründung | [`documentation/adr/`](../adr/README.md), ADR 0001–0008 |
+| Konventionen (einzige Quelle): Modul-Layout, Core vs. Module, Fehler und Responses, Hausstil für Kommentare, Testaufteilung, Boundaries | [`backend/AGENTS.md`](../../AGENTS.md); Anleitung „Ein Modul anlegen“: [`documentation/modules.md`](../modules.md) |
+| Entscheidungen mit Begründung | [`documentation/adr/`](../adr/README.md), ADR 0001–0010 |
 | API-Vertrag (Stand S1.3) | [`frontend/documentation/backend-contract.md`](../../../frontend/documentation/backend-contract.md) |
 | Known issues und Roadmap | [`backend/README.md`](../../README.md#known-issues) |
 | Gemeinsamer Standard aller Agents | `.claude/agent-standards.md` (Workspace-Root) |
@@ -36,15 +38,19 @@ Dieses Dokument enthält alles, was eine neue Session braucht, um das Backend-Cl
 | S1.5 | Admin nur lesend und über Services, Admin-CSRF, Fixes aus dem Security-Review (H1, M1, M2, L3–L5) | `adf8b66` |
 | S2.1 | Redis-Stream-Broker mit Acks, verzögerte Retries, Worker-Metriken, Windows-Worker, ADR 0009 | `326cb15` |
 | S2.2 | Tokens im Worker neu gesetzt (Task bekommt nur die `token_id`), `TaskDbSession`, bereinigte DB-Fehler in Tasks, absolute Mail-Links, ADR 0010 | `14aae6e` |
-| S2.3 | Sperr-Mail, Hinweise an die alte Adresse, nächtlicher Cleanup, Neusperre nach abgelaufener Sperre (Migration `14e82733e84f`) | Commit durch den Owner |
-| **S3** | Stil, strikte Checks, Doku | **nächster Schritt** |
-| **Frontend** | Umstellung auf den S1.3-Vertrag (plus S2: absolute Links, Refresh-401 löscht das Cookie) | offen |
+| S2.3 | Sperr-Mail, Hinweise an die alte Adresse, nächtlicher Cleanup, Neusperre nach abgelaufener Sperre (Migration `14e82733e84f`) | `248be9d` |
+| S3.1 | Strikter ruff 0.17.5 und mypy strict, Hausstil in `src/` (ohne Tests) | `ff48984` |
+| S3.2 | Typisierte Test-Suite unter mypy und pyright strict, Tests nach Verhalten benannt | `6d01f6d` |
+| S3.3 | Doku: README, `documentation/*.md`, neue Anleitung `modules.md`, `AGENTS.md` auf rund 200 Zeilen, ADR-Korrekturen, dieser Ordner | Commit durch den Owner |
+| **Frontend** | Umstellung auf den S1.3-Vertrag (plus S2: absolute Links, Refresh-401 löscht das Cookie) | **offen** |
 
 Stand nach S1.5: 587 Tests grün, Coverage 95,2 %, 271 Unit-Tests ohne Docker. ruff (0.15), mypy und `uv audit` sind sauber.
 
-## 4. Nächster Schritt: Frontend-Umstellung
+Stand nach S3.2 (geprüft am 22.11.2026 auf einem Wegwerf-Worktree von `6d01f6d`, ohne Doku-Änderungen): 805 Tests grün, 421 davon Unit-Tests ohne Docker. ruff 0.17.5, mypy, pyright, `uv audit --frozen` und `uv lock --check` sind sauber. Mit dem Beispielmodul aus `modules.md` sind es 822 Tests und 94,31 % Coverage.
 
-Seit S1.3 funktioniert das Frontend nicht mehr mit dem Backend. **Empfohlene Reihenfolge: zuerst das Frontend umstellen, dann S2.** S2 ändert den Vertrag nur minimal.
+## 4. Nächster Schritt: Frontend-Umstellung (offen)
+
+Seit S1.3 funktioniert das Frontend nicht mehr mit dem Backend. Die empfohlene Reihenfolge war: zuerst das Frontend umstellen, dann S2. S2 ist inzwischen umgesetzt, die Frontend-Umstellung ist weiterhin **offen** und der nächste größere Schritt. S2 hat den Vertrag nur minimal geändert (absolute Mail-Links, „Passwort vergessen“ antwortet immer 202, ein Refresh-401 löscht das Cookie).
 
 - Agents: frontend-engineer setzt um, frontend-tester sichert ab. Zuerst `frontend/AGENTS.md` und `frontend/README.md` lesen.
 - Die Aufgabenliste steht in `frontend/documentation/backend-contract.md`, Abschnitt „Migration from the envelope contract“. Er hat 13 Punkte, darunter:
@@ -58,11 +64,11 @@ Seit S1.3 funktioniert das Frontend nicht mehr mit dem Backend. **Empfohlene Rei
   - MSW-, Playwright- und Unit-Mocks anpassen.
 - Commits im Frontend-Repo macht der Owner.
 
-## 5. S2: Hintergrund-Jobs und Mails zuverlässig machen
+## 5. S2: Hintergrund-Jobs und Mails zuverlässig machen (erledigt: S2.1 bis S2.3)
 
 Agent: backend-engineer. Am Ende reviewt security-auditor. Vorher die Memory-Notizen des Agents und `src/app/core/tasks.py`, `src/app/worker.py`, `src/app/modules/auth/tasks.py`, `src/app/core/mail.py` und `src/app/modules/auth/service.py` lesen.
 
-**Heutiger Stand (geprüft am 17.11.2026, vor der Umsetzung erneut prüfen):**
+**Stand vor der Umsetzung (geprüft am 17.11.2026; historisch, S2 ist umgesetzt):**
 - Module-Tasks laufen über `async_shared_broker` (Facade `app.core.task`).
 - Der echte Broker wird in `app/worker.py` (`app.worker:broker`/`:scheduler`) und im App-Lifespan gebaut.
 - Die Mail-Tasks bekommen Empfänger, Username und **rohes Token** als Argumente. Diese liegen damit in Redis.
@@ -92,9 +98,9 @@ Agent: backend-engineer. Am Ende reviewt security-auditor. Vorher die Memory-Not
 
 **Vertragsänderungen fürs Frontend** (in `backend-contract.md` nachtragen): „Passwort vergessen“ antwortet garantiert 202, und die Mail-Links werden absolut. Sonst ändert sich nichts.
 
-## 6. S3: Stil, strikte Checks, Doku
+## 6. S3: Stil, strikte Checks, Doku (erledigt: S3.1 bis S3.3)
 
-Agents: backend-engineer (Code und Tests), danach docs-writer.
+Agents: backend-engineer (Code und Tests), danach docs-writer. Umgesetzt in `ff48984` (Punkte 1 bis 3 und der Kleinkram), `6d01f6d` (Punkt 4) und S3.3 (Punkt 6). Die Liste unten ist der ursprüngliche Auftrag.
 
 1. **Hausstil in allen Dateien** (`src/`, `tests/`, `run.py`, `alembic/env.py`), nach `AGENTS.md` → „Comments and docstrings“:
    - Pfad-Kopfzeilen, Banner, nacherzählende Kommentare, Review- und Phasen-IDs sowie TODOs ohne Issue entfernen;
@@ -123,9 +129,14 @@ Agents: backend-engineer (Code und Tests), danach docs-writer.
    - Die ADR-Index-Notiz „code does not match yet“ entfernen.
    - Dieses Dokument und `README.md` im Review-Ordner auf „abgeschlossen“ setzen.
 
-## 7. Danach und Sammelpunkte
+## 7. Danach und Sammelpunkte (alles offen, nichts davon ist begonnen)
 
-**Offene Entscheidungen** D2–D4, D8–D10 und D12 einzeln mit dem Owner besprechen (Empfehlung mit Begründung, der Owner entscheidet). Danach folgen die Review-Phasen 2–6 aus [README.md](README.md#4-umsetzungsplan):
+Reihenfolge der nächsten Schritte, ohne Priorisierung durch den Owner:
+
+1. **Frontend-Umstellung** auf den Vertrag ab S1.3 (§4).
+2. **Deploy-Runde** (Liste unten).
+3. **Offene Entscheidungen** D2–D4, D8–D10 und D12 einzeln mit dem Owner besprechen (Empfehlung mit Begründung, der Owner entscheidet). D6 (mypy und pyright strict als Gates, `ty` nur Hinweis) ist entschieden und mit [ADR 0011](../adr/0011-type-checking-mypy-and-pyright-strict.md) festgehalten.
+4. **Review-Phasen 2–6** aus [README.md](README.md#4-umsetzungsplan); der Stand je Phase steht in der Tabelle dort, und die ursprünglichen Inhalte sind:
 - Phase 2: Unit of Work, UUIDv7, neue Migrations-Baseline, absolute Session-Laufzeit, Constraint-Namen.
 - Phase 3: `must_change` durchsetzen (Known issue 16), `revoke_reason`.
 - Phase 4: Rate-Limiting D4, das auch Known issue 17 löst.
@@ -134,6 +145,7 @@ Agents: backend-engineer (Code und Tests), danach docs-writer.
 **Deploy-Runde** (deploy-engineer; `deployment/` ist git-ignored):
 - Traefik schneidet heute `/api` ab und muss `/api/v1` unverändert weiterleiten. **Das blockiert jeden Deploy des neuen Vertrags.**
 - `FORWARDED_ALLOW_IPS` auf die Traefik-Adressen setzen, nie `*`. `CORS_ORIGINS` auf das echte Frontend setzen.
+- `FRONTEND_URL` setzen (https, nicht der Dev-Wert). Der Stack setzt es heute nicht, und der Startup-Guard stoppt die API dann mit `ENVIRONMENT=prod` (README, Known issue 30; am 22.11.2026 in `docker-compose.yml` geprüft).
 - `/metrics` und `/health/ready` nicht öffentlich routen (Known issue 19).
 - `prometheus.yml` auf `metrics_path: /metrics` umstellen.
 - `DEBUG` aus dem Stack entfernen.

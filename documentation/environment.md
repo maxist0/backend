@@ -1,445 +1,78 @@
-# Environment Configuration
+# Environments and secrets
 
-> **Status (2026-11-16):** this page is partly stale. The authoritative configuration table is [README.md → Configuration](../README.md#configuration). Corrected here: `JWT_ALGORITHM` and `BCRYPT_ROUNDS` were removed; new settings `ADMIN_ENABLED`, `ARGON2_*`, `PASSWORD_HASH_CONCURRENCY`; the startup guard. Outside `dev` and `unittest` the application refuses to start when `JWT_SECRET_KEY` is the default or shorter than 32 characters, and (with the admin panel enabled) when `ADMIN_PASSWORD` or `ADMIN_SECRET_KEY` are defaults. `docker stack deploy` needs `JWT_SECRET_KEY` exported in the deploy shell and does not read `.env`.
+How the application knows which environment it runs in, where it reads configuration from, and how secrets are handled. Form: explanation with reference tables. The table of every setting, with defaults and bounds, is [README → Configuration](../README.md#configuration); this page does not repeat it.
 
-## Overview
+## `ENVIRONMENT`
 
-The application supports **four deployment environments**, each with distinct configurations:
+`ENVIRONMENT` is required. There is no fallback to `dev`: a missing, empty or unknown value stops the process with a message that lists the allowed values (`environment_from_os` in `src/app/core/config.py`). It is read from the process environment only, because it decides whether `.env.local` is read at all.
 
-- **dev**: Local development with auto-reload
-- **test**: Automated testing environment
-- **stage**: Staging/pre-production environment
-- **prod**: Production environment
+| Value | Set by | Docs and OpenAPI | Logs | `.env.local` | Startup guard | Admin panel |
+|---|---|---|---|---|---|---|
+| `dev` | `python run.py dev` | on | coloured console | read | off | on unless `ADMIN_ENABLED=false` |
+| `unittest` | `tests/conftest.py`, `run.py unittest` | on | JSON | ignored | off | off unless `ADMIN_ENABLED=true` |
+| `test` | the runtime | on | JSON | ignored | on | off unless `ADMIN_ENABLED=true` |
+| `stage` | the runtime | on | JSON | ignored | on | off unless `ADMIN_ENABLED=true` |
+| `prod` | the runtime | off | JSON | ignored | on | off unless `ADMIN_ENABLED=true` |
 
-Configuration is managed via `.env` files and environment variables, using **pydantic-settings** for type-safe configuration.
+`python run.py` without an argument expects `ENVIRONMENT` from the runtime (Docker, Swarm). `run.py dev` and `run.py unittest` set it. `run.py dev` also starts the taskiq worker and scheduler.
 
-## Configuration Hierarchy
+## Where configuration comes from
 
-Settings are loaded in order (later overrides earlier):
+Priority, highest first:
 
-1. **Defaults** in `src/common/config.py` (Settings class)
-2. **Base file**: `.env` (shared across all environments)
-3. **Environment file**: `.env.{env}` (environment-specific overrides)
-4. **Environment variables**: Actual environment variables (highest priority)
+1. Environment variables, including those injected by Docker, Swarm or CI.
+2. `.env.local`, only with `ENVIRONMENT=dev`. The file is git-ignored and relative to the working directory (`backend/`). A missing file is skipped.
+3. The defaults in `Settings`.
 
-### Example
+`.env` is a tracked reference of every variable with its default and secrets commented out. It is **not read** by the application. Do not copy it to `.env.local` as is: its empty `APP_NAME=` makes the app fail at startup. Put only the values you change into `.env.local`.
 
-```ini
-# .env (shared across all environments)
-CACHE_MAXWAIT_CONNECTIONS=10
-LOG_LEVEL=INFO
+`get_settings()` builds the settings once per process (cached). Unknown variables are ignored. Validation errors never echo input values, because they can be secrets. Alembic does not build `Settings`: it reads `DATABASE_URL` only ([database.md](database.md#migrations)).
 
-# .env.prod (overrides for production)
-DEBUG=False
-LOG_LEVEL=WARNING
-ENVIRONMENT=prod
-DATABASE_URL=postgresql+asyncpg://prod_user:secure_pass@db.prod.internal:5432/api_prod
-OTLP_ENDPOINT=http://grafana-alloy.monitoring:4318
-```
+## Startup guard
 
-## Environment Files
+Outside `dev` and `unittest` the application refuses to start when:
 
-### `.env` (Shared Base Configuration)
+- `JWT_SECRET_KEY` is the public default or shorter than 32 characters;
+- `FRONTEND_URL` is the development default (`http://localhost:5173`) or does not use `https`, because email links carry tokens;
+- the admin panel is enabled and `ADMIN_PASSWORD` or `ADMIN_SECRET_KEY` is a public default or shorter than 32 characters.
 
-Common settings used by all environments:
+The error names the variables, not their values. Independent of the environment, the validators also refuse `CORS_ORIGINS` entries that are `*` or carry a path, a `DATABASE_URL` with another driver than psycopg, and Argon2 costs below the OWASP minimum.
 
-```ini
-# Application
-APP_NAME=api
-APP_DESCRIPTION=FastAPI Application
-APP_VERSION=0.1.0
+## Secrets
 
-# Cache - defaults
-CACHE_HOST=localhost
-CACHE_PORT=6379
-CACHE_DB=0
-CACHE_MAX_CONNECTIONS=10
-CACHE_KEY_PREFIX=fastapi-cache
+| Secret | Variable | Notes |
+|---|---|---|
+| JWT signing key | `JWT_SECRET_KEY` | 256 bits of randomness. The algorithm is HS256, pinned in code. Changing it invalidates every access token already issued |
+| Admin password and session key | `ADMIN_PASSWORD`, `ADMIN_SECRET_KEY` | only checked when the admin panel is enabled |
+| Database | `DATABASE_URL` (contains the password) | the password is masked in logs |
+| Redis | `CACHE_PASSWORD`, and the passwords inside `TASKIQ_BROKER_URL` and `TASKIQ_RESULT_BACKEND_URL` | |
+| SMTP | `MAIL_PASSWORD` | without the full mail configuration, mail tasks send nothing |
 
-# JWT (algorithm HS256 is pinned in code; JWT_ALGORITHM was removed)
-ACCESS_TOKEN_EXPIRE_MINUTES=15
-REFRESH_TOKEN_EXPIRE_DAYS=30
+- Generate a key with `python -c "import secrets; print(secrets.token_urlsafe(48))"` (the command from the `.env` template).
+- Secrets never enter git: `.env.local` is ignored, and `.env` holds none.
+- Inject secrets as environment variables at runtime. `docker stack deploy` does not read `.env`: export `JWT_SECRET_KEY` (and `DB_PASSWORD` and `REDIS_PASSWORD`, whose compose fallbacks are development values) in the shell that deploys; the stack file fails the deploy when `JWT_SECRET_KEY` is missing. Docker secrets for all credentials are Roadmap Phase 6.
+- Never print secrets: use `SecretStr` for a new secret and add it to the startup guard and the README table ([AGENTS.md](../AGENTS.md#security-rules)).
 
-# Password hashing (Argon2id; BCRYPT_ROUNDS was removed)
-ARGON2_TIME_COST=3
-ARGON2_MEMORY_KIB=65536
-ARGON2_PARALLELISM=4
-PASSWORD_HASH_CONCURRENCY=4
+## Per environment
 
-# Admin panel: unset = enabled only in dev
-# ADMIN_ENABLED=false
+**Development.** `docker compose -f compose.dev.yaml up -d --wait`, then `run.py dev` ([README → Quick start](../README.md#quick-start)). The defaults match the compose file. Use a second compose project and other ports for experiments that must not touch your data: `DEV_POSTGRES_PORT` and `DEV_REDIS_PORT`, with matching `DATABASE_URL`, `CACHE_PORT` and `TASKIQ_*_URL`.
 
-# Server
-HOST=0.0.0.0
-```
+**Tests.** `tests/conftest.py` sets `ENVIRONMENT=unittest` and `ADMIN_ENABLED=true` and points every service address at a closed port. The integration fixtures then wire the Testcontainers addresses. See [testing.md](testing.md).
 
-### `.env.dev` (Development)
+**Test and prod.** The runtime injects every variable. They differ from `dev` in the table above and from each other only in what you set: `prod` hides the API docs. See [docker.md](docker.md).
 
-Local development settings with fast iteration:
+## Stage
 
-```ini
-ENVIRONMENT=dev
-DEBUG=True
-LOG_LEVEL=DEBUG
-HOST=127.0.0.1
-PORT=8000
-RELOAD=True
+The repository defines **no staging stack**: no staging compose file, no CI pipeline and no Kubernetes manifests exist (open decisions D5 and D11, Roadmap Phases 5 and 6). `ENVIRONMENT=stage` behaves like `test`: API docs on, JSON logs, `.env.local` ignored, the startup guard on and the admin panel off unless `ADMIN_ENABLED=true`. A staging deployment is therefore the production image with `ENVIRONMENT=stage` and staging values. The only code difference from `prod` is that the API docs stay on.
 
-# Local database
-DATABASE_URL=postgresql+asyncpg://dev:dev@localhost:5432/api_dev
+Checklist for a staging deployment:
 
-# Local Redis
-CACHE_HOST=localhost
-CACHE_PORT=6379
+1. Build the image and tag it ([docker.md](docker.md#image)).
+2. Provide separate secrets and separate Postgres and Redis instances. Never point staging at production data or reuse production secrets.
+3. Set `ENVIRONMENT=stage`, `JWT_SECRET_KEY`, `DATABASE_URL`, `CACHE_*`, `TASKIQ_*_URL`, an `https` `FRONTEND_URL`, `CORS_ORIGINS` for the staging frontend and `FORWARDED_ALLOW_IPS` for the proxy ([README → Configuration](../README.md#configuration)).
+4. Run `alembic upgrade head` as a separate step before the API starts. Test the downgrade of a new migration on a copy first.
+5. Start the API, a worker and **one** scheduler. Without the scheduler, retries and the nightly cleanup never run.
+6. Check `GET /health/ready` and, for the worker, its metrics port ([monitoring.md](monitoring.md)). Send a real mail to confirm the `MAIL_*` values.
+7. Do not route `/metrics`, `/health/ready` or `/admin` publicly.
 
-# Dev Secret (MUST be changed in production!)
-JWT_SECRET_KEY=dev-secret-key-not-for-production
-
-# Logging
-ACCESS_LOG_ENABLED=True
-OTLP_LOGS_ENABLED=False  # Don't export logs locally
-```
-
-### `.env.test` (Testing)
-
-Isolated test environment:
-
-```ini
-ENVIRONMENT=test
-DEBUG=False
-LOG_LEVEL=WARNING
-PORT=8001
-RELOAD=False
-
-# Test database (separate from dev)
-DATABASE_URL=postgresql+asyncpg://test:test@localhost:5432/api_test
-
-# Test Redis instance
-CACHE_HOST=localhost
-CACHE_PORT=6379
-CACHE_DB=1  # Different DB to isolate test data
-
-# Test JWT secret
-JWT_SECRET_KEY=test-secret-key-for-testing
-
-# Disable logging during tests
-ACCESS_LOG_ENABLED=False
-OTLP_LOGS_ENABLED=False
-```
-
-### `.env.stage` (Staging)
-
-Pre-production environment mirroring production:
-
-```ini
-ENVIRONMENT=stage
-DEBUG=False
-LOG_LEVEL=INFO
-PORT=8000
-RELOAD=False
-
-# Staging database
-DATABASE_URL=postgresql+asyncpg://stage_user:stage_password@db.stage.internal:5432/api_stage
-
-# Staging Redis
-CACHE_HOST=redis.stage.internal
-CACHE_PORT=6379
-CACHE_PASSWORD=staging-redis-password
-
-# Production-like JWT secret (rotate regularly)
-JWT_SECRET_KEY=${STAGING_JWT_SECRET_KEY}  # Via secrets manager
-
-# Logging
-ACCESS_LOG_ENABLED=True
-OTLP_LOGS_ENABLED=True
-OTLP_ENDPOINT=http://grafana-alloy.staging:4318
-OTLP_SERVICE_NAME=api-staging
-```
-
-### `.env.prod` (Production)
-
-Production-ready configuration:
-
-```ini
-ENVIRONMENT=prod
-DEBUG=False
-LOG_LEVEL=WARNING
-PORT=8000
-RELOAD=False
-
-# Production database (high availability)
-DATABASE_URL=postgresql+asyncpg://prod_user:${DB_PASSWORD}@db-primary.prod.internal:5432/api_prod
-
-# Connection pool for production load
-DB_POOL_SIZE=20
-DB_MAX_OVERFLOW=40
-
-# Production Redis (cluster/sentinel)
-CACHE_HOST=redis-cluster.prod.internal
-CACHE_PORT=6379
-CACHE_PASSWORD=${REDIS_PASSWORD}
-CACHE_MAX_CONNECTIONS=20
-
-# Production JWT secret (from secrets manager)
-JWT_SECRET_KEY=${PROD_JWT_SECRET_KEY}
-
-# Logging & Monitoring
-ACCESS_LOG_ENABLED=True
-OTLP_LOGS_ENABLED=True
-OTLP_ENDPOINT=http://grafana-alloy.prod:4318
-OTLP_SERVICE_NAME=api
-OTLP_HEADERS=Authorization=Bearer ${OTEL_AUTH_TOKEN}
-METRICS_ENABLED=True
-```
-
-## Starting the Application
-
-### Development
-
-```bash
-# With auto-reload
-python app.py dev
-
-# With custom port
-python app.py dev --port 8001
-
-# With custom host
-python app.py dev --host 0.0.0.0
-```
-
-### Testing
-
-```bash
-# Run tests in test environment
-pytest tests/
-
-# The test environment is automatically activated via pytest.ini
-```
-
-### Staging
-
-```bash
-# Single instance
-python app.py stage --host 0.0.0.0 --port 8000
-
-# Docker Compose
-docker-compose -f docker-compose.yml -f docker-compose.stage.yml up
-```
-
-### Production
-
-```bash
-# Docker
-docker build -t api:latest .
-docker run -e ENVIRONMENT=prod api:latest python app.py prod
-
-# Kubernetes
-kubectl apply -f deployment/k8n/api/prod/
-```
-
-## Database-Specific Configuration
-
-Each environment has its own database instance to prevent data mixing:
-
-| Environment | Host | Database | User | Purpose |
-|-------------|------|----------|------|---------|
-| dev | localhost | api_dev | dev | Local development |
-| test | localhost | api_test | test | Unit/integration tests |
-| stage | db.stage.internal | api_stage | stage_user | Pre-production testing |
-| prod | db-primary.prod.internal | api_prod | prod_user | Live production data |
-
-### Database URLs
-
-```python
-# src/common/config.py
-DATABASE_URL: str = "postgresql+asyncpg://user:password@host:5432/database"
-```
-
-## Secrets Management
-
-### Development
-
-Store secrets in `.env.dev` (add to `.gitignore`):
-
-```ini
-JWT_SECRET_KEY=dev-insecure-secret-key
-CACHE_PASSWORD=
-```
-
-### Production
-
-Use environment secrets manager (AWS Secrets Manager, HashiCorp Vault, etc.):
-
-```bash
-# In docker-compose or k8s, inject secrets as environment variables
-export PROD_JWT_SECRET_KEY=$(aws secretsmanager get-secret-value --secret-id api/jwt-secret)
-export DB_PASSWORD=$(aws secretsmanager get-secret-value --secret-id api/db-password)
-
-python app.py prod
-```
-
-### Kubernetes Secrets
-
-```yaml
-apiVersion: v1
-kind: Secret
-metadata:
-  name: api-secrets
-  namespace: production
-type: Opaque
-data:
-  jwt-secret-key: <base64-encoded-secret>
-  db-password: <base64-encoded-password>
-  redis-password: <base64-encoded-password>
-
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: api
-  namespace: production
-spec:
-  template:
-    spec:
-      containers:
-      - name: api
-        env:
-        - name: PROD_JWT_SECRET_KEY
-          valueFrom:
-            secretKeyRef:
-              name: api-secrets
-              key: jwt-secret-key
-        - name: DB_PASSWORD
-          valueFrom:
-            secretKeyRef:
-              name: api-secrets
-              key: db-password
-        - name: REDIS_PASSWORD
-          valueFrom:
-            secretKeyRef:
-              name: api-secrets
-              key: redis-password
-```
-
-## Environment Variables Override
-
-Any setting can be overridden via environment variable:
-
-```bash
-# Override specific settings
-export ENVIRONMENT=stage
-export LOG_LEVEL=DEBUG
-export DATABASE_URL=postgresql+asyncpg://...
-export JWT_SECRET_KEY=custom-secret
-
-python app.py stage
-```
-
-## Configuration Verification
-
-Check current configuration on startup:
-
-```bash
-# View active configuration in logs
-python app.py dev
-
-# Output in logs:
-# 2026-02-27 10:00:00 [INFO] app.startup
-#     environment="dev"
-#     host="127.0.0.1"
-#     port=8000
-#     debug=true
-#     log_level="DEBUG"
-#     database_url="postgresql+asyncpg://dev:***@localhost:5432/api_dev"
-```
-
-## Environment-Specific Features
-
-### Development
-
-- ✅ Auto-reload on file changes (`RELOAD=true`)
-- ✅ OpenAPI documentation (`/docs`)
-- ✅ Debug logging
-- ✅ Structured console output (colored)
-
-### Test
-
-- ✅ Isolated database & cache
-- ✅ Minimal logging (suppress noise)
-- ✅ No OTLP export
-- ✅ Deterministic results
-
-### Staging
-
-- ✅ Production-like configuration
-- ✅ Real secrets management
-- ✅ OTLP logging enabled
-- ✅ Metrics collection
-
-### Production
-
-- ✅ No debug mode
-- ✅ Security headers enabled
-- ✅ OTLP logging & metrics
-- ✅ High-performance settings
-- ✅ No OpenAPI docs
-- ✅ Connection pool tuning
-
-## Database Migrations
-
-For each environment, migrations are applied before startup:
-
-```bash
-# Dev
-alembic upgrade head
-
-# Test
-alembic upgrade head --sql > migrations.sql  # View what would run
-
-# Staging
-alembic upgrade head
-
-# Prod
-alembic upgrade head  # Usually run as init container in K8s
-```
-
-## Configuration Validation
-
-On startup, the application validates configuration:
-
-- Database URL is valid and reachable
-- Redis connection pool can be established
-- All required secrets are provided
-- JWT secret is set (not default)
-
-If validation fails, application exits with error (prevents invalid deployments).
-
-## Switching Environments
-
-### For Developers
-
-```bash
-# Switch from dev to test
-python app.py test tests/
-
-# Switch from dev to staging (requires credentials)
-python app.py stage
-```
-
-### For DevOps
-
-```bash
-# Docker
-docker build -t api:latest .
-docker run -e ENVIRONMENT=stage api:latest
-
-# Kubernetes
-kubectl set env deployment/api ENVIRONMENT=prod
-```
-
----
-
-**Related Documentation:**
-- See [database.md](database.md) for database setup per environment
-- See [redis.md](redis.md) for cache configuration
-- See [logging.md](logging.md) for environment-specific logging
+Not covered yet: a staging data refresh or anonymisation job, a smoke-test suite against a deployed environment and a promotion workflow. They belong to the CI work in Roadmap Phase 5.

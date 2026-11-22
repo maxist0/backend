@@ -55,7 +55,7 @@ Chosen option: "a thin `@cached(ttl, key)` and `invalidate(pattern)` wrapper ove
 
 ## More Information
 
-Implemented in S1 of the 2026-11 cleanup. Conventions: [AGENTS.md → Caching and background jobs](../../AGENTS.md#caching-and-background-jobs-target).
+Implemented in S1 of the 2026-11 cleanup. Conventions: [AGENTS.md → Caching and background jobs](../../AGENTS.md#caching-and-background-jobs).
 
 Implementation notes (S1.4):
 

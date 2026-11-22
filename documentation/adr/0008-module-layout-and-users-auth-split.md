@@ -63,6 +63,6 @@ For password and email change of the signed-in user:
 
 ## More Information
 
-* Conventions: [AGENTS.md → Module layout](../../AGENTS.md#module-layout-target) and [Core vs modules](../../AGENTS.md#core-vs-modules-target).
+* Conventions: [AGENTS.md → Module layout](../../AGENTS.md#module-layout) and [Core vs modules](../../AGENTS.md#core-vs-modules).
 * Implemented in S1.2 (structure) and S1.3 (paths and methods) of the 2026-11 cleanup.
 * The pending email change is completed through `POST /auth/email/verify`, which consumes the `CHANGE_EMAIL` token, switches the account to the new address and verifies it.
