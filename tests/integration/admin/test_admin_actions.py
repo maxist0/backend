@@ -64,7 +64,7 @@ def fail_audit_writes(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def audit_rows(db: Db, event: str) -> list[dict[str, Any]]:
-    """Audit rows of one event type (the enum label, e.g. `ACCOUNT_LOCKED`).
+    """Audit rows of one event type (the stored value, e.g. `account_locked`).
 
     Any: the values are the columns `user_id` and `detail` as the driver
     returns them.
@@ -100,13 +100,13 @@ class TestUserActions:
         assert rows["bob"]["is_locked"]
         assert rows["bob"]["locked_until"] is None
         assert not rows["carol"]["is_locked"], "unselected user must be untouched"
-        audits = audit_rows(db, "ACCOUNT_LOCKED")
+        audits = audit_rows(db, "account_locked")
         assert sorted(a["user_id"] for a in audits) == sorted(ids)
         assert all(f"by admin {actor}" in a["detail"] for a in audits)
         assert (
             db.scalar(
                 "SELECT DISTINCT ip_address FROM auth_audit_log "
-                "WHERE event_type = 'ACCOUNT_LOCKED'"
+                "WHERE event_type = 'account_locked'"
             )
             == "testclient"
         )
@@ -123,7 +123,7 @@ class TestUserActions:
 
         assert active_session_count(db, "alice") == 0
         assert db.scalar("SELECT revoke_reason FROM sessions") == "admin_lock"
-        assert "revoked 1 session(s)" in audit_rows(db, "ACCOUNT_LOCKED")[0]["detail"]
+        assert "revoked 1 session(s)" in audit_rows(db, "account_locked")[0]["detail"]
         assert refresh_with(client, t.refresh)[0].status_code == 401
         assert (
             client.get("/api/v1/users/me", headers=bearer(t.access)).status_code == 401
@@ -174,7 +174,7 @@ class TestUserActions:
         assert row["is_locked"] is False
         assert row["failed_login_attempts"] == 0
         assert row["locked_until"] is None
-        assert audit_rows(db, "ACCOUNT_UNLOCKED") == [
+        assert audit_rows(db, "account_unlocked") == [
             {"user_id": user_id_of(db, "alice"), "detail": f"Unlocked by admin {actor}"}
         ]
 
@@ -190,7 +190,7 @@ class TestUserActions:
         assert db.scalar("SELECT is_active FROM users") is False
         assert active_session_count(db, "alice") == 0
         assert db.scalar("SELECT revoke_reason FROM sessions") == "admin_deactivate"
-        assert audit_rows(db, "ACCOUNT_DEACTIVATED") == [
+        assert audit_rows(db, "account_deactivated") == [
             {
                 "user_id": user_id_of(db, "alice"),
                 "detail": f"Deactivated by admin {actor}, revoked 1 session(s)",
@@ -212,7 +212,7 @@ class TestUserActions:
         run_action(client, "user", "reactivate-users", [user_id_of(db, "alice")])
 
         assert db.scalar("SELECT is_active FROM users") is True
-        assert audit_rows(db, "ACCOUNT_REACTIVATED") == [
+        assert audit_rows(db, "account_reactivated") == [
             {
                 "user_id": user_id_of(db, "alice"),
                 "detail": f"Reactivated by admin {actor}",
@@ -241,7 +241,7 @@ class TestUserActions:
         run_action(client, "user", "force-password-change", [user_id_of(db, "alice")])
 
         assert db.scalar("SELECT must_change FROM password_credentials") is True
-        assert audit_rows(db, "PASSWORD_CHANGE_FORCED") == [
+        assert audit_rows(db, "password_change_forced") == [
             {
                 "user_id": user_id_of(db, "alice"),
                 "detail": f"Password change forced by admin {actor}",
@@ -260,16 +260,16 @@ class TestUserActions:
         )
 
         assert r.status_code == 303
-        assert audit_rows(db, "PASSWORD_CHANGE_FORCED") == []
+        assert audit_rows(db, "password_change_forced") == []
 
     @pytest.mark.parametrize(
         ("slug", "event"),
         [
-            ("lock-users", "ACCOUNT_LOCKED"),
-            ("unlock-users", "ACCOUNT_UNLOCKED"),
-            ("deactivate-users", "ACCOUNT_DEACTIVATED"),
-            ("reactivate-users", "ACCOUNT_REACTIVATED"),
-            ("force-password-change", "PASSWORD_CHANGE_FORCED"),
+            ("lock-users", "account_locked"),
+            ("unlock-users", "account_unlocked"),
+            ("deactivate-users", "account_deactivated"),
+            ("reactivate-users", "account_reactivated"),
+            ("force-password-change", "password_change_forced"),
         ],
     )
     def test_a_user_that_no_longer_exists_is_skipped(
@@ -305,7 +305,7 @@ class TestSessionActions:
         assert row["revoke_reason"] == "admin"
         assert row["revoked_at"] is not None
         assert active_session_count(db, "alice") == 1
-        assert audit_rows(db, "SESSION_REVOKED") == [
+        assert audit_rows(db, "session_revoked") == [
             {
                 "user_id": user_id_of(db, "alice"),
                 "detail": f"Session {first_id} revoked by admin {actor}",
@@ -330,7 +330,7 @@ class TestSessionActions:
 
         assert r.status_code == 303
         assert db.scalar("SELECT revoke_reason FROM sessions") == "reuse_detected"
-        assert audit_rows(db, "SESSION_REVOKED") == []
+        assert audit_rows(db, "session_revoked") == []
 
     def test_a_session_that_no_longer_exists_is_skipped(
         self, client: TestClient, db: Db
@@ -346,7 +346,7 @@ class TestSessionActions:
 
         assert r.status_code == 303
         assert active_session_count(db, "alice") == 0
-        assert len(audit_rows(db, "SESSION_REVOKED")) == 1
+        assert len(audit_rows(db, "session_revoked")) == 1
 
 
 class TestOneTransactionPerAction:
@@ -452,7 +452,7 @@ class TestActionSecurity:
 
         assert r.status_code == 403
         assert db.scalar("SELECT is_locked FROM users") is False
-        assert audit_rows(db, "ACCOUNT_LOCKED") == []
+        assert audit_rows(db, "account_locked") == []
 
     def test_action_without_fetch_metadata_is_rejected(
         self, client: TestClient, db: Db
@@ -538,7 +538,7 @@ class TestActionSecurity:
         assert r.status_code == 302
         assert r.headers["location"].endswith("/admin/login")
         assert db.scalar("SELECT is_locked FROM users") is False
-        assert audit_rows(db, "ACCOUNT_LOCKED") == []
+        assert audit_rows(db, "account_locked") == []
 
     def test_action_redirect_ignores_referer_header(
         self, client: TestClient, db: Db

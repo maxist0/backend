@@ -26,10 +26,27 @@ Pool values are **per process**. Every API process and every taskiq worker proce
 - `build_engine(settings)` creates the async engine: `pool_pre_ping=True` (stale connections are discarded), `hide_parameters=True` (bound values stay out of SQL error messages), `connect_timeout` from `DB_CONNECT_TIMEOUT`, no echo. It logs the URL with the password masked.
 - `create_session_factory()` returns an `async_sessionmaker` with `expire_on_commit=False` and `autoflush=False`. `create_app()` creates it unbound; the lifespan binds it to the engine after a `SELECT 1` check and unbinds it on shutdown.
 - `DbSession` is `Annotated[AsyncSession, Depends(get_db)]`. Use it in routes and dependencies; never create an `AsyncSession` yourself. `get_db` rolls the session back when the request raises.
-- `Base` is the declarative base of every model; `utcnow()` returns a timezone-aware UTC `datetime` for timestamp columns.
+- `Base` is the declarative base of every model. Its metadata carries SQLAlchemy's naming convention, so every constraint gets a deterministic name: `pk_<table>`, `uq_<table>_<column>`, `fk_<table>_<column>_<referred table>`, `ck_<table>_<name>`, `ix_<column label>` for an unnamed index ([ADR 0012](adr/0012-schema-conventions-uuidv7-value-enums-usernames.md)).
+- The mixins `UUIDPrimaryKey`, `CreatedAt` and `Timestamps` and the column type helper `value_enum` give a model the conventions below ([Model conventions](#model-conventions)).
+- `utcnow()` returns a timezone-aware UTC `datetime` for comparisons with timestamp columns.
 - Nothing is created at import time. The engine and the pool exist only inside the lifespan (API) and in a worker's startup hook.
 
 On Windows psycopg needs a `SelectorEventLoop`; the lifespan fails fast with a clear message on the default `ProactorEventLoop` ([README → Quick start](../README.md#quick-start)).
+
+## Model conventions
+
+Every table of the built-in modules follows these rules, and a new module gets them from `app.core` ([modules.md](modules.md#step-2-the-model)):
+
+| Rule | How |
+|---|---|
+| Primary key | `UUIDPrimaryKey`: `id uuid`, a UUIDv7 generated in Python (`uuid.uuid7()`), no server default. A table whose ids must not reveal their creation time declares its own `id` with `default=uuid.uuid4` instead |
+| Timestamps | `CreatedAt` (`created_at`) for rows that never change; `Timestamps` (`created_at`, `updated_at`) for rows that do. `timestamptz`, NOT NULL, `server_default=now()`. The ORM reads `created_at` back with `INSERT ... RETURNING` and sets `updated_at` on every UPDATE it emits; an `update()` statement sets `updated_at=func.now()` itself |
+| Enums | `value_enum(MyEnum)`: VARCHAR(64) that stores `member.value`, with a CHECK constraint `ck_<table>_<lower-case class name>` on the values. No PostgreSQL enum types: they cannot drop a value |
+| Constraint names | from the naming convention; give a CHECK constraint a short `name`, the convention adds the prefix and the table |
+| Indexes | one for every foreign key and every filter or sort column, named explicitly or by the convention |
+| Case-insensitive uniqueness | a unique index on `lower(column)`, and queries that filter on the same expression |
+
+**Changing an enum.** Adding or removing a value is a migration: drop the CHECK constraint and create it with the new values (`op.drop_constraint("ck_<table>_<name>", "<table>", type_="check")`, then `op.create_check_constraint(...)`). Autogenerate does not detect a changed value, and `alembic check` does not either; `tests/integration/core/test_migrations.py` fails until the migration exists. Remove a value only after no row holds it. On a large table create the new constraint `NOT VALID` and validate it in a second step, so the table is not locked while every row is checked.
 
 ## Transactions
 
@@ -48,9 +65,9 @@ The service owns the transaction: it calls `commit()` once its work is done, and
 
 ## Schema: users and auth
 
-The five tables of the built-in `users` and `auth` modules. Source of truth: the models (`src/app/modules/users/models.py`, `src/app/modules/auth/models.py`) and the Alembic migrations. This section was checked on 2026-11-22 against `\d <table>` of a database migrated to the head revision. Application defaults (`uuid4()`, `utcnow()`, `False`, `0`) are set by SQLAlchemy, so the columns have no server defaults.
+The five tables of the built-in `users` and `auth` modules. Source of truth: the models (`src/app/modules/users/models.py`, `src/app/modules/auth/models.py`) and the Alembic migration. This section was checked on 2026-11-22 against `\d <table>` of a database migrated to the head revision.
 
-All primary keys are UUIDv4 generated in the application (open decision D10 covers UUIDv7). Timestamps are `timestamptz` in UTC. Your own modules follow the same rules: see [modules.md](modules.md).
+All primary keys are UUIDv7 generated in the application (`pk_<table>`). `created_at` and `updated_at` have the server default `now()`; the other defaults (`uuid7()`, `False`, `0`) are set by SQLAlchemy, so those columns have no server default. Timestamps are `timestamptz` in UTC. Your own modules follow the same rules: see [Model conventions](#model-conventions).
 
 ```
 users 1 ── 1 password_credentials
@@ -66,8 +83,8 @@ The identity of an account.
 | Column | Type | Null | Notes |
 |---|---|---|---|
 | `id` | uuid | no | primary key |
-| `username` | varchar(64) | no | unique (`users_username_key`); letters, digits, `-` and `_` (checked by the request schema) |
-| `email` | varchar(255) | no | unique (`users_email_key`); stored lower case |
+| `username` | varchar(64) | no | unique regardless of case (unique index `uq_users_lower_username` on `lower(username)`), stored in the casing given at registration; ASCII letters, digits, `-` and `_` (checked by the request schema) |
+| `email` | varchar(255) | no | unique (`uq_users_email`); stored lower case |
 | `display_name` | varchar(128) | yes | |
 | `is_active` | boolean | no | `false` blocks login, refresh and access tokens |
 | `is_email_verified` | boolean | no | |
@@ -86,31 +103,32 @@ One row per user.
 | Column | Type | Null | Notes |
 |---|---|---|---|
 | `id` | uuid | no | primary key |
-| `user_id` | uuid | no | unique, foreign key to `users.id` `ON DELETE CASCADE` |
+| `user_id` | uuid | no | unique (`uq_password_credentials_user_id`), foreign key to `users.id` `ON DELETE CASCADE` |
 | `password_hash` | varchar(512) | no | Argon2id hash |
 | `must_change` | boolean | no | set by the admin action "Force password change"; not enforced yet (known issue 16) |
 | `created_at`, `updated_at` | timestamptz | no | |
 
 ### `sessions` (module `auth`)
 
-One row per refresh token. A rotated token stays as a row so reuse can be detected.
+One row per refresh token. A rotated token stays as a row so reuse can be detected. CHECK `ck_sessions_expires_within_family`: `expires_at <= family_expires_at`.
 
 | Column | Type | Null | Notes |
 |---|---|---|---|
 | `id` | uuid | no | primary key |
 | `user_id` | uuid | no | foreign key `ON DELETE CASCADE`; index `ix_sessions_user_id` |
-| `token_hash` | varchar(64) | no | SHA-256 of the refresh token; unique (`sessions_token_hash_key`) |
+| `token_hash` | varchar(64) | no | SHA-256 of the refresh token; unique (`uq_sessions_token_hash`) |
 | `family_id` | uuid | no | all rotations of one login share it; index `ix_sessions_family_id` |
 | `is_revoked` | boolean | no | |
 | `revoke_reason` | varchar(64) | yes | for example `rotated`, `logout_all`, `password_reset` |
-| `expires_at` | timestamptz | no | index `ix_sessions_expires_at` |
-| `device_id`, `device_name` | varchar(255) | yes | from the `X-Device-*` headers, cut to 255 characters |
-| `ip_address` | varchar(45) | yes | |
-| `user_agent` | varchar(512) | yes | cut to 512 characters |
+| `expires_at` | timestamptz | no | `REFRESH_TOKEN_EXPIRE_DAYS` after creation, at most `family_expires_at` |
+| `family_expires_at` | timestamptz | no | absolute end of the family: `SESSION_MAX_LIFETIME_DAYS` after the login, copied on rotation; index `ix_sessions_family_expires_at` |
+| `device_id`, `device_name` | varchar(255) | yes | from the `X-Device-*` headers, cut to 255 characters; NULL once the session is rotated |
+| `ip_address` | varchar(45) | yes | NULL once the session is rotated |
+| `user_agent` | varchar(512) | yes | cut to 512 characters; NULL once the session is rotated |
 | `created_at` | timestamptz | no | |
 | `revoked_at` | timestamptz | yes | |
 
-The nightly `auth.cleanup` task deletes ended sessions `AUTH_CLEANUP_RETENTION_DAYS` after their latest timestamp.
+The nightly `auth.cleanup` task deletes a session `AUTH_CLEANUP_RETENTION_DAYS` after its family's end, or after its revocation if that came later ([authentication.md](authentication.md#emails), Cleanup).
 
 ### `email_tokens` (module `auth`)
 
@@ -120,7 +138,7 @@ Single-use tokens mailed to a user. Only the SHA-256 hash of the token value is 
 |---|---|---|---|
 | `id` | uuid | no | primary key; this id, not the token, goes into the task |
 | `user_id` | uuid | no | foreign key `ON DELETE CASCADE`; index `ix_email_tokens_user_purpose` (`user_id`, `purpose`) |
-| `purpose` | `emailtokenpurpose` | no | `VERIFY_EMAIL`, `CHANGE_EMAIL`, `RESET_PASSWORD` |
+| `purpose` | varchar(64) | no | CHECK `ck_email_tokens_emailtokenpurpose`: `verify_email`, `change_email`, `reset_password` |
 | `token_hash` | varchar(64) | no | index `ix_email_tokens_token_hash` |
 | `new_email` | varchar(255) | yes | the requested address of a `CHANGE_EMAIL` token |
 | `previous_email` | varchar(255) | yes | the replaced address, set when a change is confirmed, so the worker can notify it |
@@ -139,23 +157,29 @@ Append-only record of security-relevant events.
 |---|---|---|---|
 | `id` | uuid | no | primary key |
 | `user_id` | uuid | yes | foreign key `ON DELETE SET NULL`; index `ix_audit_log_user_id` |
-| `event_type` | `auditeventtype` | no | index `ix_audit_log_event_type` |
+| `event_type` | varchar(64) | no | CHECK `ck_auth_audit_log_auditeventtype` (values below); index `ix_audit_log_event_type` |
 | `ip_address` | varchar(45) | yes | |
 | `user_agent` | varchar(512) | yes | |
 | `detail` | text | yes | short context, for example "Password confirmation" or `... by admin <name>` |
 | `created_at` | timestamptz | no | index `ix_audit_log_created_at` |
 
-PostgreSQL stores the enum member names, in upper case: `REGISTER`, `LOGIN_SUCCESS`, `LOGIN_FAILED`, `ACCOUNT_LOCKED`, `ACCOUNT_UNLOCKED`, `EMAIL_VERIFICATION_SENT`, `EMAIL_VERIFIED`, `EMAIL_CHANGED`, `PASSWORD_CHANGED`, `PASSWORD_RESET_REQUESTED`, `PASSWORD_RESET_COMPLETED`, `SESSION_REVOKED`, `ACCOUNT_DEACTIVATED`, `ACCOUNT_REACTIVATED`, `PASSWORD_CHANGE_FORCED`, `ACCOUNT_LOCKED_NOTICE_SENT`. The cleanup task does not touch this table.
+The column stores the values of `AuditEventType`: `register`, `login_success`, `login_failed`, `account_locked`, `account_unlocked`, `email_verification_sent`, `email_verified`, `email_changed`, `password_changed`, `password_reset_requested`, `password_reset_completed`, `session_revoked`, `account_deactivated`, `account_reactivated`, `password_change_forced`, `account_locked_notice_sent`. The cleanup task does not touch this table.
 
 ### Revisions
 
 | Revision | Message |
 |---|---|
-| `37a0d49f8bbc` | add auth and user tables |
-| `8b82d1b725c0` | add admin audit event types |
-| `14e82733e84f` | add `previous_email` and the lock-notice audit event |
+| `b799370af501` | baseline: the complete schema of `users` and `auth` |
 
-Applied migrations are never edited (see [Migrations](#migrations)).
+On 2026-11-22 this baseline replaced the revisions `37a0d49f8bbc`, `8b82d1b725c0` and `14e82733e84f`; no data existed on any of them. A local database created before that is still stamped with a deleted revision, and Alembic stops with "Can't locate revision". Recreate it; never `alembic stamp` it onto the baseline, because its schema differs from the baseline's (enum types, constraint names, columns) and `stamp` changes only the version row:
+
+```bash
+docker compose -f compose.dev.yaml down -v
+docker compose -f compose.dev.yaml up -d --wait
+ENVIRONMENT=dev uv run alembic upgrade head
+```
+
+From now on applied migrations are never edited (see [Migrations](#migrations)).
 
 ## Migrations
 
@@ -174,9 +198,10 @@ Each command needs `DATABASE_URL` in the environment, or `ENVIRONMENT=dev` and a
 - File names follow `alembic.ini`: `YYYYMMDD_HHMM_<revision>_<slug>.py`, timestamps in UTC.
 - After writing a revision, the post-write hooks in `alembic.ini` run ruff `--fix` and `ruff format` on it. Read the file anyway: autogenerate is a draft.
 - Never edit an applied migration. The downgrade must work; the example in [modules.md](modules.md#step-11-the-migration) shows the full sequence.
-- Prefer expand and contract for data migrations. New tables get a UUID primary key, `created_at` and `updated_at` as `timestamptz` and an index for every foreign key and filter column.
+- Prefer expand and contract for data migrations. New tables follow the [Model conventions](#model-conventions).
+- Constraint names come from the naming convention. Autogenerate writes them with `op.f(...)`; keep them spelled out, so replaying a revision never depends on the convention. Write a `value_enum` column as `sa.String(length=64)` plus an explicit `sa.CheckConstraint(..., name=op.f("ck_<table>_<name>"))`, as the baseline does.
+- `uv run pytest tests/integration/core/test_migrations.py` runs every revision up, down to base and up again in a throwaway database, then `alembic check`, and compares the enum CHECK constraints with the models.
 - Apply migrations to your local database only. The Swarm stack has a one-shot `migrate` service that runs `alembic upgrade head`; the application never migrates at startup.
-- The first migration was written with an older template; it is the one file with ignored ruff rules in `pyproject.toml`.
 
 ## Inspecting the dev database
 

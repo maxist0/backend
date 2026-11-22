@@ -244,3 +244,43 @@ class TestCleanupRetention:
                 AUTH_CLEANUP_RETENTION_DAYS=days
             ).AUTH_CLEANUP_RETENTION_DAYS
         )
+
+
+class TestSessionMaxLifetime:
+    def test_default_is_ninety_days(self, settings_factory: SettingsFactory) -> None:
+        assert settings_factory().SESSION_MAX_LIFETIME_DAYS == 90
+
+    @pytest.mark.parametrize("days", [0, 366, -1])
+    def test_values_outside_the_bounds_are_rejected(
+        self, settings_factory: SettingsFactory, days: int
+    ) -> None:
+        with pytest.raises(ValidationError):
+            settings_factory(
+                SESSION_MAX_LIFETIME_DAYS=days, REFRESH_TOKEN_EXPIRE_DAYS=1
+            )
+
+    @pytest.mark.parametrize("days", [1, 365])
+    def test_the_bounds_themselves_are_accepted(
+        self, settings_factory: SettingsFactory, days: int
+    ) -> None:
+        """Control: the rejections above are caused by the bound only."""
+        settings = settings_factory(
+            SESSION_MAX_LIFETIME_DAYS=days, REFRESH_TOKEN_EXPIRE_DAYS=1
+        )
+
+        assert days == settings.SESSION_MAX_LIFETIME_DAYS
+
+    def test_a_family_shorter_than_one_session_is_rejected(
+        self, settings_factory: SettingsFactory
+    ) -> None:
+        with pytest.raises(ValidationError, match="SESSION_MAX_LIFETIME_DAYS"):
+            settings_factory(SESSION_MAX_LIFETIME_DAYS=29, REFRESH_TOKEN_EXPIRE_DAYS=30)
+
+    def test_a_family_as_long_as_one_session_is_accepted(
+        self, settings_factory: SettingsFactory
+    ) -> None:
+        settings = settings_factory(
+            SESSION_MAX_LIFETIME_DAYS=30, REFRESH_TOKEN_EXPIRE_DAYS=30
+        )
+
+        assert settings.SESSION_MAX_LIFETIME_DAYS == settings.REFRESH_TOKEN_EXPIRE_DAYS

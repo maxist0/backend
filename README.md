@@ -34,7 +34,7 @@ Versions are the locked ones in `uv.lock`.
 | Users | Built-in `users` module: `GET` and `PATCH /api/v1/users/me`, the `CurrentUser` and `OptionalUser` dependencies |
 | Auth | Built-in `auth` module: register, login (OAuth2 password form), refresh with rotation and reuse detection, logout and logout-all, email verification, password reset, password and email change, account lockout, audit log ([authentication.md](documentation/authentication.md)) |
 | API contract | Everything under `/api/v1`, plain typed responses, RFC 9457 `application/problem+json` errors with a stable `code` ([ADR 0002](documentation/adr/0002-rfc9457-errors-plain-responses-api-v1.md), frontend view: [backend-contract.md](../frontend/documentation/backend-contract.md)) |
-| Data | PostgreSQL 18, Alembic migrations (async `env.py`, post-write ruff hooks), UUID primary keys, `timestamptz` columns |
+| Data | PostgreSQL 18, Alembic migrations (async `env.py`, post-write ruff hooks), model mixins for UUIDv7 primary keys and `timestamptz` columns, deterministic constraint names, enums as checked VARCHAR values ([ADR 0012](documentation/adr/0012-schema-conventions-uuidv7-value-enums-usernames.md)) |
 | Caching | `@cached(ttl, key)` and `invalidate(pattern)` on Redis (cashews, JSON values), `RedisDep` for direct access ([redis.md](documentation/redis.md)) |
 | Background jobs | taskiq 0.13 on a Redis stream with acknowledgements, delayed retries, a cron scheduler, a database session per task, transactional mail tasks |
 | Observability | structlog JSON logs on stdout with request IDs, Prometheus metrics at `/metrics`, `/health` and `/health/ready` ([logging.md](documentation/logging.md), [monitoring.md](documentation/monitoring.md)) |
@@ -89,6 +89,8 @@ uv run python run.py dev
 ```
 
 Without `ENVIRONMENT=dev`, Alembic ignores `.env.local` and stops with "DATABASE_URL is not set" unless you export `DATABASE_URL`.
+
+**Database created before 2026-11-22?** The migrations were replaced by one baseline revision on that day, so an older local database is stamped with a revision that no longer exists, and Alembic stops with "Can't locate revision". Delete it with `docker compose -f compose.dev.yaml down -v`, start it again and migrate ([database.md → Revisions](documentation/database.md#revisions)). Do not `alembic stamp` it onto the baseline: its schema is not the baseline's.
 
 `run.py dev` sets `ENVIRONMENT=dev` and starts three processes:
 
@@ -179,7 +181,7 @@ Larger decisions have an ADR in [documentation/adr/](documentation/adr/README.md
 | JWT | `PyJWT[crypto]`, HS256 pinned in code | maintained; a fixed algorithm list prevents algorithm confusion | python-jose (unpatched critical CVE) |
 | Refresh tokens | opaque, hashed at rest, rotated on every use, family-based reuse detection, HttpOnly cookie, Postgres only | OAuth 2.1 and RFC 9700 guidance; one atomic `UPDATE ... RETURNING` is the only gate | JWT refresh tokens, a Redis mirror |
 | ORM and migrations | SQLAlchemy 2 async with `expire_on_commit=False`; Alembic with an async `env.py`, run as a separate step before rollout | typed, mature, autogenerate; never migrate at import time | SQLModel, app-startup migrations |
-| Primary keys | UUIDv4 generated in the application | safe to expose, mergeable across environments | bigint identity; UUIDv7 is open (D10) |
+| Primary keys | UUIDv7 generated in the application (`UUIDPrimaryKey` mixin; [ADR 0012](documentation/adr/0012-schema-conventions-uuidv7-value-enums-usernames.md)) | safe to expose, mergeable across environments, time-ordered inserts into the key index | UUIDv4 (random index writes), PostgreSQL `uuidv7()` (id unknown before the flush), bigint identity (enumerable) |
 | Cache | cashews behind `@cached` / `invalidate`, JSON values ([ADR 0003](documentation/adr/0003-caching-via-cached-decorator.md)) | maintained; caches return values, not responses; nothing is unpickled | fastapi-cache2 (dormant), an ETag middleware |
 | Background jobs | taskiq on a Redis stream with acknowledgements ([ADR 0009](documentation/adr/0009-taskiq-redis-stream-broker-and-delayed-retries.md), [0010](documentation/adr/0010-token-emails-rekeyed-in-the-worker.md)) | async-native, FastAPI-style dependencies, cron via labels, at-least-once delivery | Celery (no async tasks), arq (maintenance only) |
 | Logging | structlog over stdlib, to stdout only ([ADR 0004](documentation/adr/0004-logging-stdout-only.md)) | third-party loggers share one pipeline; a collector reads the container output | loguru, application-side export |
@@ -257,13 +259,14 @@ The worker also reads `PROMETHEUS_MULTIPROC_DIR` (not a setting; default `<tmp>/
 | `JWT_SECRET_KEY` | public placeholder | **Secret.** Guarded outside `dev`/`unittest`: not the default, at least 32 characters. Use a 256-bit random value. The algorithm is HS256, pinned in code |
 | `ACCESS_TOKEN_EXPIRE_MINUTES` | `15` | |
 | `REFRESH_TOKEN_EXPIRE_DAYS` | `30` | |
+| `SESSION_MAX_LIFETIME_DAYS` | `90` | `1..365`, at least `REFRESH_TOKEN_EXPIRE_DAYS`. Absolute lifetime of a login: refreshing never extends a session past it ([authentication.md](documentation/authentication.md#tokens)) |
 | `ARGON2_TIME_COST` | `3` | `>= 2` (OWASP minimum), validated in every environment |
 | `ARGON2_MEMORY_KIB` | `65536` | `>= 19456` (OWASP minimum) |
 | `ARGON2_PARALLELISM` | `4` | `>= 1` |
 | `PASSWORD_HASH_CONCURRENCY` | `4` | `>= 1`. Concurrent Argon2 operations per process (the bound is N × this value with N processes); each needs `ARGON2_MEMORY_KIB` of RAM |
 | `LOGIN_MAX_ATTEMPTS` | `5` | `1..100` (NIST SP 800-63B-4 3.2.2). Consecutive failed password logins that set a timed lock |
 | `LOGIN_LOCKOUT_SECONDS` | `900` | `1..86400`. Length of the timed lock |
-| `AUTH_CLEANUP_RETENTION_DAYS` | `30` | `1..365`. Days that ended sessions and closed email tokens are kept before the nightly cleanup deletes them |
+| `AUTH_CLEANUP_RETENTION_DAYS` | `30` | `1..365`. Days that ended sessions and closed email tokens are kept before the nightly cleanup deletes them; a session counts as ended when its family has ended |
 
 **Mail.** Without server, sender, username and password the mail tasks send nothing and log `email.not_sent` (`reason=mail_not_configured`).
 
@@ -434,10 +437,13 @@ This is the original implementation plan. The re-prioritised plan from the Novem
 ### Phase 4: Data layer
 
 - [ ] Unit of work: crud functions stop committing; the service owns the transaction. Registration becomes atomic. (New modules already follow this: see [modules.md](documentation/modules.md).)
-- [ ] Base model mixins: `created_at`, `updated_at` (server defaults), optional `version`, optional soft delete with partial indexes.
-- [ ] Evaluate UUIDv7 primary keys (Postgres 18 `uuidv7()`); document the decision (D10).
+- [x] Base model mixins in the core: `UUIDPrimaryKey`, `CreatedAt`, `Timestamps` (server defaults). No `version` column and no soft delete until a module needs them (owner decision 2026-11-22).
+- [x] UUIDv7 primary keys, generated in Python (D10, [ADR 0012](documentation/adr/0012-schema-conventions-uuidv7-value-enums-usernames.md)).
+- [x] Enums as VARCHAR with a CHECK constraint on the values (`value_enum`); usernames unique regardless of case.
+- [x] Absolute session (family) lifetime, `SESSION_MAX_LIFETIME_DAYS`.
 - [x] Session cleanup job: `auth.cleanup` at 03:00 UTC deletes ended sessions and closed email tokens after `AUTH_CLEANUP_RETENTION_DAYS`, in batches.
-- [ ] SQLAlchemy naming convention for constraints; `alembic check` in CI; migration review checklist (expand/contract, `CONCURRENTLY`).
+- [x] SQLAlchemy naming convention for constraints; one reviewed baseline revision; a test runs the migrations up, down and up and `alembic check`.
+- [ ] `alembic check` in CI (D5); migration review checklist (expand/contract, `CONCURRENTLY`).
 - [x] SQLAlchemy 2.1 (`sqlalchemy[asyncio]`, psycopg 3).
 
 ### Phase 5: Supply chain and CI/CD
@@ -476,17 +482,18 @@ The numbers are stable: other documents and ADRs refer to them. Closed issues st
 - ~~7~~ The password-reset email link is absolute (`FRONTEND_URL` + `FRONTEND_RESET_PASSWORD_PATH`), and every token link URL-encodes the token.
 - ~~9~~ The coverage threshold exists once: `fail_under` in `[tool.coverage.report]`. `addopts` sets no `--cov-fail-under`.
 - ~~10~~ No unused settings remain, and the `MAIL_*` values are `Settings` fields (`config.py`). `REDIS_URL`, `BCRYPT_ROUNDS`, `CACHE_KEY_PREFIX`, `ROUTE_CACHE_*`, `DEBUG` and `OTLP_*` are gone.
+- ~~11~~ `alembic/env.py` never overrides an injected `DATABASE_URL`. With `ENVIRONMENT=dev` it fills a missing one from `.env.local`; the owner kept that convenience (2026-11-22). The log line `Using DATABASE_URL … (from environment|.env.local)` names the source, so a shell with a global `ENVIRONMENT=dev` cannot silently migrate the wrong database.
 - ~~12~~ The `Dockerfile` healthcheck targets `/health`, which works with `METRICS_ENABLED=false`.
 - ~~13~~ `ruff format --check` passes.
 - ~~14~~ Not reproducible: the virtualenv runs Python 3.14.
 - ~~15~~ Admin CSRF: sqladmin runs custom actions as `GET` requests. The admin session cookie is `SameSite=Strict`, `HttpOnly`, `Secure` outside `dev`/`unittest`, and expires 8 hours after login. A fail-safe Fetch Metadata guard answers 403 to every state-changing admin request that does not carry `Sec-Fetch-Site: same-origin`, a missing header included ([OWASP CSRF cheat sheet](https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html)). Browsers without the header (before the March 2023 baseline) cannot log in to the admin or run actions.
+- ~~26~~ Reuse detection no longer ends before the session family does. A login's family has an absolute end, `SESSION_MAX_LIFETIME_DAYS` (90) after the login; no rotated session expires after it, and the cleanup deletes a family's sessions only `AUTH_CLEANUP_RETENTION_DAYS` after that end. A replayed rotated token is therefore either found (the family is revoked) or belongs to a family that has ended, whose tokens are all refused ([authentication.md](documentation/authentication.md#emails), Cleanup).
 - ~~28~~ The `.env` template is a startable dev configuration: every active line holds the `Settings` default, and settings that are unset by default, secrets, `ENVIRONMENT` and `APP_VERSION` are commented out instead of empty or fixed. `tests/unit/core/test_env_template.py` copies it to `.env.local`, builds the app with `ENVIRONMENT=dev` and checks that no setting differs from its default. The Quick start copies it again.
 - ~~29~~ The core tests derive the expected tables and task names from `MODULES` (`Module.models`, `Module.tasks`) and check that no table or task exists outside a registered module; the tests of `users` and `auth` name their own tables and tasks. Adding a module changes only the OpenAPI snapshot, an intended contract change ([modules.md](documentation/modules.md#step-13-regenerate-the-openapi-snapshot)).
 
 **Open**
 
 8. The refresh cookie is set without `Secure`. When `Secure` or a name prefix is added, `_delete_refresh_cookie` in `modules/auth/router.py` must send the same name and attributes, or browsers keep the old cookie. Use `__Secure-`, not `__Host-`: `__Host-` requires `Path=/`, which conflicts with the narrow `<API_PREFIX>/auth` path. [Phase 1]
-11. Partly fixed: `alembic/env.py` no longer overrides injected variables, but with `ENVIRONMENT=dev` it still fills a missing `DATABASE_URL` from `.env.local`. [Phase 4]
 16. The admin action "Force password change" sets `password_credentials.must_change`, but neither login, refresh nor access tokens check it, and a password change or reset does not clear it. [Phase 3]
 17. A locked account can be told apart by response time while the Argon2 queue is loaded: a refusal on a locked account waits like an average verify, but does not queue behind other password evaluations. The real control is rate limiting ([D4](#open-decisions)). [Phase 3]
 18. **Accepted risk:** `PUT /users/me/email` answers 409 `email_taken` when the new address belongs to another account, so a signed-in user who knows their password can test whether an address is registered. The owner accepted this: `POST /auth/register` reveals the same with its 409, and only the account holder (after the password check) can ask.
@@ -497,7 +504,6 @@ The numbers are stable: other documents and ADRs refer to them. Closed issues st
 23. `POST /auth/password/forgot` answers an unknown address at once, a known inactive or admin-locked account after an audit row, and a known active account after a token, an audit row and the enqueue: three timing classes, so the response time tells whether an address is registered and roughly in which state. The answer itself is always 202. Likewise, while Redis is unreachable, the login request that sets a timed lock (the fifth wrong password) waits up to the broker's socket timeout (5 s) for the lock notice's enqueue, which shows that the account exists. Like known issue 17, the control is rate limiting ([D4](#open-decisions)); equal timing is not attempted before it. [D4, review plan Phase 4]
 24. Retry schedules (`taskiq_retry:*`) never expire: while the scheduler is down they pile up, and the scheduler sends every overdue one when it starts again. For the token mails this is harmless (the schedule holds only the token's id, and a run after the link's expiry sends nothing), and the lock notice checks that the lock is still active; a late email-change notice is still true when it arrives. A future task with time-sensitive effects must check its own deadline. [Phase 3]
 25. **Accepted:** a refresh that fails with 401 clears the refresh cookie (same name and path). If that 401 reaches the browser after the response of a login made in parallel, it deletes the new login's cookie, and the user has to sign in again. This affects availability only.
-26. Reuse detection of rotated refresh tokens ends when the cleanup deletes the rotated session, `REFRESH_TOKEN_EXPIRE_DAYS` + `AUTH_CLEANUP_RETENTION_DAYS` after the token was issued (60 days by default). A replay after that is a plain 401 and no longer revokes the family. The fix is the absolute session (family) lifetime planned in the [review plan, Phase 2](documentation/review-2026-11/README.md#phase-2-datenschicht) (M2): a family whose absolute lifetime ends before its rotated sessions are deleted has nothing left to protect. [review plan Phase 2]
 27. **Accepted:** the lock-notice throttle is check, send, record, and not atomic. After a worker backlog several lock notices of one user can go out together, at most one per lock.
 30. The Swarm stack sets no `FRONTEND_URL`, `CORS_ORIGINS` or `FORWARDED_ALLOW_IPS`. With `ENVIRONMENT=prod` the startup guard stops the API until `FRONTEND_URL` is a real `https` URL, and the cookie, CORS and client-IP behaviour need the real values. [deploy round]
 
@@ -516,7 +522,7 @@ Decisions deliberately deferred. A decision that is taken gets an ADR, and its r
 | D7 | Repository layout | monorepo README at the root plus this file, one AGENTS.md per package | root overview and per-package files (in place) |
 | D8 | License and compliance scope | internal, or open source; whether CRA/NIS2 deliverables (SBOM, SECURITY.md, reporting process) are mandatory | treat as mandatory for an industrial product |
 | D9 | Idempotency keys | implement in the boilerplate now (the frontend blueprint requires them) or later | Phase 2 |
-| D10 | Primary key strategy | UUIDv4 (current), UUIDv7, bigint | evaluate UUIDv7 with Postgres 18 |
+| D10 | Primary key strategy | UUIDv4, UUIDv7, bigint | **Decided 2026-11-22:** UUIDv7 generated in Python (`uuid.uuid7()`), a module may opt out to UUIDv4 per table. See [ADR 0012](documentation/adr/0012-schema-conventions-uuidv7-value-enums-usernames.md) (implemented) |
 | D11 | Deployment target | Docker Swarm (current), Kubernetes, both | Swarm now, Kubernetes manifests later |
 | D12 | Password hashing library | keep `argon2-cffi` directly, or `pwdlib` (FastAPI tutorial default, bcrypt upgrade path) | keep `argon2-cffi` |
 

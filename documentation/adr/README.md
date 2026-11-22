@@ -4,7 +4,7 @@ Decisions that shape the backend. Each record uses the [MADR 4.0](https://adr.gi
 
 Naming: `NNNN-kebab-title.md`, numbered in the order the decisions were taken. A record is never rewritten after acceptance. A later decision supersedes it with a new ADR and a status change.
 
-The first eight decisions were taken by the owner on 2026-11-16, the next two on 2026-11-17, and ADR 0011 (open decision D6) was recorded on 2026-11-22. They are implemented in steps S1–S3 of the 2026-11 cleanup (S1 structure, S2 taskiq reliability, S3 style pass, strict ruff/mypy, docs).
+The first eight decisions were taken by the owner on 2026-11-16, the next two on 2026-11-17, ADR 0011 (open decision D6) was recorded on 2026-11-22, and ADR 0012 (open decision D10) the same day. ADRs 0001 to 0011 are implemented in steps S1–S3 of the 2026-11 cleanup (S1 structure, S2 taskiq reliability, S3 style pass, strict ruff/mypy, docs); ADR 0012 in step B1.1 of review phase 2 (data layer).
 
 | ADR | Title | Status | Date | Open decision |
 |---|---|---|---|---|
@@ -19,5 +19,6 @@ The first eight decisions were taken by the owner on 2026-11-16, the next two on
 | [0009](0009-taskiq-redis-stream-broker-and-delayed-retries.md) | Taskiq on a Redis stream with acknowledgements and delayed retries | accepted | 2026-11-17 | |
 | [0010](0010-token-emails-rekeyed-in-the-worker.md) | Token emails are re-keyed in the worker; tasks get a database session | accepted | 2026-11-17 | |
 | [0011](0011-type-checking-mypy-and-pyright-strict.md) | Type checking: mypy and pyright strict are gates, ty is informational | accepted | 2026-11-22 | D6 |
+| [0012](0012-schema-conventions-uuidv7-value-enums-usernames.md) | Schema conventions: UUIDv7 keys, model mixins, constraint names, checked VARCHAR enums, case-insensitive usernames | accepted | 2026-11-22 | D10 |
 
 Conventions that follow from these decisions are in [AGENTS.md](../../AGENTS.md).

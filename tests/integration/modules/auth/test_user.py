@@ -197,7 +197,7 @@ class TestChangeMyEmail:
         assert audit_count(db, "email_verification_sent", "alice") == before + 1
         detail = db.scalar(
             "SELECT detail FROM auth_audit_log WHERE event_type::text = "
-            "'EMAIL_VERIFICATION_SENT' ORDER BY created_at DESC LIMIT 1"
+            "'email_verification_sent' ORDER BY created_at DESC LIMIT 1"
         )
         assert detail == "Email change requested"
 
@@ -277,7 +277,7 @@ class TestChangeMyEmail:
         # The redemption was rolled back with the failed change.
         assert (
             db.scalar(
-                "SELECT used_at FROM email_tokens WHERE purpose::text = 'CHANGE_EMAIL'"
+                "SELECT used_at FROM email_tokens WHERE purpose::text = 'change_email'"
             )
             is None
         )
@@ -296,7 +296,7 @@ class TestChangeMyEmail:
         assert captured_emails == []
         assert (
             db.scalar(
-                "SELECT count(*) FROM email_tokens WHERE purpose::text = 'CHANGE_EMAIL'"
+                "SELECT count(*) FROM email_tokens WHERE purpose::text = 'change_email'"
             )
             == 0
         )

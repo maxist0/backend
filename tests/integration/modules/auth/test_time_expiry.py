@@ -22,7 +22,9 @@ import pytest
 import time_machine
 from fastapi.testclient import TestClient
 from sqlalchemy import RowMapping
+from sqlalchemy.exc import IntegrityError
 
+from app.core import constraint_name
 from app.core.config import get_settings
 from tests.helpers import (
     LOGIN_LOCKOUT_SECONDS,
@@ -62,6 +64,10 @@ def _access_lifetime() -> timedelta:
 
 def _refresh_lifetime() -> timedelta:
     return timedelta(days=get_settings().REFRESH_TOKEN_EXPIRE_DAYS)
+
+
+def _family_lifetime() -> timedelta:
+    return timedelta(days=get_settings().SESSION_MAX_LIFETIME_DAYS)
 
 
 class TestAccessTokenExpiry:
@@ -165,12 +171,11 @@ class TestRefreshSessionLifetime:
     def test_rotation_grants_the_successor_a_full_new_lifetime(
         self, client: TestClient, db: Db
     ) -> None:
-        """Characterisation: the lifetime slides, there is no absolute cap.
+        """The lifetime slides while the family end is further away.
 
         Python clock (time-machine) for the written value; the rotation gate
         itself runs on the database clock and the old session is still valid
-        there. If an absolute session lifetime is introduced, this test is the
-        one to change.
+        there.
         """
         register_ok(client, username="alice")
         start = _frozen_now()
@@ -184,6 +189,139 @@ class TestRefreshSessionLifetime:
 
         newest = db.scalar("SELECT max(expires_at) FROM sessions WHERE NOT is_revoked")
         assert newest == later + _refresh_lifetime()
+
+    @pytest.mark.usefixtures("captured_emails")
+    def test_login_sets_the_family_end_after_the_maximum_lifetime(
+        self, client: TestClient, db: Db
+    ) -> None:
+        """Python clock (time-machine): the value the service writes."""
+        register_ok(client, username="alice")
+        start = _frozen_now()
+
+        with _travel(start):
+            login_tokens(client, "alice")
+
+        assert db.scalar("SELECT family_expires_at FROM sessions") == (
+            start + _family_lifetime()
+        )
+
+    @pytest.mark.usefixtures("captured_emails")
+    def test_rotation_keeps_the_family_end(self, client: TestClient, db: Db) -> None:
+        """Python clock (time-machine): a later rotation copies the end unchanged."""
+        register_ok(client, username="alice")
+        start = _frozen_now()
+        with _travel(start):
+            tokens = login_tokens(client, "alice")
+
+        with _travel(start + timedelta(days=10)):
+            r, _ = refresh_with(client, tokens.refresh)
+        assert r.status_code == 200
+
+        ends = db.rows("SELECT DISTINCT family_expires_at AS end FROM sessions")
+        assert [row["end"] for row in ends] == [start + _family_lifetime()]
+
+    @pytest.mark.usefixtures("captured_emails")
+    def test_rotation_near_the_family_end_caps_the_successor(
+        self, client: TestClient, db: Db
+    ) -> None:
+        """Python clock (time-machine): the successor ends with its family.
+
+        The rotation gate runs on the database clock, where the old session
+        is still valid.
+        """
+        register_ok(client, username="alice")
+        start = _frozen_now()
+        with _travel(start):
+            tokens = login_tokens(client, "alice")
+
+        near_end = start + _family_lifetime() - timedelta(days=1)
+        with _travel(near_end):
+            r, _ = refresh_with(client, tokens.refresh)
+        assert r.status_code == 200
+
+        newest = db.scalar("SELECT expires_at FROM sessions WHERE NOT is_revoked")
+        assert newest == start + _family_lifetime()
+
+    @pytest.mark.usefixtures("captured_emails")
+    def test_access_token_ends_with_its_family(self, client: TestClient) -> None:
+        """Python clock (time-machine): `exp` and `expires_in` stop at the end.
+
+        Five minutes before the family end a refresh still succeeds (the gate
+        runs on the database clock), but the new access token must not
+        outlive the family.
+        """
+        register_ok(client, username="alice")
+        start = _frozen_now()
+        with _travel(start):
+            tokens = login_tokens(client, "alice")
+        family_end = start + _family_lifetime()
+        remaining = timedelta(minutes=5)
+        assert remaining < _access_lifetime()
+
+        with _travel(family_end - remaining):
+            r, renewed = refresh_with(client, tokens.refresh)
+
+        assert r.status_code == 200
+        assert renewed is not None
+        assert r.json()["expires_in"] == int(remaining.total_seconds())
+        claims = jwt.decode(renewed.access, options={"verify_signature": False})
+        assert claims["exp"] == int(family_end.timestamp())
+
+    @pytest.mark.usefixtures("captured_emails")
+    def test_access_token_keeps_its_full_lifetime_far_from_the_family_end(
+        self, client: TestClient
+    ) -> None:
+        """Control for the cap above: login and an early refresh are not cut."""
+        register_ok(client, username="alice")
+        r = login(client, username="alice")
+        client.cookies.clear()
+
+        assert r.json()["expires_in"] == int(_access_lifetime().total_seconds())
+
+    @pytest.mark.usefixtures("captured_emails")
+    def test_refresh_after_the_family_end_is_refused(
+        self, client: TestClient, db: Db
+    ) -> None:
+        """Database clock (SQL rewrite): no rotation outlives its family."""
+        register_ok(client, username="alice")
+        tokens = login_tokens(client, "alice")
+        db.execute(
+            "UPDATE sessions SET family_expires_at = now() + interval '1 minute', "
+            "expires_at = now() + interval '1 minute'"
+        )
+        r, renewed = refresh_with(client, tokens.refresh)
+        assert r.status_code == 200
+        assert renewed is not None
+        assert db.scalar(
+            "SELECT expires_at = family_expires_at FROM sessions WHERE NOT is_revoked"
+        )
+
+        db.execute(
+            "UPDATE sessions SET family_expires_at = now() - interval '1 second', "
+            "expires_at = least(expires_at, now() - interval '1 second')"
+        )
+        r, again = refresh_with(client, renewed.refresh)
+
+        assert r.status_code == 401
+        assert r.json()["code"] == "invalid_refresh_token"
+        assert again is None
+        assert db.scalar("SELECT count(*) FROM sessions WHERE NOT is_revoked") == 1
+
+    def test_a_session_cannot_outlive_its_family(self, db: Db) -> None:
+        """The database refuses a row whose expiry lies after its family end."""
+        db.execute(
+            "INSERT INTO users (id, username, email, is_active, is_email_verified, "
+            "is_locked, failed_login_attempts) VALUES "
+            "(gen_random_uuid(), 'alice', 'alice@example.com', true, false, false, 0)"
+        )
+        with pytest.raises(IntegrityError) as excinfo:
+            db.execute(
+                "INSERT INTO sessions (id, user_id, token_hash, family_id, "
+                "is_revoked, expires_at, family_expires_at) SELECT "
+                "gen_random_uuid(), id, 'h', gen_random_uuid(), false, "
+                "now() + interval '2 days', now() + interval '1 day' FROM users"
+            )
+        assert constraint_name(excinfo.value) == "ck_sessions_expires_within_family"
 
     @pytest.mark.usefixtures("captured_emails")
     def test_session_is_refreshable_while_the_database_says_it_is_valid(
@@ -357,7 +495,7 @@ class TestEmailChangeTokenLifetime:
         token = self._request_change(client, captured_emails)
         db.execute(
             "UPDATE email_tokens SET expires_at = now() - interval '1 second' "
-            "WHERE purpose::text = 'CHANGE_EMAIL'"
+            "WHERE purpose::text = 'change_email'"
         )
 
         r = verify_email(client, token)

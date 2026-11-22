@@ -163,6 +163,11 @@ class Settings(BaseSettings):
     JWT_SECRET_KEY: SecretStr = SecretStr(_DEFAULT_JWT_SECRET_KEY)
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
     REFRESH_TOKEN_EXPIRE_DAYS: int = 30
+    # Absolute lifetime of a login's refresh-token family: rotation never
+    # extends a session past it, so a stolen family cannot be kept alive
+    # for good, and the cleanup can rely on it. At least the refresh
+    # lifetime (validated below).
+    SESSION_MAX_LIFETIME_DAYS: int = Field(default=90, ge=1, le=365)
 
     # Password hashing (Argon2id). Defaults equal argon2-cffi's defaults
     # (RFC 9106 "second recommended option"), so existing hashes stay valid.
@@ -300,6 +305,21 @@ class Settings(BaseSettings):
                     "(scheme://host[:port], no path or trailing slash)."
                 )
         return origins
+
+    @model_validator(mode="after")
+    def _require_family_outlasting_a_session(self) -> Self:
+        """`SESSION_MAX_LIFETIME_DAYS` may not be shorter than one session.
+
+        A shorter value would silently cut every session's lifetime, so
+        `REFRESH_TOKEN_EXPIRE_DAYS` would no longer mean what it says.
+        """
+        if self.SESSION_MAX_LIFETIME_DAYS < self.REFRESH_TOKEN_EXPIRE_DAYS:
+            raise ValueError(
+                "SESSION_MAX_LIFETIME_DAYS must be at least "
+                "REFRESH_TOKEN_EXPIRE_DAYS: a login's session family cannot "
+                "end before its first session."
+            )
+        return self
 
     @model_validator(mode="after")
     def _refuse_insecure_defaults(self) -> Self:

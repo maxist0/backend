@@ -107,7 +107,7 @@ def _change_token_id(db: Db, username: str = "alice") -> str:
     return str(
         db.scalar(
             "SELECT t.id FROM email_tokens t JOIN users u ON u.id = t.user_id "
-            "WHERE u.username = :u AND t.purpose = 'CHANGE_EMAIL' "
+            "WHERE u.username = :u AND t.purpose = 'change_email' "
             "ORDER BY t.created_at DESC LIMIT 1",
             u=username,
         )
@@ -230,7 +230,7 @@ class TestAccountLockedNotice:
         db.execute(
             "UPDATE auth_audit_log "
             "SET created_at = now() - interval '24 hours 1 minute' "
-            "WHERE event_type = 'ACCOUNT_LOCKED_NOTICE_SENT'"
+            "WHERE event_type = 'account_locked_notice_sent'"
         )
         _lift_timed_lock(db)
         _lock_by_login(client)

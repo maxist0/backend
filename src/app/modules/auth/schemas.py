@@ -15,7 +15,18 @@ from pydantic import (
 
 from app.modules.users.schemas import UserResponse
 
-_USERNAME_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+# Matched with `fullmatch`: `$` in `match` would accept a trailing newline.
+_USERNAME_RE = re.compile(r"[a-zA-Z0-9_-]+")
+
+
+def is_username(value: str) -> bool:
+    """Tell whether `value` is a well-formed username (ASCII only).
+
+    The database compares usernames with `lower()`, which also folds some
+    non-ASCII characters onto ASCII letters (the Kelvin sign onto `k`), so a
+    login name is looked up only when this holds.
+    """
+    return _USERNAME_RE.fullmatch(value) is not None
 
 
 def _reject_whitespace_and_control_chars(value: object) -> object:
@@ -54,7 +65,7 @@ class RegisterRequest(BaseModel):
     @classmethod
     def validate_username(cls, v: str) -> str:
         """Allow ASCII letters, digits, hyphens and underscores only."""
-        if not _USERNAME_RE.match(v):
+        if not is_username(v):
             raise ValueError(
                 "Username may only contain letters, digits, hyphens, and underscores"
             )

@@ -273,15 +273,17 @@ async def get_session_by_token_hash(
     return result.scalars().first()
 
 
-async def rotate_session(
-    db: AsyncSession, token_hash: str
-) -> tuple[uuid.UUID, uuid.UUID] | None:
+async def rotate_session(db: AsyncSession, token_hash: str) -> datetime | None:
     """Atomically consume a refresh token: the single gate for rotation.
 
     `UPDATE ... WHERE NOT is_revoked AND expires_at > now() RETURNING`: of
     several concurrent calls with the same token exactly one gets a row.
-    Returns `(user_id, family_id)` or None if the token is unknown, revoked
-    or expired.
+    A session never expires after its family's end (a CHECK constraint), so
+    the gate also refuses every token of an ended family. The consumed row
+    drops its IP address, user agent and device: it stays only for reuse
+    detection, which needs none of them, and the successor carries the
+    current values. Returns the family's end (`family_expires_at`) or None
+    if the token is unknown, revoked or expired.
 
     The caller holds the user lock (`lock_user`) already. Does NOT commit:
     the caller writes the successor session in the same transaction, so a
@@ -294,13 +296,18 @@ async def rotate_session(
             Session.is_revoked.is_(False),
             Session.expires_at > func.now(),
         )
-        .values(is_revoked=True, revoke_reason="rotated", revoked_at=func.now())
-        .returning(Session.user_id, Session.family_id)
+        .values(
+            is_revoked=True,
+            revoke_reason="rotated",
+            revoked_at=func.now(),
+            ip_address=None,
+            user_agent=None,
+            device_id=None,
+            device_name=None,
+        )
+        .returning(Session.family_expires_at)
     )
-    row = result.first()
-    if row is None:
-        return None
-    return row[0], row[1]
+    return result.scalar_one_or_none()
 
 
 async def revoke_user_sessions(
@@ -315,7 +322,7 @@ async def revoke_user_sessions(
 
     Active means not revoked and not expired. An expired session cannot be
     refreshed any more, and leaving it alone keeps its `revoked_at` empty,
-    so the cleanup's retention still counts from its expiry. Reuse
+    so the cleanup's retention still counts from its family's end. Reuse
     detection is unaffected: it looks only for sessions revoked as
     `rotated`.
 
@@ -585,21 +592,24 @@ async def audit_event_since(
 
 
 # PostgreSQL's GREATEST ignores NULL arguments, so these are the latest of
-# the row's timestamps: when it expired, or a later revocation, use or
-# invalidation. `expires_at` is NOT NULL, so the value is never NULL. The
-# extra `expires_at < cutoff` is implied by it, but lets the planner use
-# the `expires_at` index, oldest rows first.
+# the row's timestamps: when it (or its family) ended, or a later
+# revocation, use or invalidation. The first argument is NOT NULL, so the
+# value is never NULL. The extra `... < cutoff` on the first argument is
+# implied by it, but lets the planner use that column's index, oldest rows
+# first.
 
 
 async def delete_ended_sessions(
     db: AsyncSession, retention: timedelta, limit: int
 ) -> int:
-    """Delete up to `limit` sessions ended longer than `retention` ago.
+    """Delete up to `limit` sessions whose family ended longer than `retention` ago.
 
-    Ended means expired, and also last changed (revoked) before the cutoff.
-    A revoked session is kept until it has also expired for `retention`:
-    until then its token could still be presented, and a rotated token that
-    comes back must be found to revoke its family (reuse detection).
+    A session is kept until its family has ended (`family_expires_at`) and
+    it was last changed (revoked) for `retention`. Until the family ends, a
+    successor of a rotated token can still be refreshed, and a rotated
+    token that comes back must be found to revoke the family (reuse
+    detection); after the end, every token of the family is refused anyway.
+    No session expires after its family, so this also covers `expires_at`.
 
     Rows locked by another transaction (a revocation, a second cleanup run)
     are skipped (`SKIP LOCKED`), so this never waits on a row lock and never
@@ -612,10 +622,10 @@ async def delete_ended_sessions(
     batch = (
         select(Session.id)
         .where(
-            Session.expires_at < cutoff,
-            func.greatest(Session.expires_at, Session.revoked_at) < cutoff,
+            Session.family_expires_at < cutoff,
+            func.greatest(Session.family_expires_at, Session.revoked_at) < cutoff,
         )
-        .order_by(Session.expires_at)
+        .order_by(Session.family_expires_at)
         .limit(limit)
         .with_for_update(skip_locked=True)
     )

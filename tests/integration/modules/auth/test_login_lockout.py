@@ -169,12 +169,12 @@ class TestUniformLoginRefusal:
 
         rows = db.rows(
             "SELECT event_type::text AS event, detail FROM auth_audit_log "
-            "WHERE event_type::text IN ('LOGIN_FAILED', 'ACCOUNT_LOCKED') "
+            "WHERE event_type::text IN ('login_failed', 'account_locked') "
             "ORDER BY created_at"
         )
         events = [r["event"] for r in rows]
         assert (
-            events == ["LOGIN_FAILED"] * 4 + ["ACCOUNT_LOCKED"] + ["LOGIN_FAILED"] * 2
+            events == ["login_failed"] * 4 + ["account_locked"] + ["login_failed"] * 2
         )
         assert (
             rows[4]["detail"]

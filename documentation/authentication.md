@@ -15,9 +15,11 @@ Token encoding, Argon2 hashing and token hashing are core infrastructure in `src
 
 | Token | Format | Lifetime | Stored |
 |---|---|---|---|
-| Access token | JWT, HS256 pinned in code. Claims `exp`, `iat`, `nbf`, `sub` (user UUID), `jti`, `type=access`, `sid` (session family id), `username` | `ACCESS_TOKEN_EXPIRE_MINUTES` (15) | not stored |
-| Refresh token | opaque, 32 random bytes (urlsafe) | `REFRESH_TOKEN_EXPIRE_DAYS` (30) | SHA-256 hash in `sessions`, Postgres only; `HttpOnly` cookie `refresh_token`, `SameSite=Lax`, path `<API_PREFIX>/auth` |
+| Access token | JWT, HS256 pinned in code. Claims `exp`, `iat`, `nbf`, `sub` (user UUID), `jti`, `type=access`, `sid` (session family id), `username` | `ACCESS_TOKEN_EXPIRE_MINUTES` (15), never past the end of its session family; `expires_in` in the response says the actual value | not stored |
+| Refresh token | opaque, 32 random bytes (urlsafe) | `REFRESH_TOKEN_EXPIRE_DAYS` (30), never past the end of its family: `SESSION_MAX_LIFETIME_DAYS` (90) after the login | SHA-256 hash in `sessions`, Postgres only; `HttpOnly` cookie `refresh_token`, `SameSite=Lax`, path `<API_PREFIX>/auth` |
 | Email token | opaque, random (`token_urlsafe(32)`) | password reset 1 hour; verification and email change 24 hours | SHA-256 hash in `email_tokens` |
+
+**Absolute session lifetime.** A login starts a session family that ends `SESSION_MAX_LIFETIME_DAYS` later (`sessions.family_expires_at`). Every rotation copies that end unchanged and gives the new session `min(now + REFRESH_TOKEN_EXPIRE_DAYS, family end)`; a CHECK constraint makes sure no session expires after its family. An access token issued shortly before the family end expires with the family. A refresh after the family end is refused like any expired token (401 `invalid_refresh_token`), and the user must log in again. Active use therefore keeps a login alive for at most `SESSION_MAX_LIFETIME_DAYS` ([OWASP Session Management Cheat Sheet, absolute timeout](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html)). The setting must be at least `REFRESH_TOKEN_EXPIRE_DAYS`; it applies to logins made after a change.
 
 Decoding reads the algorithm from a fixed list, never from the token. It requires `exp`, `iat`, `nbf`, `sub` and `jti`, checks `type=access` and requires `sub` (and `sid`, when present) to be a UUID; `sid` is optional so that tokens issued before it existed stay valid. Access tokens are stateless and stay valid until they expire, with one exception: an admin-locked user gets 401 at once. Revoking a session therefore ends refresh, not access tokens already issued.
 
@@ -25,14 +27,14 @@ Decoding reads the algorithm from a fixed list, never from the token. It require
 
 ```
 register ──▶ user + argon2id credential + VERIFY_EMAIL token ──▶ mail task
-login    ──▶ lock check, admission limiter (PASSWORD_HASH_CONCURRENCY), lock re-check,
+login    ──▶ username lookup ignoring case (a name outside the username pattern counts as unknown), lock check, admission limiter (PASSWORD_HASH_CONCURRENCY), lock re-check,
              verify password (Argon2 in a thread pool; dummy verify for unknown or inactive users),
              success = conditional atomic UPDATE (refused once locked)
              ──▶ access token (15 min)
-                 └▶ refresh token: sha256 → sessions (family_id, device, ip), Postgres only,
+                 └▶ refresh token: sha256 → sessions (family_id, family end, device, ip), Postgres only,
                                    cookie refresh_token (HttpOnly, SameSite=Lax, Path=<API_PREFIX>/auth)
 refresh  ──▶ atomic UPDATE ... RETURNING on the session row (not revoked, not expired)
-         ├─ success: a new pair in the same family
+         ├─ success: a new pair in the same family, never expiring after the family end
          ├─ token already rotated or revoked: reuse detected, the whole family is revoked
          │   (strict: two concurrent refreshes of the same token count as reuse)
          └─ user inactive or admin-locked: refresh denied, family revoked
@@ -48,11 +50,11 @@ A refresh that fails with 401 clears the refresh cookie (known issue 25).
 
 **Login answers.** A wrong password, an unknown user and a locked or inactive account all get the same 401 `invalid_credentials`. A locked account waits a calibrated time instead of running Argon2, so the response time does not reveal the lock (known issue 17 for the remaining gap). `POST /auth/password/forgot` answers 202 for every address, also when enqueueing the mail fails (known issue 23 for the timing gap).
 
-**Duplicate registrations.** Two parallel registrations with the same username or email are decided by the unique constraints. The loser gets 409 `user_exists`, never 500.
+**Duplicate registrations.** Usernames are unique regardless of case (`Alice` and `alice` are one name) and keep the casing given at registration; login accepts any casing. A username consists of ASCII letters, digits, `-` and `_` only (the whole value; a trailing line break is refused with 422). A login name that does not match that pattern is treated as an unknown user without a database lookup, because PostgreSQL's `lower()` folds some non-ASCII letters onto ASCII ones (the Kelvin sign, U+212A, onto `k`). Two parallel registrations with the same username or email are decided by the unique index `uq_users_lower_username` and the constraint `uq_users_email`. The loser gets 409 `user_exists`, never 500.
 
 **Pending email tokens.** Every event that should end an intruder's hold on the account (password change, password reset, admin lock, admin deactivation) invalidates all open email tokens of the user, in the same commit as the session revocation. `POST /auth/email/verify` refuses a token of an inactive or admin-locked account with the same 400 `invalid_token` as an unknown one, and spends it, so lifting the block later does not revive a link that may be in the wrong hands.
 
-**Password confirmation counts like a login.** A wrong current password on `PUT /users/me/password` or `PUT /users/me/email` increments the same failure counter (`LOGIN_MAX_ATTEMPTS`) and sets the same timed lock as failed logins, with `LOGIN_FAILED` and `ACCOUNT_LOCKED` audit rows (detail "Password confirmation"). As after a login lockout, sessions stay valid; while the lock lasts, both endpoints answer 400 `wrong_password` even for the correct password, and the password login answers 401. A correct password resets the counter. An expired timed lock counts as no lock, so wrong confirmations after a lock ran out start a new series.
+**Password confirmation counts like a login.** A wrong current password on `PUT /users/me/password` or `PUT /users/me/email` increments the same failure counter (`LOGIN_MAX_ATTEMPTS`) and sets the same timed lock as failed logins, with `login_failed` and `account_locked` audit rows (detail "Password confirmation"). As after a login lockout, sessions stay valid; while the lock lasts, both endpoints answer 400 `wrong_password` even for the correct password, and the password login answers 401. A correct password resets the counter. An expired timed lock counts as no lock, so wrong confirmations after a lock ran out start a new series.
 
 ## Two kinds of lock
 
@@ -89,7 +91,7 @@ The worker sends nothing for an inactive or admin-locked account or an already v
 - Notices go only to verified addresses: an address nobody confirmed may belong to someone else, so `previous_email` is stored only when the old address was verified.
 - A redelivery can send a notice twice; the mails carry no token, so a duplicate is harmless. The 24-hour throttle is check, send, record, and not atomic (known issue 27).
 
-**Cleanup.** `auth.cleanup` runs daily at 03:00 UTC. It deletes sessions and email tokens whose latest timestamp (`expires_at`, and `revoked_at`, `used_at` or `invalidated_at` where set) lies more than `AUTH_CLEANUP_RETENTION_DAYS` in the past. A revoked session stays until its token has also expired for that long; reuse detection ends then (known issue 26). Deleting a token also deletes its `new_email` and `previous_email`. The task deletes in batches of 1000 rows, one transaction each, at most 100 batches per table and run (the log says `capped=true`; the next night continues), skips rows another transaction holds (`FOR UPDATE SKIP LOCKED`) and takes no user lock, so it never waits on a request. It logs `auth.cleanup_done` with `sessions_deleted` and `email_tokens_deleted`. The audit log is not touched.
+**Cleanup.** `auth.cleanup` runs daily at 03:00 UTC. It deletes email tokens whose latest timestamp (`expires_at`, and `used_at` or `invalidated_at` where set) lies more than `AUTH_CLEANUP_RETENTION_DAYS` in the past, and sessions whose family end (`family_expires_at`, and `revoked_at` where later) lies that far in the past. Every session of a family, a rotated one included, therefore stays until its family has ended: a replayed rotated token is either found and revokes the family, or its family has ended and every token of it is refused anyway. Sessions are kept for up to `SESSION_MAX_LIFETIME_DAYS` + `AUTH_CLEANUP_RETENTION_DAYS` (120 days by default). A rotated session keeps no IP address, user agent or device: the rotation sets them to NULL, so only the active session of a family holds them, and the admin session view shows them empty for rotated rows. Deleting a token also deletes its `new_email` and `previous_email`. The task deletes in batches of 1000 rows, one transaction each, at most 100 batches per table and run (the log says `capped=true`; the next night continues), skips rows another transaction holds (`FOR UPDATE SKIP LOCKED`) and takes no user lock, so it never waits on a request. It logs `auth.cleanup_done` with `sessions_deleted` and `email_tokens_deleted`. The audit log is not touched.
 
 ## Admin panel
 

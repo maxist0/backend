@@ -15,6 +15,7 @@ from tests.helpers import (
     Db,
     active_session_count,
     assert_nothing_personal_in_redis,
+    login,
     login_tokens,
     refresh_with,
     register_ok,
@@ -22,6 +23,7 @@ from tests.helpers import (
 )
 
 ROUNDS = 4  # repetitions of the race tests; every round must pass
+CLIENT_COLUMNS = ("ip_address", "user_agent", "device_id", "device_name")
 
 
 class TestRefreshGate:
@@ -60,6 +62,45 @@ class TestRefreshGate:
         )
         assert detail
         assert "reuse" in detail.lower()
+
+    @pytest.mark.usefixtures("captured_emails")
+    def test_rotation_clears_the_client_data_of_the_consumed_session(
+        self, client: TestClient, db: Db
+    ) -> None:
+        """The rotated row keeps no IP, user agent or device; reuse still works."""
+        register_ok(client, username="alice")
+        device = {"X-Device-Id": "device-1", "X-Device-Name": "Phone"}
+        r = login(client, username="alice", headers=device)
+        old_refresh = client.cookies["refresh_token"]
+        client.cookies.clear()
+
+        renewed = client.post(
+            "/api/v1/auth/refresh",
+            headers={**device, "Cookie": f"refresh_token={old_refresh}"},
+        )
+        client.cookies.clear()
+        assert (r.status_code, renewed.status_code) == (200, 200)
+
+        rows = db.rows(
+            "SELECT is_revoked, ip_address, user_agent, device_id, device_name "
+            "FROM sessions ORDER BY created_at, is_revoked DESC"
+        )
+        rotated, successor = (
+            next(row for row in rows if row["is_revoked"]),
+            next(row for row in rows if not row["is_revoked"]),
+        )
+        assert [rotated[k] for k in CLIENT_COLUMNS] == [None] * len(CLIENT_COLUMNS)
+        assert [successor[k] for k in CLIENT_COLUMNS] == [
+            "testclient",
+            "testclient",
+            "device-1",
+            "Phone",
+        ]
+
+        replay, _ = refresh_with(client, old_refresh)
+
+        assert replay.status_code == 401
+        assert active_session_count(db, "alice") == 0
 
     @pytest.mark.usefixtures("captured_emails")
     def test_concurrent_refresh_with_same_cookie_yields_exactly_one_200(

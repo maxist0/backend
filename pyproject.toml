@@ -178,12 +178,6 @@ ignore = [
 "alembic/versions/**" = [
     "D103",    # upgrade()/downgrade() are Alembic's fixed entry points
     "D415",    # the first docstring line is the revision message
-    "S608",    # DDL built from fixed enum labels in the file, no input
-]
-# Applied migration written with the old template; applied migrations are
-# never edited (AGENTS.md, Database and migrations).
-"alembic/versions/20260226_2120_37a0d49f8bbc_add_auth_user_tables.py" = [
-    "I001", "UP007", "UP035",
 ]
 
 [tool.ruff.lint.pydocstyle]

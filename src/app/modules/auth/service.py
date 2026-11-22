@@ -64,6 +64,7 @@ from app.modules.auth.models import (
     PasswordCredential,
     Session,
 )
+from app.modules.auth.schemas import is_username
 from app.modules.auth.tasks import (
     send_account_locked_notice_task,
     send_email_change_completed_notice_task,
@@ -72,7 +73,11 @@ from app.modules.auth.tasks import (
 )
 from app.modules.users import User
 from app.modules.users import crud as users_crud
-from app.modules.users.models import lock_is_active
+from app.modules.users.models import (
+    EMAIL_UNIQUE_CONSTRAINT,
+    USERNAME_UNIQUE_INDEX,
+    lock_is_active,
+)
 
 logger = get_logger(__name__)
 
@@ -98,12 +103,10 @@ REFRESH_TOKEN_REUSE = Counter(
 _USER_AGENT_MAX_LENGTH = 512
 _DEVICE_HEADER_MAX_LENGTH = 255
 
-# Unique constraints of `users` (PostgreSQL default names for the unnamed
-# constraints in the initial migration) -> the 409 message of the pre-check.
-_USERS_EMAIL_KEY = "users_email_key"
+# Unique constraints of `users` -> the 409 message of the pre-check.
 _REGISTER_CONFLICT_MESSAGES = {
-    "users_username_key": "Username already taken",
-    _USERS_EMAIL_KEY: "Email already registered",
+    USERNAME_UNIQUE_INDEX: "Username already taken",
+    EMAIL_UNIQUE_CONSTRAINT: "Email already registered",
 }
 
 # Validity of the links in the emails, counted from the request. A retried
@@ -183,7 +186,7 @@ async def _open_email_token(
     Returns:
         The new token's id, for `_enqueue_token_email` after the commit.
     """
-    token_id = uuid.uuid4()
+    token_id = uuid.uuid7()
     await crud.invalidate_tokens_for_user_purpose(db, user_id, purpose, commit=False)
     await crud.create_email_token(
         db,
@@ -380,7 +383,8 @@ async def authenticate_user(  # noqa: PLR0912, PLR0915 - the lock checks, their 
     """Verify credentials. Handles account locking on repeated failures.
 
     Every refusal (unknown user, wrong password, locked or inactive account)
-    raises the same `InvalidCredentialsError`.
+    raises the same `InvalidCredentialsError`. A name that is not a
+    well-formed username counts as unknown.
 
     Burst safety: the credential check runs under an admission limiter, it
     re-reads the lock state after the wait, and a failure is counted before
@@ -390,7 +394,13 @@ async def authenticate_user(  # noqa: PLR0912, PLR0915 - the lock checks, their 
     the password was being verified.
     """
     settings = get_settings()
-    user = await users_crud.get_user_by_username(db, username)
+    # A name outside the pattern is never looked up: `lower()` in the
+    # database could fold it onto another user's ASCII username.
+    user = (
+        await users_crud.get_user_by_username(db, username)
+        if is_username(username)
+        else None
+    )
     if user is None:
         await equalize_password_timing(password)
         LOGIN_FAILURES.labels(reason="unknown_user").inc()
@@ -506,27 +516,71 @@ async def authenticate_user(  # noqa: PLR0912, PLR0915 - the lock checks, their 
     return user
 
 
+@dataclass(frozen=True)
+class SessionFamily:
+    """The rotation family of one login: its id and its absolute end."""
+
+    id: uuid.UUID
+    expires_at: datetime
+
+
+@dataclass(frozen=True)
+class SessionTokens:
+    """The tokens of a login or a rotation, for the response."""
+
+    access_token: str
+    refresh_token: str
+    # Lifetime of the access token in seconds, as encoded in its `exp`.
+    expires_in: int
+
+
 async def create_session_tokens(
     db: AsyncSession,
     user: User,
     request: Request | None = None,
-    family_id: uuid.UUID | None = None,
-) -> tuple[str, str]:
+    family: SessionFamily | None = None,
+) -> SessionTokens:
     """Create an access token and a refresh token (persisted as a session).
 
+    Without `family` (a login) the session starts a new family that ends
+    `SESSION_MAX_LIFETIME_DAYS` from now. A rotation passes the family of
+    the rotated session; the new session expires after
+    `REFRESH_TOKEN_EXPIRE_DAYS`, and the access token after
+    `ACCESS_TOKEN_EXPIRE_MINUTES`, but neither after the family's end.
+
     Returns:
-        `(access_token, raw_refresh_token)`. Commits.
+        The access token, the raw refresh token and the access token's
+        lifetime. Commits.
     """
-    fam_id = family_id or uuid.uuid4()
-    access_token = create_access_token(user.username, str(user.id), str(fam_id))
+    settings = get_settings()
+    now = utcnow()
+    if family is None:
+        family = SessionFamily(
+            id=uuid.uuid7(),
+            expires_at=now + timedelta(days=settings.SESSION_MAX_LIFETIME_DAYS),
+        )
+    access_lifetime = max(
+        timedelta(0),
+        min(
+            timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES),
+            family.expires_at - now,
+        ),
+    )
+    access_token = create_access_token(
+        user.username, str(user.id), str(family.id), access_lifetime
+    )
 
     # The raw token goes to the client only; the session stores its hash.
     raw_refresh = secrets.token_urlsafe(32)
     session = Session(
         user_id=user.id,
         token_hash=hash_token(raw_refresh),
-        family_id=fam_id,
-        expires_at=utcnow() + timedelta(days=get_settings().REFRESH_TOKEN_EXPIRE_DAYS),
+        family_id=family.id,
+        expires_at=min(
+            now + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS),
+            family.expires_at,
+        ),
+        family_expires_at=family.expires_at,
         device_id=_bounded_header(request, "x-device-id", _DEVICE_HEADER_MAX_LENGTH),
         device_name=_bounded_header(
             request, "x-device-name", _DEVICE_HEADER_MAX_LENGTH
@@ -536,14 +590,18 @@ async def create_session_tokens(
     )
     await crud.create_session(db, session)
 
-    return access_token, raw_refresh
+    return SessionTokens(
+        access_token=access_token,
+        refresh_token=raw_refresh,
+        expires_in=int(access_lifetime.total_seconds()),
+    )
 
 
 async def refresh_session(
     db: AsyncSession,
     raw_token: str,
     request: Request | None = None,
-) -> tuple[str, str]:
+) -> SessionTokens:
     """Rotate a refresh token. PostgreSQL is the only gate (atomic UPDATE).
 
     Detects token reuse and revokes the whole family.
@@ -554,11 +612,12 @@ async def refresh_session(
     it as well. Lock order: users, then sessions.
 
     Returns:
-        `(access_token, raw_refresh_token)` of the successor session.
+        The tokens of the successor session.
 
     Raises:
-        InvalidRefreshTokenError: The token is unknown, expired, revoked or
-            reused, or the account is inactive or admin-locked.
+        InvalidRefreshTokenError: The token is unknown, expired (its family
+            ended included), revoked or reused, or the account is inactive
+            or admin-locked.
     """
     token_hash_val = hash_token(raw_token)
 
@@ -593,8 +652,8 @@ async def refresh_session(
             )
         raise InvalidRefreshTokenError()
 
-    rotated = await crud.rotate_session(db, token_hash_val)
-    if rotated is None:
+    family_expires_at = await crud.rotate_session(db, token_hash_val)
+    if family_expires_at is None:
         sess = await crud.get_session_by_token_hash(db, token_hash_val)
         if sess is not None and sess.is_revoked and sess.revoke_reason == "rotated":
             await _revoke_reused_family(db, sess, request)
@@ -602,7 +661,9 @@ async def refresh_session(
         raise InvalidRefreshTokenError()
 
     # Same transaction as the rotation: one commit for old + new session.
-    tokens = await create_session_tokens(db, user, request, family_id=family_id)
+    tokens = await create_session_tokens(
+        db, user, request, SessionFamily(family_id, family_expires_at)
+    )
     logger.info("auth.token_refreshed")
     return tokens
 
@@ -882,7 +943,7 @@ async def _apply_email_change(
     except IntegrityError as exc:
         await db.rollback()
         constraint = constraint_name(exc)
-        if constraint != _USERS_EMAIL_KEY:
+        if constraint != EMAIL_UNIQUE_CONSTRAINT:
             raise
         # Constraint name only: the error text contains the email.
         logger.info("auth.email_change_conflict", constraint=constraint)
@@ -1184,7 +1245,10 @@ async def cleanup_ended_auth_records(
 ) -> CleanupResult:
     """Delete ended sessions and closed email tokens older than `retention`.
 
-    Sessions first, then email tokens, each in batches of `batch_size` rows
+    A session counts as ended when its family has ended
+    (`crud.delete_ended_sessions`), so a rotated token stays detectable
+    while its family can still be refreshed. Sessions first, then email
+    tokens, each in batches of `batch_size` rows
     with one transaction per batch, until a batch comes back short or
     `max_batches` batches ran; the next run continues. No user row is
     locked, and rows locked by others are skipped, so the cleanup never
@@ -1193,7 +1257,7 @@ async def cleanup_ended_auth_records(
 
     Args:
         db: The task's session; committed after every batch.
-        retention: How long a row is kept after its last change.
+        retention: How long a row is kept after it ended or last changed.
         batch_size: Rows per delete statement.
         max_batches: Batches per table in this run.
 

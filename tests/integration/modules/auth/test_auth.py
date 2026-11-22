@@ -55,6 +55,24 @@ class TestRegister:
         assert body["detail"] == "Username already taken"
 
     @pytest.mark.usefixtures("captured_emails")
+    def test_username_differing_only_in_case_returns_409(
+        self, client: TestClient
+    ) -> None:
+        register(client, username="alice")
+        r = register(client, username="ALICE", email="alice2@example.com")
+        assert r.status_code == 409
+        body = r.json()
+        assert body["code"] == "user_exists"
+        assert body["detail"] == "Username already taken"
+
+    @pytest.mark.usefixtures("captured_emails")
+    def test_username_keeps_its_casing(self, client: TestClient, db: Db) -> None:
+        r = register(client, username="Alice_Smith")
+        assert r.status_code == 201
+        assert r.json()["username"] == "Alice_Smith"
+        assert db.scalar("SELECT username FROM users") == "Alice_Smith"
+
+    @pytest.mark.usefixtures("captured_emails")
     def test_duplicate_email_returns_409(self, client: TestClient) -> None:
         register(client, username="alice", email="shared@example.com")
         r = register(client, username="alice2", email="shared@example.com")
@@ -85,6 +103,33 @@ class TestRegister:
     def test_username_with_special_chars_returns_422(self, client: TestClient) -> None:
         r = register(client, username="alice!")
         assert r.status_code == 422
+
+    @pytest.mark.usefixtures("captured_emails")
+    def test_new_rows_get_uuidv7_ids(self, client: TestClient, db: Db) -> None:
+        register(client, username="alice")
+        login(client, username="alice")
+
+        ids = [
+            db.scalar("SELECT id FROM users"),
+            db.scalar("SELECT id FROM password_credentials"),
+            db.scalar("SELECT id FROM email_tokens"),
+            db.scalar("SELECT id FROM auth_audit_log LIMIT 1"),
+            db.scalar("SELECT id FROM sessions"),
+            db.scalar("SELECT family_id FROM sessions"),
+        ]
+        assert [value.version for value in ids] == [7] * len(ids)
+
+    @pytest.mark.usefixtures("captured_emails")
+    def test_enum_columns_store_the_values(self, client: TestClient, db: Db) -> None:
+        """`login_success`, not the member name `LOGIN_SUCCESS`."""
+        register(client, username="alice")
+
+        events = db.rows("SELECT event_type FROM auth_audit_log ORDER BY event_type")
+        assert [row["event_type"] for row in events] == [
+            "email_verification_sent",
+            "register",
+        ]
+        assert db.scalar("SELECT purpose FROM email_tokens") == "verify_email"
 
     @pytest.mark.usefixtures("captured_emails")
     def test_email_is_lowercased(self, client: TestClient) -> None:
@@ -122,6 +167,14 @@ class TestLogin:
         assert "Path=/api/v1/auth" in cookie
         assert "HttpOnly" in cookie
         assert "SameSite=lax" in cookie
+
+    @pytest.mark.usefixtures("captured_emails")
+    def test_username_is_matched_regardless_of_case(self, client: TestClient) -> None:
+        register(client, username="Alice")
+        r = login(client, username="aLICE")
+
+        assert r.status_code == 200
+        assert r.json()["user"]["username"] == "Alice"
 
     @pytest.mark.usefixtures("captured_emails")
     def test_wrong_password_returns_401(self, client: TestClient) -> None:

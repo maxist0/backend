@@ -55,8 +55,14 @@ if config.config_file_name is not None:
 logger = logging.getLogger("alembic.env")
 
 
-def _database_url() -> str:
-    """Resolve the migration URL (see module docstring)."""
+def _database_url() -> tuple[str, str]:
+    """Resolve the migration URL and name where it came from.
+
+    Returns:
+        The normalised URL and its source: `environment` or the file name
+        of `.env.local`.
+    """
+    injected = bool(os.environ.get("DATABASE_URL", "").strip())
     environment = os.environ.get("ENVIRONMENT", "").strip()
     if environment == Environment.DEV.value and LOCAL_ENV_FILE.exists():
         load_dotenv(LOCAL_ENV_FILE, override=False)
@@ -68,15 +74,21 @@ def _database_url() -> str:
             "read it from .env.local."
         )
     try:
-        return normalize_database_url(url)
+        return normalize_database_url(url), (
+            "environment" if injected else LOCAL_ENV_FILE.name
+        )
     except ValueError as exc:
         # The message names the scheme only, never the URL.
         raise MigrationConfigError(str(exc)) from None
 
 
-_url = _database_url()
+_url, _url_source = _database_url()
+# The source is logged so a shell with a global ENVIRONMENT=dev cannot
+# silently migrate the .env.local database instead of the intended one.
 logger.info(
-    "Using DATABASE_URL %s", make_url(_url).render_as_string(hide_password=True)
+    "Using DATABASE_URL %s (from %s)",
+    make_url(_url).render_as_string(hide_password=True),
+    _url_source,
 )
 
 target_metadata = Base.metadata

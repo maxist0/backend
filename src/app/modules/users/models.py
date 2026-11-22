@@ -6,14 +6,18 @@ module depends on no other module. Deleting a user removes the dependent
 rows through the foreign keys' `ON DELETE` rules.
 """
 
-import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Integer, String
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy import Boolean, DateTime, Index, Integer, String, func
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.core import Base, utcnow
+from app.core import Base, Timestamps, UUIDPrimaryKey, utcnow
+
+# Names of the unique constraints, for telling the conflicts apart
+# (`constraint_name`). The email constraint is named by the core's naming
+# convention; the username index is named here.
+USERNAME_UNIQUE_INDEX = "uq_users_lower_username"
+EMAIL_UNIQUE_CONSTRAINT = "uq_users_email"
 
 
 def lock_is_active(
@@ -33,15 +37,12 @@ def lock_is_active(
     return locked_until > (now or utcnow())
 
 
-class User(Base):
+class User(UUIDPrimaryKey, Timestamps, Base):
     """A user account; credentials and sessions belong to the auth module."""
 
     __tablename__ = "users"
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
-    username: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    username: Mapped[str] = mapped_column(String(64), nullable=False)
     email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
     display_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
@@ -57,14 +58,14 @@ class User(Base):
         DateTime(timezone=True), nullable=True
     )
 
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utcnow
-    )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utcnow, onupdate=utcnow
-    )
     last_login_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
+    )
+
+    __table_args__ = (
+        # Usernames are unique regardless of case and keep the casing the
+        # user chose. The login lookup filters on the same expression.
+        Index(USERNAME_UNIQUE_INDEX, func.lower(username), unique=True),
     )
 
     def __str__(self) -> str:

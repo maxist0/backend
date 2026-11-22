@@ -2,7 +2,7 @@
 
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import utcnow
@@ -16,8 +16,14 @@ async def get_user_by_id(db: AsyncSession, user_id: uuid.UUID) -> User | None:
 
 
 async def get_user_by_username(db: AsyncSession, username: str) -> User | None:
-    """Return the user with this exact username, or None."""
-    result = await db.execute(select(User).where(User.username == username))
+    """Return the user with this username in any casing, or None.
+
+    `lower(username)` is the expression of the unique index, so the lookup
+    uses it and finds at most one user.
+    """
+    result = await db.execute(
+        select(User).where(func.lower(User.username) == func.lower(username))
+    )
     return result.scalars().first()
 
 

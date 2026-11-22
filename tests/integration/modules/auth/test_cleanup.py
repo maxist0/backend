@@ -1,7 +1,9 @@
 """The nightly cleanup deletes ended sessions and closed email tokens only.
 
 They go after the retention period, counted from the row's last change;
-nothing else goes.
+for a session, from its family's end at the earliest, so a replayed rotated
+token is found as long as its family can still be refreshed. Nothing else
+goes.
 
 Rows are written with SQL, with timestamps relative to `now()`. The task
 runs in-process (`run_task`) with the default retention of 30 days.
@@ -27,6 +29,7 @@ from tests.helpers import (
     call_in_app,
     log_events,
     login_tokens,
+    refresh_with,
     register_ok,
     run_task,
     user_id_of,
@@ -40,18 +43,28 @@ RECENT = "now() - interval '29 days'"
 FUTURE = "now() + interval '5 days'"
 
 
-def _session(db: Db, user_id: str, *, expires: str, revoked: str | None = None) -> str:
+def _session(
+    db: Db,
+    user_id: str,
+    *,
+    expires: str,
+    revoked: str | None = None,
+    family_ends: str | None = None,
+    reason: str = "logout",
+) -> str:
+    """Insert a session; its family ends with it unless `family_ends` is later."""
     session_id = str(uuid.uuid4())
     db.execute(
         "INSERT INTO sessions (id, user_id, token_hash, family_id, is_revoked, "
-        f"revoke_reason, expires_at, revoked_at, created_at) VALUES (:id, :u, :h, "
-        f":f, :rev, :reason, {expires}, {revoked or 'NULL'}, now())",
+        "revoke_reason, expires_at, family_expires_at, revoked_at, created_at) "
+        f"VALUES (:id, :u, :h, :f, :rev, :reason, {expires}, "
+        f"{family_ends or expires}, {revoked or 'NULL'}, now())",
         id=session_id,
         u=user_id,
         h=uuid.uuid4().hex,
         f=str(uuid.uuid4()),
         rev=revoked is not None,
-        reason="logout" if revoked is not None else None,
+        reason=reason if revoked is not None else None,
     )
     return session_id
 
@@ -68,7 +81,7 @@ def _token(
     db.execute(
         "INSERT INTO email_tokens (id, user_id, purpose, token_hash, new_email, "
         "previous_email, expires_at, used_at, invalidated_at, created_at) VALUES "
-        "(:id, :u, 'CHANGE_EMAIL', :h, 'new@example.com', 'old@example.com', "
+        "(:id, :u, 'change_email', :h, 'new@example.com', 'old@example.com', "
         f"{expires}, {used or 'NULL'}, {invalidated or 'NULL'}, now())",
         id=token_id,
         u=user_id,
@@ -97,10 +110,38 @@ class TestCleanupTask:
             _session(db, user_id, expires=FUTURE, revoked=OLD),
             # Expired long ago, revoked recently (logout-all reaches it).
             _session(db, user_id, expires=OLD, revoked=RECENT),
+            # Rotated and expired long ago, but its family ended recently:
+            # a replay of the token must still revoke the family.
+            _session(
+                db,
+                user_id,
+                expires=OLD,
+                revoked=OLD,
+                family_ends=RECENT,
+                reason="rotated",
+            ),
+            # Rotated long ago in a family that can still be refreshed.
+            _session(
+                db,
+                user_id,
+                expires=OLD,
+                revoked=OLD,
+                family_ends=FUTURE,
+                reason="rotated",
+            ),
         }
         gone_sessions = {
             _session(db, user_id, expires=OLD),
             _session(db, user_id, expires=OLD, revoked=OLD),
+            # Rotated in a family that ended before the retention.
+            _session(
+                db,
+                user_id,
+                expires=OLD,
+                revoked=OLD,
+                family_ends=OLD,
+                reason="rotated",
+            ),
         }
         kept_tokens = {
             _token(db, user_id, expires=FUTURE),  # open
@@ -185,6 +226,39 @@ class TestCleanupTask:
         assert free not in _ids(db, "sessions")
         run_task(client, cleanup_task)
         assert held not in _ids(db, "sessions")
+
+
+class TestReuseDetectionOutlivesTheCleanup:
+    @pytest.mark.usefixtures("captured_emails")
+    def test_a_rotated_token_replayed_after_the_cleanup_revokes_its_family(
+        self, client: TestClient, db: Db
+    ) -> None:
+        """The rotated session ended long ago, but its family has not."""
+        register_ok(client, username="alice")
+        old = login_tokens(client, "alice")
+        r, successor = refresh_with(client, old.refresh)
+        assert r.status_code == 200
+        assert successor is not None
+        db.execute(
+            "UPDATE sessions SET expires_at = now() - interval '40 days', "
+            "revoked_at = now() - interval '40 days' WHERE revoke_reason = 'rotated'"
+        )
+        assert db.scalar("SELECT bool_and(family_expires_at > now()) FROM sessions")
+
+        run_task(client, cleanup_task)
+        replay, _ = refresh_with(client, old.refresh)
+
+        assert replay.status_code == 401
+        assert "reuse" in replay.json()["detail"].lower()
+        assert db.scalar("SELECT count(*) FROM sessions WHERE NOT is_revoked") == 0
+        assert (
+            db.scalar(
+                "SELECT revoke_reason FROM sessions WHERE revoke_reason <> 'rotated'"
+            )
+            == "reuse_detected"
+        )
+        after, _ = refresh_with(client, successor.refresh)
+        assert after.status_code == 401
 
 
 class TestBatching:

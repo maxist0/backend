@@ -95,11 +95,8 @@ def _accepted() -> Response:
     return Response(status_code=status.HTTP_202_ACCEPTED)
 
 
-def _token_response(access_token: str, settings: Settings) -> TokenResponse:
-    return TokenResponse(
-        access_token=access_token,
-        expires_in=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
-    )
+def _token_response(tokens: service.SessionTokens) -> TokenResponse:
+    return TokenResponse(access_token=tokens.access_token, expires_in=tokens.expires_in)
 
 
 @auth_router.post(
@@ -146,11 +143,11 @@ async def login(
     httpOnly cookie for the auth routes. A wrong password, an unknown user and
     a locked or deactivated account all get the same 401.
     """
-    access_token, raw_refresh = await service.create_session_tokens(db, user, request)
-    _set_refresh_cookie(response, raw_refresh, settings)
+    tokens = await service.create_session_tokens(db, user, request)
+    _set_refresh_cookie(response, tokens.refresh_token, settings)
     logger.info("auth.user_logged_in")
     return LoginResponse(
-        **_token_response(access_token, settings).model_dump(),
+        **_token_response(tokens).model_dump(),
         user=user_to_response(user),
     )
 
@@ -227,14 +224,12 @@ async def refresh_tokens(
     expired, revoked or reused) is cleared with the 401.
     """
     try:
-        access_token, new_raw_refresh = await service.refresh_session(
-            db, raw_token, request
-        )
+        tokens = await service.refresh_session(db, raw_token, request)
     except InvalidRefreshTokenError as exc:
         _delete_refresh_cookie_on(exc, settings)
         raise
-    _set_refresh_cookie(response, new_raw_refresh, settings)
-    return _token_response(access_token, settings)
+    _set_refresh_cookie(response, tokens.refresh_token, settings)
+    return _token_response(tokens)
 
 
 @auth_router.post(

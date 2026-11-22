@@ -151,7 +151,10 @@ House style, enforced by ruff (rule sets `D` with the google convention, and `ER
 - Avoid lazy loads in async code: use `selectinload`/`joinedload` or `await session.refresh(obj, [...])`.
 - `expire_on_commit=False` is set; still re-read objects you need after a commit if another transaction may have changed them.
 - Model change → autogenerate → read the generated file, fix types and names, add indexes → `uv run alembic upgrade head` locally only. Downgrade must work. Prefer expand/contract for data migrations.
-- New tables get `created_at`/`updated_at` `timestamptz`, UUID PK, explicit indexes for every FK and filter column.
+- New tables use the core mixins: `UUIDPrimaryKey` (UUIDv7 generated in Python), `Timestamps` (`created_at`/`updated_at`, `timestamptz`, server default `now()`) or `CreatedAt` for rows that never change. Explicit indexes for every FK and filter column. See [database.md → Model conventions](documentation/database.md#model-conventions) and [ADR 0012](documentation/adr/0012-schema-conventions-uuidv7-value-enums-usernames.md).
+- Enum columns use `value_enum(MyEnum)` from `app.core`: a VARCHAR that stores the values (`login_success`) with a CHECK constraint. Never a native PostgreSQL enum. A changed value needs a migration that replaces the CHECK constraint; autogenerate does not see it.
+- Constraint names come from the naming convention on `Base.metadata`. Code that reacts to a violation compares `constraint_name(exc)` with a named constant, never with a PostgreSQL default name.
+- Case-insensitive uniqueness is a unique index on `lower(column)`; queries filter on the same expression. No `citext`.
 
 ## Caching and background jobs
 

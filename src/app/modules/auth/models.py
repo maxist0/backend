@@ -10,37 +10,35 @@ import uuid
 from datetime import datetime
 from enum import Enum as PyEnum
 
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Index, String, Text
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    String,
+    Text,
+    Uuid,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from app.core import Base, utcnow
+from app.core import Base, CreatedAt, Timestamps, UUIDPrimaryKey, value_enum
 from app.modules.users import User
 
 
-class PasswordCredential(Base):
+class PasswordCredential(UUIDPrimaryKey, Timestamps, Base):
     """The Argon2 password hash of a user (one per user)."""
 
     __tablename__ = "password_credentials"
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
     user_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
+        Uuid,
         ForeignKey("users.id", ondelete="CASCADE"),
         unique=True,
         nullable=False,
     )
     password_hash: Mapped[str] = mapped_column(String(512), nullable=False)
     must_change: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utcnow
-    )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utcnow, onupdate=utcnow
-    )
 
     def __str__(self) -> str:
         """Label in the admin panel, without the hash."""
@@ -50,7 +48,7 @@ class PasswordCredential(Base):
 
 
 class AuditEventType(PyEnum):
-    """Kind of an audit-log entry; PostgreSQL stores the member names."""
+    """Kind of an audit-log entry; the column stores the values."""
 
     REGISTER = "register"
     LOGIN_SUCCESS = "login_success"
@@ -71,29 +69,22 @@ class AuditEventType(PyEnum):
     ACCOUNT_LOCKED_NOTICE_SENT = "account_locked_notice_sent"
 
 
-class AuthAuditLog(Base):
+class AuthAuditLog(UUIDPrimaryKey, CreatedAt, Base):
     """An append-only record of a security-relevant event of an account."""
 
     __tablename__ = "auth_audit_log"
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
     user_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True),
+        Uuid,
         ForeignKey("users.id", ondelete="SET NULL"),
         nullable=True,
     )
     event_type: Mapped[AuditEventType] = mapped_column(
-        Enum(AuditEventType, name="auditeventtype"), nullable=False
+        value_enum(AuditEventType), nullable=False
     )
     ip_address: Mapped[str | None] = mapped_column(String(45), nullable=True)
     user_agent: Mapped[str | None] = mapped_column(String(512), nullable=True)
     detail: Mapped[str | None] = mapped_column(Text, nullable=True)
-
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utcnow
-    )
 
     def __str__(self) -> str:
         """Label in the admin panel."""
@@ -109,28 +100,25 @@ class AuthAuditLog(Base):
 
 
 class EmailTokenPurpose(PyEnum):
-    """What an email token proves; PostgreSQL stores the member names."""
+    """What an email token proves; the column stores the values."""
 
     VERIFY_EMAIL = "verify_email"
     CHANGE_EMAIL = "change_email"
     RESET_PASSWORD = "reset_password"  # noqa: S105 - token purpose, not a secret
 
 
-class EmailToken(Base):
+class EmailToken(UUIDPrimaryKey, CreatedAt, Base):
     """A single-use token mailed to the user; only its SHA-256 hash is stored."""
 
     __tablename__ = "email_tokens"
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
     user_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
+        Uuid,
         ForeignKey("users.id", ondelete="CASCADE"),
         nullable=False,
     )
     purpose: Mapped[EmailTokenPurpose] = mapped_column(
-        Enum(EmailTokenPurpose, name="emailtokenpurpose"), nullable=False
+        value_enum(EmailTokenPurpose), nullable=False
     )
     token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     new_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
@@ -148,10 +136,6 @@ class EmailToken(Base):
         DateTime(timezone=True), nullable=True
     )
 
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utcnow
-    )
-
     def __str__(self) -> str:
         """Label in the admin panel, without the hash."""
         return f"{self.purpose.value} (user_id={self.user_id})"
@@ -165,25 +149,28 @@ class EmailToken(Base):
     )
 
 
-class Session(Base):
+class Session(UUIDPrimaryKey, CreatedAt, Base):
     """A refresh-token session; rotated tokens stay for reuse detection."""
 
     __tablename__ = "sessions"
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
     user_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
+        Uuid,
         ForeignKey("users.id", ondelete="CASCADE"),
         nullable=False,
     )
     token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
-    family_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    family_id: Mapped[uuid.UUID] = mapped_column(Uuid, nullable=False)
     is_revoked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     revoke_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    # Absolute end of the login's rotation family: set at login, copied
+    # unchanged on every rotation. No session of the family expires later
+    # (CHECK below), so after this time no token of the family is accepted.
+    family_expires_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
 
@@ -192,9 +179,6 @@ class Session(Base):
     ip_address: Mapped[str | None] = mapped_column(String(45), nullable=True)
     user_agent: Mapped[str | None] = mapped_column(String(512), nullable=True)
 
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utcnow
-    )
     revoked_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -210,5 +194,9 @@ class Session(Base):
     __table_args__ = (
         Index("ix_sessions_user_id", "user_id"),
         Index("ix_sessions_family_id", "family_id"),
-        Index("ix_sessions_expires_at", "expires_at"),
+        # The cleanup task deletes in batches ordered by this column.
+        Index("ix_sessions_family_expires_at", "family_expires_at"),
+        CheckConstraint(
+            "expires_at <= family_expires_at", name="expires_within_family"
+        ),
     )

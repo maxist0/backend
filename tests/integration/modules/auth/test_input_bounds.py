@@ -1,4 +1,6 @@
-"""Oversized headers and malformed addresses on the auth routes."""
+"""Oversized headers, malformed addresses and usernames on the auth routes."""
+
+import logging
 
 import pytest
 from fastapi.testclient import TestClient
@@ -8,6 +10,7 @@ from tests.helpers import (
     CapturedEmails,
     Db,
     audit_count,
+    log_events,
     login,
     login_tokens,
     register,
@@ -89,6 +92,53 @@ class TestInputBounds:
     ) -> None:
         r = client.post("/api/v1/auth/password/forgot", json={"email": email})
         assert r.status_code == 422
+
+    @pytest.mark.parametrize("username", ["alice\n", "alice\r\n", "\nalice"], ids=repr)
+    def test_register_with_a_line_break_in_the_username_returns_422(
+        self, client: TestClient, username: str
+    ) -> None:
+        r = register(client, username=username, email="other@example.com")
+
+        assert r.status_code == 422
+        assert [e["field"] for e in r.json()["errors"]] == ["username"]
+
+    @pytest.mark.usefixtures("captured_emails")
+    def test_username_with_a_trailing_newline_cannot_shadow_an_existing_one(
+        self, client: TestClient, db: Db
+    ) -> None:
+        register_ok(client, username="alice")
+
+        r = register(client, username="alice\n", email="other@example.com")
+
+        assert r.status_code == 422
+        assert db.scalar("SELECT count(*) FROM users") == 1
+
+    @pytest.mark.usefixtures("captured_emails")
+    @pytest.mark.parametrize(
+        "username",
+        ["\N{KELVIN SIGN}ate", "kate\n", "ka te"],
+        ids=["kelvin sign folds to k", "trailing newline", "space"],
+    )
+    def test_login_name_outside_the_username_pattern_is_an_unknown_user(
+        self,
+        client: TestClient,
+        db: Db,
+        caplog: pytest.LogCaptureFixture,
+        username: str,
+    ) -> None:
+        """No lookup: the database's `lower()` could fold it onto `kate`."""
+        register_ok(client, username="kate")
+        caplog.set_level(logging.WARNING)
+
+        r = login(client, username=username)
+
+        assert r.status_code == 401
+        assert r.json()["code"] == "invalid_credentials"
+        assert "refresh_token" not in client.cookies
+        assert log_events(caplog, "auth.login_attempt_unknown_user")
+        assert audit_count(db, "login_failed", "kate") == 0
+        assert audit_count(db, "login_success", "kate") == 0
+        assert db.scalar("SELECT failed_login_attempts FROM users") == 0
 
     def test_reset_mail_is_sent_to_the_stored_address(
         self, client: TestClient, captured_emails: CapturedEmails

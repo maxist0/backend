@@ -33,7 +33,6 @@ import asyncio
 import logging
 import threading
 import time
-import uuid
 from collections.abc import Callable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 
@@ -93,16 +92,16 @@ def rotation_gate(monkeypatch: pytest.MonkeyPatch) -> Iterator[_RotationGate]:
         db: AsyncSession,
         user: User,
         request: Request | None = None,
-        family_id: uuid.UUID | None = None,
-    ) -> tuple[str, str]:
-        if family_id is not None and gate.armed:  # refresh path, not login
+        family: service.SessionFamily | None = None,
+    ) -> service.SessionTokens:
+        if family is not None and gate.armed:  # refresh path, not login
             gate.armed = False
             gate.reached.set()
             released = await asyncio.get_running_loop().run_in_executor(
                 None, gate.release.wait, 30
             )
             assert released, "rotation gate was never released"
-        return await original(db, user, request, family_id)
+        return await original(db, user, request, family)
 
     monkeypatch.setattr(service, "create_session_tokens", gated)
     yield gate
@@ -430,7 +429,12 @@ class TestConcurrentRegistration:
             ) -> Response:
                 if duplicate == "email":
                     return register(client, username=f"{prefix}{i}", email=email)
-                return register(client, username=name, email=f"{prefix}{i}@example.com")
+                # Half of the racers differ only in case: one user either way.
+                return register(
+                    client,
+                    username=name.upper() if i % 2 else name,
+                    email=f"{prefix}{i}@example.com",
+                )
 
             results = run_parallel(racers, _register)
 
@@ -455,7 +459,8 @@ class TestConcurrentRegistration:
             else:
                 assert (
                     db.scalar(
-                        "SELECT count(*) FROM users WHERE username = :n", n=shared_name
+                        "SELECT count(*) FROM users WHERE lower(username) = :n",
+                        n=shared_name,
                     )
                     == 1
                 )
@@ -464,7 +469,27 @@ class TestConcurrentRegistration:
         assert caplog.records, "no log records captured; test is not observing logs"
         assert "race0.mail@example.com" not in text
         assert "racer0x" not in text
+        assert "RACER0X" not in text
         assert "DETAIL" not in text, "raw database error text reached the logs"
+
+    @pytest.mark.usefixtures("captured_emails")
+    def test_unique_index_decides_a_username_the_pre_check_missed(
+        self, client: TestClient, db: Db, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The case-insensitive index answers 409 like the pre-check would."""
+        register_ok(client, username="alice")
+
+        async def _missed(_db: AsyncSession, _username: str) -> User | None:
+            return None
+
+        monkeypatch.setattr(crud, "get_user_by_username", _missed)
+
+        r = register(client, username="ALICE", email="other@example.com")
+
+        assert r.status_code == 409
+        assert r.json()["code"] == "user_exists"
+        assert r.json()["detail"] == "Username already taken"
+        assert db.scalar("SELECT count(*) FROM users") == 1
 
     def test_email_change_confirmation_racing_a_registration_never_fails_with_500(
         self,

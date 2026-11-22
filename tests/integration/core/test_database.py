@@ -43,7 +43,7 @@ class TestPsycopgConstraintNames:
         wrapper = RuntimeError("wrapper")
         wrapper.__cause__ = exc  # what `raise ... from exc` sets
         assert find_db_error(wrapper) is exc
-        assert constraint_name(exc) == "users_email_key"
+        assert constraint_name(exc) == "uq_users_email"
         assert sqlstate(exc) == "23505"
 
 
