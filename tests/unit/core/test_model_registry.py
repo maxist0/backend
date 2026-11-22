@@ -1,22 +1,16 @@
-"""Alembic sees every table through `MODULES`, without application settings."""
+"""Alembic sees every table through `MODULES`, without application settings.
+
+The expected tables come from the modules' own `models` files, so a new
+module needs no edit here. Each module's tests name its concrete tables.
+"""
 
 import os
 import subprocess
 import sys
 
-from sqlalchemy import Table
-
 from app.core import Base
 from app.modules import MODULES
-from tests.helpers import BACKEND_DIR
-
-EXPECTED_TABLES = {
-    "users",
-    "password_credentials",
-    "auth_audit_log",
-    "email_tokens",
-    "sessions",
-}
+from tests.helpers import BACKEND_DIR, module_tables
 
 # What alembic/env.py does, in a fresh interpreter without ENVIRONMENT (like
 # the deployed migrate job, which gets only DATABASE_URL), so no other import
@@ -27,6 +21,10 @@ _ALEMBIC_IMPORTS = (
     "print(sorted(Base.metadata.tables))\n"
     "print('SETTINGS_BUILT', get_settings.cache_info().currsize)\n"
 )
+
+
+def _tables_of_all_modules() -> set[str]:
+    return {table for module in MODULES for table in module_tables(module)}
 
 
 def test_modules_register_every_table_without_environment() -> None:
@@ -44,22 +42,22 @@ def test_modules_register_every_table_without_environment() -> None:
 
     assert proc.returncode == 0, proc.stderr[-1500:]
     tables, settings_built = proc.stdout.strip().splitlines()
-    assert tables == str(sorted(EXPECTED_TABLES))
+    assert tables == str(sorted(_tables_of_all_modules()))
     assert settings_built == "SETTINGS_BUILT 0"
 
 
-def test_modules_models_cover_every_mapped_table() -> None:
-    """Every mapped table belongs to the `models` of a registered module."""
-    selectables = [
-        mapper.local_table
-        for mapper in Base.registry.mappers
-        if any(
-            module.models is not None
-            and mapper.class_.__module__ == module.models.__name__
-            for module in MODULES
-        )
-    ]
-    assert all(isinstance(table, Table) for table in selectables)
-    module_tables = {table.name for table in selectables if isinstance(table, Table)}
+def test_every_table_belongs_to_a_registered_module() -> None:
+    """No orphan models: a table outside every `Module.models` fails here."""
+    orphans = set(Base.metadata.tables) - _tables_of_all_modules()
 
-    assert module_tables == set(Base.metadata.tables) == EXPECTED_TABLES
+    assert orphans == set()
+
+
+def test_every_declared_models_file_registers_its_tables() -> None:
+    """A module that declares `models` maps at least one table, on `Base`."""
+    declared = {
+        module.name: module_tables(module) for module in MODULES if module.models
+    }
+
+    assert all(declared.values()), declared
+    assert _tables_of_all_modules() <= set(Base.metadata.tables)

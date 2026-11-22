@@ -861,17 +861,29 @@ class TestCountWordsTask:
         run_task(client, count_words_task, str(uuid.uuid4()))
 ```
 
-## Step 13: update the core tests that list module contents
+## Step 13: regenerate the OpenAPI snapshot
 
-Three places record what the registered modules contain. A new module changes them, and the full suite fails until you update them:
+Your routes change the API contract, so the snapshot test fails until you regenerate the committed document:
 
-| Place | Change |
-|---|---|
-| `EXPECTED_TABLES` in `tests/unit/core/test_model_registry.py` | add `"notes"` |
-| `TASK_NAMES` in `tests/unit/core/test_taskiq_and_logging.py` | add `"notes.count_words"` |
-| `tests/unit/core/openapi_snapshot.json` | `UPDATE_OPENAPI_SNAPSHOT=1 uv run pytest tests/unit/core/test_openapi_contract.py`, then review the diff: it must contain only your paths and schemas |
+```bash
+UPDATE_OPENAPI_SNAPSHOT=1 uv run pytest tests/unit/core/test_openapi_contract.py
+```
 
-The first two lists live in core tests, so adding a module touches them today (README, known issue 29). Queued messages carry task names, so renaming a task strands them: choose the name once.
+Review the diff of `tests/unit/core/openapi_snapshot.json`: it must contain only your paths and schemas.
+
+No other core file changes. The core tests read the tables and tasks from `Module.models` and `Module.tasks` and fail only when a table or task exists outside a registered module. To pin your module's own tables and task names, add a test like `tests/unit/modules/auth/test_module_contents.py`, with the helpers `module_tables` and `declared_tasks` from `tests/helpers.py`:
+
+```python
+from app.modules.notes import module
+from tests.helpers import declared_tasks, module_tables
+
+
+def test_declares_its_table_and_task() -> None:
+    assert module_tables(module) == {"notes"}
+    assert [t.task_name for t in declared_tasks(module.tasks)] == ["notes.count_words"]
+```
+
+Queued messages carry task names, so renaming a task strands them: choose the name once.
 
 ## Step 14: run the gates
 
@@ -891,9 +903,9 @@ uv run pytest
 |---|---|
 | `tests/unit/core/test_module_layout.py` | A module contains only the vocabulary files and a flat `templates/` folder (no `base.html`). |
 | `tests/unit/core/test_import_direction.py` | Every module package is listed in `MODULES` under its folder name; modules import `app.core`, not its submodules; the core never imports `app.modules`; a module imports only modules listed before it. |
-| `tests/unit/core/test_model_registry.py` | Importing `app.modules` registers every table without `ENVIRONMENT` and reads no settings; every mapped table belongs to a module's `models`. |
+| `tests/unit/core/test_model_registry.py` | Importing `app.modules` registers exactly the tables of the modules' `models` files, without `ENVIRONMENT` and without reading settings; no table exists outside a registered module; a declared `models` file maps at least one table. |
 | `tests/unit/core/test_openapi_contract.py` | Every module path is under the prefix; every module route declares problem-detail errors; the document equals the snapshot. |
-| `tests/unit/core/test_taskiq_and_logging.py` | The worker serves every task under its name. |
+| `tests/unit/core/test_taskiq_and_logging.py` | The worker serves exactly the core's tasks and the tasks of every `Module.tasks`, each name once; the scheduler finds every `schedule` label. |
 
 ## Docstrings and comments
 

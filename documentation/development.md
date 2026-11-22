@@ -58,7 +58,7 @@ VS Code with Pylance reads `[tool.pyright]` in `pyproject.toml` (strict mode, `v
 | `DATABASE_URL is not set` from Alembic | Alembic ignores `.env.local` unless `ENVIRONMENT=dev` is set; export `DATABASE_URL` or set `ENVIRONMENT=dev` |
 | `Database connection failed` at startup | Postgres is not running or the URL is wrong: `docker compose -f compose.dev.yaml up -d --wait`, then check `DATABASE_URL` |
 | The startup guard names variables | `ENVIRONMENT` is not `dev` or `unittest`, and a secret is a default or too short ([environment.md](environment.md#startup-guard)) |
-| The app stops at import with "A title must be provided" | `APP_NAME` is empty, usually after copying `.env` to `.env.local` as is. Remove the line |
+| The app stops at import with "A title must be provided" | `APP_NAME` is empty, in `.env.local` or the environment (a copy of a `.env` template from before 2026-11-22 has `APP_NAME=`). Set a value or remove the line |
 | `DATABASE_URL uses the asyncpg driver` | The driver is psycopg 3: use `postgresql+psycopg://` (or `postgresql://`) |
 | `The database driver (psycopg) cannot run on Windows' ProactorEventLoop` | Start the API with `python run.py dev` or `fastapi dev`, and the worker with `python -m app.worker` |
 | Port 8000, 5432 or 6379 is taken | `--port` for the API; `DEV_POSTGRES_PORT` and `DEV_REDIS_PORT` for the containers, with matching URLs in `.env.local` |

@@ -1,7 +1,8 @@
 """Helpers shared by the test modules.
 
-Both suites use the paths, the event loop helpers, `build_settings` and the
-log readers. The rest serves the integration tests: HTTP flows, captured
+Both suites use the paths, the event loop helpers, `build_settings`, the
+log readers and the module content readers (`module_tables`,
+`declared_tasks`). The rest serves the integration tests: HTTP flows, captured
 mails, the SQL helper, admin requests, Redis dumps and parallel runners.
 """
 
@@ -18,6 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import ModuleType
 from typing import Any, cast
 from urllib.parse import parse_qs, urlsplit
 
@@ -28,10 +30,11 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from fastapi_mail import MessageSchema
 from httpx2 import Response
-from sqlalchemy import Engine, RowMapping, text
+from sqlalchemy import Engine, RowMapping, Table, text
 from starlette.types import ASGIApp
 from taskiq import AsyncTaskiqDecoratedTask, AsyncTaskiqTask
 
+from app.core import Base, Module
 from app.core.config import Settings, get_settings
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
@@ -187,6 +190,43 @@ def log_events(
             if name is None or event.get("event") == name:
                 events.append(event)
     return events
+
+
+def module_tables(module: Module) -> set[str]:
+    """Names of the tables that `module.models` defines.
+
+    These are the tables of the mapped classes defined in that file plus the
+    plain `Table` objects at its top level (an association table, say).
+    Models imported from another file do not count.
+    """
+    models = module.models
+    if models is None:
+        return set()
+    tables = [
+        mapper.local_table
+        for mapper in Base.registry.mappers
+        if mapper.class_.__module__ == models.__name__
+    ]
+    tables += [value for value in vars(models).values() if isinstance(value, Table)]
+    return {table.name for table in tables if isinstance(table, Table)}
+
+
+def declared_tasks(
+    tasks: ModuleType | None,
+) -> list[AsyncTaskiqDecoratedTask[..., object]]:
+    """The taskiq tasks defined in `tasks`, not the ones imported into it.
+
+    `app.core.task` keeps the function's `__module__` (`functools.wraps`),
+    which tells where a task is defined.
+    """
+    if tasks is None:
+        return []
+    return [
+        value
+        for value in vars(tasks).values()
+        if isinstance(value, AsyncTaskiqDecoratedTask)
+        and value.original_func.__module__ == tasks.__name__
+    ]
 
 
 def register(

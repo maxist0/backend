@@ -100,7 +100,7 @@ lint = [
     # `nodejs` extra brings Node.js as a locked wheel instead of a runtime
     # download (pyright-python README, checked 2026-11-18).
     "pyright[nodejs]==1.1.414",
-    # Informational only (open decision D6); mypy and pyright are the gates.
+    # Informational only (ADR 0011); mypy and pyright are the gates.
     "ty>=0.0.104",
 ]
 dev = [

@@ -86,9 +86,22 @@ UPDATE_OPENAPI_SNAPSHOT=1 uv run pytest tests/unit/core/test_openapi_contract.py
 
 Review the diff of the snapshot before you commit it.
 
-## Tests that list module contents
+A new module changes the snapshot, because it adds paths and schemas to the contract. It is the only core test file a module changes ([modules.md](modules.md#step-13-regenerate-the-openapi-snapshot)).
 
-`EXPECTED_TABLES` in `tests/unit/core/test_model_registry.py` and `TASK_NAMES` in `tests/unit/core/test_taskiq_and_logging.py` record the tables and the task names of the registered modules. A new module changes both ([modules.md](modules.md#step-13-update-the-core-tests-that-list-module-contents), README known issue 29).
+## Module contents
+
+The core tests know no module by name. They read the expected tables and tasks from `MODULES`, with two helpers from `tests/helpers.py`:
+
+- `module_tables(module)`: the tables that `module.models` defines (mapped classes and top-level `Table` objects).
+- `declared_tasks(module.tasks)`: the tasks defined in that file, not imported into it.
+
+`tests/unit/core/test_model_registry.py` checks that importing `app.modules` (as Alembic does, without `ENVIRONMENT`) registers exactly those tables and that no table exists outside a registered module. `tests/unit/core/test_taskiq_and_logging.py` checks that the worker serves exactly the core's heartbeat plus the declared tasks, each name once, and that the scheduler finds every `schedule` label.
+
+The concrete names live in each module's tests: `tests/unit/modules/users/test_module_contents.py` and `tests/unit/modules/auth/test_module_contents.py`. Task names are pinned there because queued messages carry them.
+
+## The `.env` template
+
+`tests/unit/core/test_env_template.py` copies `.env` to `.env.local` in a temporary directory, removes every settings variable from the test environment and builds the app with `ENVIRONMENT=dev`. It also checks that the copy changes no setting: an empty `KEY=` would be an empty string instead of "unset", and a fixed value would go stale. A new setting therefore goes into the template with its default, or commented out.
 
 ## Continuous integration
 

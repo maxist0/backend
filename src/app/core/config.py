@@ -348,8 +348,9 @@ class Settings(BaseSettings):
         return self
 
     model_config = SettingsConfigDict(
-        # No dotenv file by default: `.env` is a template with empty values.
-        # get_settings() adds .env.local for ENVIRONMENT=dev only.
+        # No dotenv file by default: `.env` is only the tracked template (a copy
+        # as .env.local keeps every default). get_settings() reads .env.local
+        # for ENVIRONMENT=dev only.
         env_file=None,
         env_file_encoding="utf-8",
         extra="ignore",

@@ -1,4 +1,8 @@
-"""Taskiq wiring: shared tasks, broker builders, the worker root and its logging."""
+"""Taskiq wiring: shared tasks, broker builders, the worker root and its logging.
+
+The expected tasks come from the modules' own `tasks` files, so a new module
+needs no edit here. Each module's tests name its concrete tasks.
+"""
 
 import asyncio
 import os
@@ -10,19 +14,33 @@ from taskiq import ScheduledTask, TaskiqEvents, TaskiqState
 from taskiq.schedule_sources import LabelScheduleSource
 
 import app.core.tasks as app_tasks
-import app.modules  # noqa: F401  # pyright: ignore[reportUnusedImport] - registers the module tasks
 from app.core.config import get_settings
-from tests.helpers import BACKEND_DIR
+from app.modules import MODULES
+from tests.helpers import BACKEND_DIR, declared_tasks
 
-# Queued messages carry these names; renaming one strands messages in Redis.
-TASK_NAMES = {
-    "auth.cleanup",
-    "email.send_account_locked_notice",
-    "email.send_email_change_completed_notice",
-    "email.send_email_change_requested_notice",
-    "email.send_token_email",
-    "maintenance.taskiq_heartbeat",
-}
+# The core's own tasks. Queued messages carry these names; renaming one
+# strands messages in Redis.
+CORE_TASK_NAMES = ["maintenance.taskiq_heartbeat"]
+HEARTBEAT_CRON = "*/5 * * * *"
+
+
+def _module_task_names() -> list[str]:
+    return [
+        declared.task_name
+        for module in MODULES
+        for declared in declared_tasks(module.tasks)
+    ]
+
+
+def test_core_declares_only_the_heartbeat() -> None:
+    assert [t.task_name for t in declared_tasks(app_tasks)] == CORE_TASK_NAMES
+
+
+def test_core_and_module_task_names_are_unique() -> None:
+    """Two tasks with one name would share one slot in the worker's registry."""
+    names = CORE_TASK_NAMES + _module_task_names()
+
+    assert len(names) == len(set(names))
 
 
 def test_importing_the_worker_does_not_configure_logging() -> None:
@@ -46,11 +64,15 @@ def test_importing_the_worker_does_not_configure_logging() -> None:
     assert "CONFIGURED False" in proc.stdout
 
 
-def test_worker_broker_serves_every_task_under_its_name() -> None:
-    """`app.worker:broker` finds the shared tasks of the core and the modules."""
+def test_worker_broker_serves_exactly_the_declared_tasks() -> None:
+    """`app.worker:broker` serves the core's tasks and every `Module.tasks`.
+
+    A task that only an import outside `Module.tasks` registers, or a
+    declared `tasks` file the worker does not import, fails here.
+    """
     code = (
         "import app.worker\n"
-        "from app.modules.auth.tasks import send_token_email_task as t\n"
+        "from app.core.tasks import taskiq_heartbeat as t\n"
         "print(sorted(app.worker.broker.get_all_tasks()))\n"
         "print('DEFAULT', t.kicker().broker is app.worker.broker)\n"
     )
@@ -66,7 +88,7 @@ def test_worker_broker_serves_every_task_under_its_name() -> None:
 
     assert proc.returncode == 0, proc.stderr[-1500:]
     names, default = proc.stdout.strip().splitlines()
-    assert names == str(sorted(TASK_NAMES))
+    assert names == str(sorted(CORE_TASK_NAMES + _module_task_names()))
     assert default == "DEFAULT True"
 
 
@@ -79,8 +101,12 @@ def test_built_broker_registers_the_worker_logging_hook() -> None:
     assert broker.find_task("maintenance.taskiq_heartbeat") is not None
 
 
-def test_scheduler_finds_the_shared_heartbeat_schedule() -> None:
-    """The heartbeat is a shared task; the scheduler must still schedule it."""
+def test_scheduler_finds_every_declared_schedule() -> None:
+    """The scheduler schedules the shared tasks' `schedule` labels, only those.
+
+    The tasks are shared, not the broker's own; the scheduler must still
+    find the heartbeat and every schedule a module task declares.
+    """
     broker = app_tasks.build_broker(get_settings())
     retry_source = app_tasks.build_retry_source(get_settings())
     scheduler = app_tasks.build_scheduler(broker, retry_source)
@@ -94,11 +120,16 @@ def test_scheduler_finds_the_shared_heartbeat_schedule() -> None:
 
     schedules = asyncio.run(_schedules())
 
-    assert scheduler.broker is broker
-    assert sorted((s.task_name, s.cron) for s in schedules) == [
-        ("auth.cleanup", "0 3 * * *"),
-        ("maintenance.taskiq_heartbeat", "*/5 * * * *"),
+    declared = [
+        (declared.task_name, entry.get("cron"))
+        for module in MODULES
+        for declared in declared_tasks(module.tasks)
+        for entry in declared.labels.get("schedule", [])
     ]
+    assert scheduler.broker is broker
+    assert sorted((s.task_name, s.cron) for s in schedules) == sorted(
+        [("maintenance.taskiq_heartbeat", HEARTBEAT_CRON), *declared]
+    )
 
 
 def test_worker_startup_hook_configures_logging(

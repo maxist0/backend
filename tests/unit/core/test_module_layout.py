@@ -19,15 +19,17 @@ ALLOWED_FILES = {
     "admin.py",
 }
 ALLOWED_DIRS = {"templates"}
-IGNORED = {"__pycache__"}
 # The core's email layout; a module template with this name would shadow it.
 CORE_LAYOUT = "base.html"
 
 
+def _ignored(entry: Path) -> bool:
+    """Bytecode and tool caches (`.mypy_cache`, `.ruff_cache`, ...), not code."""
+    return entry.name == "__pycache__" or entry.name.startswith(".")
+
+
 def _module_dirs() -> list[Path]:
-    return sorted(
-        p for p in MODULES_DIR.iterdir() if p.is_dir() and p.name not in IGNORED
-    )
+    return sorted(p for p in MODULES_DIR.iterdir() if p.is_dir() and not _ignored(p))
 
 
 def test_modules_use_only_the_file_vocabulary() -> None:
@@ -38,7 +40,7 @@ def test_modules_use_only_the_file_vocabulary() -> None:
         f"{module.name}/{entry.name}"
         for module in module_dirs
         for entry in module.iterdir()
-        if entry.name not in IGNORED
+        if not _ignored(entry)
         and not (entry.is_file() and entry.name in ALLOWED_FILES)
         and not (entry.is_dir() and entry.name in ALLOWED_DIRS)
     ]

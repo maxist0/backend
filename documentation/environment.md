@@ -24,7 +24,7 @@ Priority, highest first:
 2. `.env.local`, only with `ENVIRONMENT=dev`. The file is git-ignored and relative to the working directory (`backend/`). A missing file is skipped.
 3. The defaults in `Settings`.
 
-`.env` is a tracked reference of every variable with its default and secrets commented out. It is **not read** by the application. Do not copy it to `.env.local` as is: its empty `APP_NAME=` makes the app fail at startup. Put only the values you change into `.env.local`.
+`.env` is a tracked reference of every variable. Each active line holds the `Settings` default; secrets, settings that are unset by default, `ENVIRONMENT` and `APP_VERSION` are commented out. It is **not read** by the application. Copied to `.env.local` unedited it changes nothing (`tests/unit/core/test_env_template.py`), so `cp .env .env.local` is a working start; then change the values you need.
 
 `get_settings()` builds the settings once per process (cached). Unknown variables are ignored. Validation errors never echo input values, because they can be secrets. Alembic does not build `Settings`: it reads `DATABASE_URL` only ([database.md](database.md#migrations)).
 

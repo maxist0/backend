@@ -71,15 +71,15 @@ docker compose -f compose.dev.yaml up -d --wait
 
 ### 3. Configure
 
-`run.py dev` needs no configuration with the default ports: the defaults in `Settings` match `compose.dev.yaml`. Alembic builds no `Settings` and reads only `DATABASE_URL`, so create `.env.local` with that line:
+Copy the template:
 
-```dotenv
-DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5432/api
+```bash
+cp .env .env.local          # PowerShell: Copy-Item .env .env.local
 ```
 
-`.env.local` is git-ignored and read only when `ENVIRONMENT=dev` (`python run.py dev`, or `ENVIRONMENT=dev` for Alembic). Add any other variable you want to change to it. A real environment variable always wins over `.env.local`. Every other environment expects variables injected by the runtime (Docker, Swarm, CI).
+`.env` is the tracked reference of every variable. Each active line holds the default from `Settings`, which matches `compose.dev.yaml`. Commented out are `ENVIRONMENT` (process environment only), `APP_VERSION` (the installed package version), the secrets and the settings that are unset by default (Redis password, mail account). An unedited copy therefore changes nothing for `run.py dev`, and it gives Alembic the `DATABASE_URL` it needs: Alembic builds no `Settings` and reads only that variable. `tests/unit/core/test_env_template.py` proves both.
 
-`.env` is the tracked reference: every variable with its default value (empty where there is none), secrets commented out. Do not copy it to `.env.local` as is: its empty `APP_NAME=` makes the app fail at startup (FastAPI needs a title).
+`.env.local` is git-ignored and read only when `ENVIRONMENT=dev` (`python run.py dev`, or `ENVIRONMENT=dev` for Alembic). Change the values you need there. A real environment variable always wins over `.env.local`. Every other environment expects variables injected by the runtime (Docker, Swarm, CI).
 
 ### 4. Migrate and run
 
@@ -480,6 +480,8 @@ The numbers are stable: other documents and ADRs refer to them. Closed issues st
 - ~~13~~ `ruff format --check` passes.
 - ~~14~~ Not reproducible: the virtualenv runs Python 3.14.
 - ~~15~~ Admin CSRF: sqladmin runs custom actions as `GET` requests. The admin session cookie is `SameSite=Strict`, `HttpOnly`, `Secure` outside `dev`/`unittest`, and expires 8 hours after login. A fail-safe Fetch Metadata guard answers 403 to every state-changing admin request that does not carry `Sec-Fetch-Site: same-origin`, a missing header included ([OWASP CSRF cheat sheet](https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html)). Browsers without the header (before the March 2023 baseline) cannot log in to the admin or run actions.
+- ~~28~~ The `.env` template is a startable dev configuration: every active line holds the `Settings` default, and settings that are unset by default, secrets, `ENVIRONMENT` and `APP_VERSION` are commented out instead of empty or fixed. `tests/unit/core/test_env_template.py` copies it to `.env.local`, builds the app with `ENVIRONMENT=dev` and checks that no setting differs from its default. The Quick start copies it again.
+- ~~29~~ The core tests derive the expected tables and task names from `MODULES` (`Module.models`, `Module.tasks`) and check that no table or task exists outside a registered module; the tests of `users` and `auth` name their own tables and tasks. Adding a module changes only the OpenAPI snapshot, an intended contract change ([modules.md](documentation/modules.md#step-13-regenerate-the-openapi-snapshot)).
 
 **Open**
 
@@ -497,8 +499,6 @@ The numbers are stable: other documents and ADRs refer to them. Closed issues st
 25. **Accepted:** a refresh that fails with 401 clears the refresh cookie (same name and path). If that 401 reaches the browser after the response of a login made in parallel, it deletes the new login's cookie, and the user has to sign in again. This affects availability only.
 26. Reuse detection of rotated refresh tokens ends when the cleanup deletes the rotated session, `REFRESH_TOKEN_EXPIRE_DAYS` + `AUTH_CLEANUP_RETENTION_DAYS` after the token was issued (60 days by default). A replay after that is a plain 401 and no longer revokes the family. The fix is the absolute session (family) lifetime planned in the [review plan, Phase 2](documentation/review-2026-11/README.md#phase-2-datenschicht) (M2): a family whose absolute lifetime ends before its rotated sessions are deleted has nothing left to protect. [review plan Phase 2]
 27. **Accepted:** the lock-notice throttle is check, send, record, and not atomic. After a worker backlog several lock notices of one user can go out together, at most one per lock.
-28. The `.env` template contains empty `APP_NAME=` and `APP_DESCRIPTION=` lines. Copied to `.env.local` as is, it makes the app fail at startup (FastAPI needs a title), so the Quick start tells you not to copy it. The fix is to comment the two lines out in the template. [Phase 0]
-29. Two core tests record the contents of the registered modules: `EXPECTED_TABLES` in `tests/unit/core/test_model_registry.py` and `TASK_NAMES` in `tests/unit/core/test_taskiq_and_logging.py`, plus the OpenAPI snapshot. Adding a module therefore edits core test files, against the rule that an app only adds modules ([modules.md](documentation/modules.md#step-13-update-the-core-tests-that-list-module-contents)). The fix is to derive both lists from `MODULES`. [Phase 0]
 30. The Swarm stack sets no `FRONTEND_URL`, `CORS_ORIGINS` or `FORWARDED_ALLOW_IPS`. With `ENVIRONMENT=prod` the startup guard stops the API until `FRONTEND_URL` is a real `https` URL, and the cookie, CORS and client-IP behaviour need the real values. [deploy round]
 
 ## Open decisions
