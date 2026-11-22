@@ -79,6 +79,8 @@ async def get_current_user(
     Rejects deleted, deactivated and admin-locked accounts, so those take
     effect immediately and not only at the next refresh. A timed lock from
     failed logins blocks only the password login and is not checked here.
+    Rejects tokens issued before the last password change or reset: the
+    client refreshes, and only sessions the change kept still can.
     """
     user = await crud.get_user_by_id(db, uuid.UUID(token_data.user_id))
     if user is None:
@@ -87,6 +89,9 @@ async def get_current_user(
         raise Unauthorized("Account is deactivated")
     if user.is_admin_locked():
         raise Unauthorized("Account is locked")
+    if user.password_changed_after(token_data.issued_at):
+        logger.info("auth.access_token_outdated", user_id=str(user.id))
+        raise Unauthorized("Invalid or expired access token")
     # Stamp every subsequent log in this request with the authenticated user
     # (user_id only: no usernames or emails in logs).
     structlog.contextvars.bind_contextvars(user_id=str(user.id))
@@ -109,6 +114,9 @@ async def get_optional_user(
         logger.warning("auth.optional_auth_failed", error_type=type(e).__name__)
         return None
     if user is None or not user.is_active or user.is_admin_locked():
+        return None
+    if user.password_changed_after(token_data.issued_at):
+        logger.info("auth.access_token_outdated", user_id=str(user.id))
         return None
     return user
 

@@ -149,10 +149,9 @@ async def _audit(
     request: Request | None = None,
     detail: str | None = None,
     *,
-    commit: bool = True,
     ip_address: str | None = None,
 ) -> None:
-    """Create an immutable audit-log entry.
+    """Add an immutable audit-log entry to the caller's transaction.
 
     The client IP comes from `request`, or from `ip_address` for callers
     without one (the admin panel actions).
@@ -166,7 +165,7 @@ async def _audit(
         user_agent=_bounded_header(request, "user-agent", _USER_AGENT_MAX_LENGTH),
         detail=detail,
     )
-    await crud.create_audit_log(db, log, commit=commit)
+    await crud.create_audit_log(db, log)
 
 
 async def _open_email_token(
@@ -181,13 +180,14 @@ async def _open_email_token(
     The stored hash belongs to a random value that is never sent: the mail
     task sets the hash of the value it mails (`prepare_token_email`), so
     the raw token never has to be enqueued. Lock order: `email_tokens`
-    first.
+    first. `created_at` comes from the application clock, like
+    `users.password_changed_at`, which it is compared with at redemption.
 
     Returns:
         The new token's id, for `_enqueue_token_email` after the commit.
     """
     token_id = uuid.uuid7()
-    await crud.invalidate_tokens_for_user_purpose(db, user_id, purpose, commit=False)
+    await crud.invalidate_tokens_for_user_purpose(db, user_id, purpose)
     await crud.create_email_token(
         db,
         EmailToken(
@@ -196,9 +196,9 @@ async def _open_email_token(
             purpose=purpose,
             token_hash=hash_token(secrets.token_urlsafe(32)),
             new_email=new_email,
+            created_at=utcnow(),
             expires_at=utcnow() + valid_for,
         ),
-        commit=False,
     )
     return token_id
 
@@ -254,11 +254,13 @@ async def _record_lockout(
     """Audit, log and count a lock set by failed passwords; notify the user.
 
     Called by the one request whose failure reached `LOGIN_MAX_ATTEMPTS`.
-    The audit row commits before the notice is enqueued, and the caller
-    answers the same way whether the enqueue worked or not.
+    Commits the caller's transaction with the audit row before the notice
+    is enqueued, and the caller answers the same way whether the enqueue
+    worked or not.
     """
     LOCKOUTS.inc()
     await _audit(db, AuditEventType.ACCOUNT_LOCKED, user_id, request, detail)
+    await db.commit()
     logger.warning("auth.account_locked", user_id=str(user_id), attempts=attempts)
     await _enqueue_email(
         send_account_locked_notice_task.kiq,
@@ -279,7 +281,9 @@ async def register_user(
     """Register a new user and send the verification email.
 
     The pre-checks answer the common case cheaply; the unique constraints
-    decide parallel registrations (the loser gets the same 409).
+    decide parallel registrations (the loser gets the same 409). The user,
+    its password credential, the verification token and the audit rows
+    commit together or not at all.
 
     Returns:
         The new user.
@@ -321,7 +325,7 @@ async def register_user(
     token_id = await _open_email_token(
         db, user.id, EmailTokenPurpose.VERIFY_EMAIL, _EMAIL_TOKEN_LIFETIME
     )
-    await _audit(db, AuditEventType.REGISTER, user.id, request, commit=False)
+    await _audit(db, AuditEventType.REGISTER, user.id, request)
     await _audit(
         db,
         AuditEventType.EMAIL_VERIFICATION_SENT,
@@ -329,6 +333,7 @@ async def register_user(
         request,
         _VERIFICATION_REQUESTED,
     )
+    await db.commit()
     await _enqueue_token_email(token_id, user.id, EmailTokenPurpose.VERIFY_EMAIL)
 
     logger.info("auth.user_registered", user_id=str(user.id))
@@ -341,7 +346,11 @@ async def _record_locked_login(
     locked_until: datetime | None,
     request: Request | None,
 ) -> None:
-    """Audit, log and count a login attempt on a locked account."""
+    """Audit, log and count a login attempt on a locked account.
+
+    Commits the audit row: the caller raises the refusal next, which would
+    roll it back.
+    """
     LOGIN_FAILURES.labels(reason="locked").inc()
     remaining = (
         max(int((locked_until - utcnow()).total_seconds()), 0)
@@ -357,6 +366,7 @@ async def _record_locked_login(
         if remaining is None
         else f"Account locked, {remaining}s remaining",
     )
+    await db.commit()
     logger.warning(
         "auth.login_attempt_locked_account",
         user_id=str(user_id),
@@ -390,8 +400,8 @@ async def authenticate_user(  # noqa: PLR0912, PLR0915 - the lock checks, their 
     re-reads the lock state after the wait, and a failure is counted before
     the slot is released. Once one guess of a burst has locked the account,
     later guesses are refused without an Argon2 evaluation. The success
-    path is a conditional UPDATE that refuses if a lock was committed while
-    the password was being verified.
+    path is a conditional UPDATE that refuses if a lock, or a password
+    change or reset, was committed while the password was being verified.
     """
     settings = get_settings()
     # A name outside the pattern is never looked up: `lower()` in the
@@ -414,19 +424,21 @@ async def authenticate_user(  # noqa: PLR0912, PLR0915 - the lock checks, their 
             await _record_locked_login(db, user.id, user.locked_until, request)
             await _refuse_locked_login()
 
-        # The timed lock has expired: clear it.
-        user.is_locked = False
-        user.failed_login_attempts = 0
-        user.locked_until = None
-        await users_crud.update_user(db, user)
-        await _audit(
-            db,
-            AuditEventType.ACCOUNT_UNLOCKED,
-            user.id,
-            request,
-            "Lock expired",
-        )
-        logger.info("auth.account_unlocked", user_id=str(user.id))
+        # The timed lock has expired: clear it, unless a parallel guess
+        # locked the account again since the check above.
+        if await crud.clear_expired_lock(db, user.id):
+            await _audit(
+                db,
+                AuditEventType.ACCOUNT_UNLOCKED,
+                user.id,
+                request,
+                "Lock expired",
+            )
+            logger.info("auth.account_unlocked", user_id=str(user.id))
+        # Commit before the password check: the UPDATE holds the user row
+        # lock, which must not last over Argon2, and the cleared lock stays
+        # cleared whatever this attempt's outcome.
+        await db.commit()
 
     if not user.is_active:
         await equalize_password_timing(password)
@@ -435,7 +447,7 @@ async def authenticate_user(  # noqa: PLR0912, PLR0915 - the lock checks, their 
         raise InvalidCredentialsError()
 
     locked_meanwhile = False
-    credential: PasswordCredential | None = None
+    stored: tuple[str, datetime | None] | None = None
     failure: tuple[int, bool, datetime | None] | None = None
     async with login_admission_limiter():
         # Re-check after the wait: guesses evaluated meanwhile may have
@@ -448,72 +460,130 @@ async def authenticate_user(  # noqa: PLR0912, PLR0915 - the lock checks, their 
             await _record_locked_login(db, user.id, lock_state[1], request)
             locked_meanwhile = True
         else:
-            credential = await crud.get_password_credential(db, user.id)
-            if credential is None:
+            # The hash and its version in one read: the success write below
+            # is conditional on that version.
+            stored = await crud.get_password_version(db, user.id)
+            if stored is None:
                 await equalize_password_timing(password)
                 valid = False
             else:
-                valid = await verify_password(password, credential.password_hash)
+                valid = await verify_password(password, stored[0])
 
             if not valid:
                 # Atomic increment + lock in the database (no lost update),
-                # committed before the admission slot is released.
+                # committed before the admission slot is released, so the
+                # guesses queued behind this one see the lock.
                 failure = await crud.register_failed_login(
                     db,
                     user.id,
                     settings.LOGIN_MAX_ATTEMPTS,
                     settings.LOGIN_LOCKOUT_SECONDS,
                 ) or (0, False, None)
+                await db.commit()
 
     if locked_meanwhile:
         # Outside the limiter: the timing wait must not hold an admission slot.
         await _refuse_locked_login()
 
-    if failure is not None or credential is None:
+    if failure is not None or stored is None:
         attempts, is_locked, _locked_until = failure or (0, False, None)
         LOGIN_FAILURES.labels(reason="invalid_password").inc()
         logger.warning("auth.login_failed", user_id=str(user.id), attempts=attempts)
-        if is_locked:
-            # Exactly one request reaches the threshold; it records the lock.
-            if attempts == settings.LOGIN_MAX_ATTEMPTS:
-                await _record_lockout(
-                    db,
-                    user.id,
-                    attempts,
-                    request,
-                    f"Locked after {attempts} failed attempts",
-                )
-            else:
-                await _audit(db, AuditEventType.LOGIN_FAILED, user.id, request)
-            raise InvalidCredentialsError()
-        await _audit(db, AuditEventType.LOGIN_FAILED, user.id, request)
+        # Exactly one request reaches the threshold; it records the lock.
+        if is_locked and attempts == settings.LOGIN_MAX_ATTEMPTS:
+            await _record_lockout(
+                db,
+                user.id,
+                attempts,
+                request,
+                f"Locked after {attempts} failed attempts",
+            )
+        else:
+            await _audit(db, AuditEventType.LOGIN_FAILED, user.id, request)
+            await db.commit()
         raise InvalidCredentialsError()
 
     # Success: reset the counters, unless a parallel guess locked the account
-    # while this password was being verified (conditional UPDATE).
-    last_login_at = await crud.record_successful_login(db, user.id)
+    # or the password changed while it was being verified (conditional
+    # UPDATE). No timing wait on a refusal: this request has already run a
+    # real verify, so it already takes as long as a wrong password.
+    password_hash, password_changed_at = stored
+    last_login_at = await crud.record_successful_login(db, user.id, password_changed_at)
     if last_login_at is None:
         lock_state = await crud.get_lock_state(db, user.id)
-        await _record_locked_login(
-            db, user.id, lock_state[1] if lock_state else None, request
-        )
-        # No timing wait: this request has already run a real verify, so it
-        # already takes as long as a wrong password.
+        if lock_state is None or lock_is_active(*lock_state):
+            await _record_locked_login(
+                db, user.id, lock_state[1] if lock_state else None, request
+            )
+        else:
+            await _record_outdated_password_login(db, user.id, request)
         raise InvalidCredentialsError()
-    # Mirror the committed row into the cached object without marking it
+    # Mirror the written row into the cached object without marking it
     # dirty, so a later flush cannot write these values a second time.
     set_committed_value(user, "failed_login_attempts", 0)
     set_committed_value(user, "is_locked", False)
     set_committed_value(user, "locked_until", None)
     set_committed_value(user, "last_login_at", last_login_at)
-
-    if password_needs_rehash(credential.password_hash):
-        await crud.update_password_hash(db, user.id, await hash_password(password))
-        logger.info("auth.password_rehashed", user_id=str(user.id))
-
     await _audit(db, AuditEventType.LOGIN_SUCCESS, user.id, request)
+    await db.commit()
+
+    # After the commit: the reset above holds the user row lock until then,
+    # and it must not last over the Argon2 hashing.
+    if password_needs_rehash(password_hash):
+        await _rehash_password(db, user.id, password, password_hash)
+
     logger.info("auth.login_success", user_id=str(user.id))
     return user
+
+
+async def _record_outdated_password_login(
+    db: AsyncSession, user_id: uuid.UUID, request: Request | None
+) -> None:
+    """Audit, log and count a login whose password changed while it was checked.
+
+    The password was right when it was read, so the failure counter stays:
+    a reset racing the real user's login must not count towards a lockout.
+    Commits the audit row before the caller raises the refusal.
+    """
+    LOGIN_FAILURES.labels(reason="invalid_password").inc()
+    await _audit(
+        db,
+        AuditEventType.LOGIN_FAILED,
+        user_id,
+        request,
+        "Password changed during login",
+    )
+    await db.commit()
+    logger.warning("auth.login_credentials_changed", user_id=str(user_id))
+
+
+async def _rehash_password(
+    db: AsyncSession, user_id: uuid.UUID, password: str, old_hash: str
+) -> None:
+    """Store `password` hashed with the configured Argon2 parameters.
+
+    Best effort: the login has already committed, so a failure keeps the
+    old hash and the login goes on. Only `old_hash` is replaced, so a
+    password change or reset committed meanwhile is never overwritten.
+    The savepoint confines a failed write to itself; rolling back the whole
+    session would expire the loaded `User` the login still returns.
+    """
+    try:
+        new_hash = await hash_password(password)
+        async with db.begin_nested():
+            rehashed = await crud.update_password_hash(
+                db, user_id, new_hash, expected_hash=old_hash
+            )
+    except Exception as exc:  # noqa: BLE001 - a failed rehash never fails the login
+        logger.warning(
+            "auth.password_rehash_failed",
+            user_id=str(user_id),
+            error_type=type(exc).__name__,
+        )
+        return
+    await db.commit()
+    if rehashed:
+        logger.info("auth.password_rehashed", user_id=str(user_id))
 
 
 @dataclass(frozen=True)
@@ -548,9 +618,12 @@ async def create_session_tokens(
     `REFRESH_TOKEN_EXPIRE_DAYS`, and the access token after
     `ACCESS_TOKEN_EXPIRE_MINUTES`, but neither after the family's end.
 
+    Commits the caller's transaction with the new session; for a rotation
+    that is the same commit as the consumed predecessor.
+
     Returns:
         The access token, the raw refresh token and the access token's
-        lifetime. Commits.
+        lifetime.
     """
     settings = get_settings()
     now = utcnow()
@@ -589,6 +662,7 @@ async def create_session_tokens(
         user_agent=_bounded_header(request, "user-agent", _USER_AGENT_MAX_LENGTH),
     )
     await crud.create_session(db, session)
+    await db.commit()
 
     return SessionTokens(
         access_token=access_token,
@@ -632,7 +706,7 @@ async def refresh_session(
     if user is None or not user.is_active or user.is_admin_locked():
         # The presented session is revoked as "account_disabled", never
         # "rotated", so a retry with the same cookie is a plain 401 and not a
-        # reuse signal. revoke_family commits on its own.
+        # reuse signal.
         revoked = await crud.revoke_family(
             db, owner_id, family_id, reason="account_disabled"
         )
@@ -650,6 +724,8 @@ async def refresh_session(
                 f"Refresh denied: account inactive or locked, revoked {revoked} "
                 "session(s)",
             )
+        # Before the refusal, which would roll the revocation back.
+        await db.commit()
         raise InvalidRefreshTokenError()
 
     family_expires_at = await crud.rotate_session(db, token_hash_val)
@@ -660,7 +736,8 @@ async def refresh_session(
         await db.rollback()  # end the transaction: releases the user lock
         raise InvalidRefreshTokenError()
 
-    # Same transaction as the rotation: one commit for old + new session.
+    # Same transaction as the rotation: create_session_tokens commits the
+    # old and the new session together.
     tokens = await create_session_tokens(
         db, user, request, SessionFamily(family_id, family_expires_at)
     )
@@ -696,6 +773,8 @@ async def _revoke_reused_family(
         f"Token reuse detected, revoked {revoked} session(s) "
         f"in family {sess.family_id}",
     )
+    # Before the refusal, which would roll the revocation back.
+    await db.commit()
     raise InvalidRefreshTokenError(
         "Token reuse detected – all sessions revoked"  # noqa: RUF001 - response text, unchanged
     )
@@ -739,7 +818,6 @@ async def logout_session(
         sess.user_id,
         request,
         "Logout",
-        commit=False,
     )
     await db.commit()
     logger.info("auth.user_logged_out")
@@ -763,6 +841,7 @@ async def logout_all_sessions(
         request,
         f"Logout all, revoked {revoked} session(s)",
     )
+    await db.commit()
     logger.info("auth.logout_all", user_id=str(user_id), revoked_sessions=revoked)
     return revoked
 
@@ -794,6 +873,7 @@ async def forgot_password(
             request,
             f"No email sent: account {reason}",
         )
+        await db.commit()
         logger.warning(
             "auth.password_reset_refused_account_blocked", user_id=str(user.id)
         )
@@ -809,6 +889,7 @@ async def forgot_password(
         request,
         "Password reset email requested",
     )
+    await db.commit()
     await _enqueue_token_email(token_id, user.id, EmailTokenPurpose.RESET_PASSWORD)
 
 
@@ -822,24 +903,36 @@ async def reset_password(
 
     Revokes every session of the user and every other open email token: a
     pending email change or verification started by whoever knew the old
-    password ends here.
+    password ends here. The redemption, the new hash and the revocations
+    commit together, so nothing the old password does meanwhile survives
+    the reset, and a failure before the commit changes nothing.
 
     Raises:
-        InvalidTokenError: The token is unknown, used, invalidated or expired.
+        InvalidTokenError: The token is unknown, used, invalidated or
+            expired, also when it was redeemed while the new password was
+            being hashed.
     """
+    token_hash = hash_token(raw_token)
+    # Checked before hashing, so an invalid token never costs Argon2.
+    if not await crud.email_token_is_open(
+        db, token_hash, EmailTokenPurpose.RESET_PASSWORD
+    ):
+        raise InvalidTokenError("Invalid or expired reset token")
+    # Ends the read transaction: no transaction stays open over Argon2.
+    await db.rollback()
+    new_hash = await hash_password(new_password)
+
     consumed = await crud.consume_email_token(
-        db, hash_token(raw_token), EmailTokenPurpose.RESET_PASSWORD
+        db, token_hash, EmailTokenPurpose.RESET_PASSWORD
     )
     if consumed is None:
         raise InvalidTokenError("Invalid or expired reset token")
     _token_id, user_id, _purpose, _new_email = consumed
-
-    # Fail closed: end tokens and sessions first, in one commit with the
-    # redemption (lock order email_tokens -> users -> sessions), then change
-    # the password.
-    await crud.invalidate_open_email_tokens(db, user_id, commit=False)
+    # Lock order email_tokens -> users -> sessions -> password_credentials.
+    await crud.invalidate_open_email_tokens(db, user_id)
     revoked = await crud.revoke_user_sessions(db, user_id, reason="password_reset")
-    await crud.update_password_hash(db, user_id, await hash_password(new_password))
+    await crud.mark_password_changed(db, user_id)
+    await crud.update_password_hash(db, user_id, new_hash)
     await _audit(
         db,
         AuditEventType.PASSWORD_RESET_COMPLETED,
@@ -847,6 +940,7 @@ async def reset_password(
         request,
         f"Revoked {revoked} session(s)",
     )
+    await db.commit()
     logger.info(
         "auth.password_reset_completed",
         user_id=str(user_id),
@@ -885,7 +979,7 @@ async def verify_email(
     token_id, user_id, purpose, new_email = consumed
     # Parallel requests can leave a second open token of this purpose; it
     # ends with this redemption (email_tokens first in the lock order).
-    await crud.invalidate_tokens_for_user_purpose(db, user_id, purpose, commit=False)
+    await crud.invalidate_tokens_for_user_purpose(db, user_id, purpose)
 
     user = await users_crud.get_user_by_id(db, user_id)
     if user is None:
@@ -904,8 +998,9 @@ async def verify_email(
         return
 
     user.is_email_verified = True
-    await users_crud.update_user(db, user)  # commits the token redemption as well
+    await users_crud.update_user(db, user)
     await _audit(db, AuditEventType.EMAIL_VERIFIED, user.id, request)
+    await db.commit()
     logger.info("auth.email_verified", user_id=str(user.id))
 
 
@@ -930,9 +1025,9 @@ async def _apply_email_change(
         await db.rollback()
         raise EmailTakenError()
 
-    # email_tokens before users (lock order); committed by update_user.
+    # email_tokens before users (lock order).
     await crud.invalidate_tokens_for_user_purpose(
-        db, user.id, EmailTokenPurpose.RESET_PASSWORD, commit=False
+        db, user.id, EmailTokenPurpose.RESET_PASSWORD
     )
     if user.is_email_verified:
         await crud.set_email_token_previous_email(db, token_id, user.email)
@@ -949,6 +1044,7 @@ async def _apply_email_change(
         logger.info("auth.email_change_conflict", constraint=constraint)
         raise EmailTakenError() from None
     await _audit(db, AuditEventType.EMAIL_CHANGED, user.id, request)
+    await db.commit()
     logger.info("auth.email_changed", user_id=str(user.id))
     await _enqueue_email(
         send_email_change_completed_notice_task.kiq,
@@ -981,6 +1077,7 @@ async def resend_verification_email(
         request,
         _VERIFICATION_REQUESTED,
     )
+    await db.commit()
     await _enqueue_token_email(token_id, user.id, EmailTokenPurpose.VERIFY_EMAIL)
     logger.info("auth.verification_email_resent", user_id=str(user.id))
 
@@ -1148,6 +1245,7 @@ async def record_account_locked_notice(
         notice.user_id,
         detail=f"Lock notice sent, locked until {notice.locked_until.isoformat()}",
     )
+    await db.commit()
 
 
 @dataclass(frozen=True)
@@ -1287,13 +1385,23 @@ async def _confirm_password(
     user_id: uuid.UUID,
     password: str,
     request: Request | None,
-) -> None:
+) -> datetime | None:
     """Check the current password of a signed-in user like a login attempt.
 
     Same counter, threshold and timed lock as `authenticate_user`, and like
     there a lock does not end sessions. While the account is locked even
     the correct password is refused, without an Argon2 evaluation. A
     correct password resets the counter, as a successful login does.
+
+    Commits its writes, a refusal included: a refusal is raised and would
+    roll them back, and a success must release the user row lock of the
+    reset before the caller hashes a new password or touches `email_tokens`
+    (lock order email_tokens -> users).
+
+    Returns:
+        The credential version (`users.password_changed_at`) read together
+        with the verified hash, for a write that must not overwrite a newer
+        password.
 
     Raises:
         WrongPasswordError: The password is wrong, the user has no password
@@ -1309,17 +1417,18 @@ async def _confirm_password(
             request,
             "Password confirmation, account locked",
         )
+        await db.commit()
         await wait_like_password_verify()
         raise WrongPasswordError()
 
-    credential = await crud.get_password_credential(db, user_id)
-    if credential is None:
+    stored = await crud.get_password_version(db, user_id)
+    if stored is None:
         await equalize_password_timing(password)
         valid = False
     else:
-        valid = await verify_password(password, credential.password_hash)
+        valid = await verify_password(password, stored[0])
 
-    if not valid:
+    if stored is None or not valid:
         attempts, is_locked, _locked_until = await crud.register_failed_login(
             db, user_id, settings.LOGIN_MAX_ATTEMPTS, settings.LOGIN_LOCKOUT_SECONDS
         ) or (0, False, None)
@@ -1343,11 +1452,22 @@ async def _confirm_password(
                 request,
                 "Password confirmation",
             )
+            await db.commit()
         raise WrongPasswordError()
 
     # A lock committed by a parallel wrong guess meanwhile still wins.
     if not await crud.reset_failed_logins(db, user_id):
+        await _audit(
+            db,
+            AuditEventType.LOGIN_FAILED,
+            user_id,
+            request,
+            "Password confirmation, account locked",
+        )
+        await db.commit()
         raise WrongPasswordError()
+    await db.commit()
+    return stored[1]
 
 
 async def change_password(
@@ -1366,20 +1486,42 @@ async def change_password(
     issued before the claim existed) all sessions are revoked. The current
     password is checked like a login (`_confirm_password`).
 
+    A password change or reset committed after the confirmation wins: the
+    request then changes nothing and is refused like a wrong password,
+    without counting towards the lockout (the password was right when it
+    was checked).
+
     Raises:
         WrongPasswordError: `current_password` is wrong, the user has no
-            password credential, or the account is locked.
+            password credential, the account is locked, or the password
+            changed since it was confirmed.
     """
-    await _confirm_password(db, user_id, current_password, request)
+    seen = await _confirm_password(db, user_id, current_password, request)
 
+    # Hashed before any lock is taken. The open email tokens, the other
+    # sessions and the password change in one commit (lock order
+    # email_tokens -> users -> sessions -> password_credentials).
     new_hash = await hash_password(new_password)
-    # Fail closed: end the open email tokens and the other sessions, in one
-    # commit (lock order email_tokens -> users -> sessions), before the
-    # password changes.
-    await crud.invalidate_open_email_tokens(db, user_id, commit=False)
+    await crud.invalidate_open_email_tokens(db, user_id)
     revoked = await crud.revoke_user_sessions(
         db, user_id, reason="password_changed", except_family=keep_session_family
     )
+    # Every password write holds the user lock (taken by the revocation)
+    # or, for the rehash, is conditional on the old hash; so once the
+    # version is still `seen` here, the hash below cannot overwrite a newer
+    # password.
+    if not await crud.mark_password_changed_if_unchanged(db, user_id, seen):
+        await db.rollback()
+        await _audit(
+            db,
+            AuditEventType.LOGIN_FAILED,
+            user_id,
+            request,
+            "Password confirmation, password changed meanwhile",
+        )
+        await db.commit()
+        logger.warning("auth.password_change_credentials_changed", user_id=str(user_id))
+        raise WrongPasswordError()
     await crud.update_password_hash(db, user_id, new_hash)
     await _audit(
         db,
@@ -1388,6 +1530,7 @@ async def change_password(
         request,
         f"Revoked {revoked} other session(s)",
     )
+    await db.commit()
 
     logger.info("auth.password_changed", user_id=str(user_id), revoked_sessions=revoked)
 
@@ -1413,7 +1556,8 @@ async def request_email_change(
         EmailUnchangedError: `new_email` is the current address.
         EmailTakenError: `new_email` belongs to another account.
     """
-    await _confirm_password(db, user.id, current_password, request)
+    user_id = user.id
+    seen = await _confirm_password(db, user_id, current_password, request)
     if new_email == user.email:
         raise EmailUnchangedError()
     if await users_crud.get_user_by_email(db, new_email) is not None:
@@ -1421,26 +1565,45 @@ async def request_email_change(
 
     token_id = await _open_email_token(
         db,
-        user.id,
+        user_id,
         EmailTokenPurpose.CHANGE_EMAIL,
         _EMAIL_TOKEN_LIFETIME,
         new_email=new_email,
     )
+    # A reset or change committed since the confirmation ends this request:
+    # it may have invalidated the open tokens before this one existed. The
+    # user lock (after email_tokens in the lock order) waits for a reset in
+    # flight; a reset that takes it later stamps a `password_changed_at`
+    # after this token's `created_at`, which the redemption refuses.
+    current = await crud.lock_and_get_user(db, user_id)
+    if current is None or current.password_changed_at != seen:
+        await db.rollback()
+        await _audit(
+            db,
+            AuditEventType.LOGIN_FAILED,
+            user_id,
+            request,
+            "Password confirmation, password changed meanwhile",
+        )
+        await db.commit()
+        logger.warning("auth.email_change_credentials_changed", user_id=str(user_id))
+        raise WrongPasswordError()
     await _audit(
         db,
         AuditEventType.EMAIL_VERIFICATION_SENT,
-        user.id,
+        user_id,
         request,
         "Email change requested",
     )
-    await _enqueue_token_email(token_id, user.id, EmailTokenPurpose.CHANGE_EMAIL)
+    await db.commit()
+    await _enqueue_token_email(token_id, user_id, EmailTokenPurpose.CHANGE_EMAIL)
     await _enqueue_email(
         send_email_change_requested_notice_task.kiq,
         token_id,
-        user_id=user.id,
+        user_id=user_id,
         purpose="email_change_requested",
     )
-    logger.info("auth.email_change_requested", user_id=str(user.id))
+    logger.info("auth.email_change_requested", user_id=str(user_id))
 
 
 async def _lock_user_or_skip(db: AsyncSession, user_id: uuid.UUID) -> User | None:
@@ -1477,21 +1640,18 @@ async def admin_lock_user(
     Returns:
         False if the user does not exist (nothing changed), otherwise True.
     """
-    await crud.invalidate_open_email_tokens(db, user_id, commit=False)
+    await crud.invalidate_open_email_tokens(db, user_id)
     user = await _lock_user_or_skip(db, user_id)
     if user is None:
         return False
     user.is_locked = True
     user.locked_until = None
-    revoked = await crud.revoke_user_sessions(
-        db, user_id, reason="admin_lock", commit=False
-    )
+    revoked = await crud.revoke_user_sessions(db, user_id, reason="admin_lock")
     await _audit(
         db,
         AuditEventType.ACCOUNT_LOCKED,
         user_id,
         detail=f"Locked by admin {actor}, revoked {revoked} session(s)",
-        commit=False,
         ip_address=ip_address,
     )
     await db.commit()
@@ -1528,7 +1688,6 @@ async def admin_unlock_user(
         AuditEventType.ACCOUNT_UNLOCKED,
         user_id,
         detail=f"Unlocked by admin {actor}",
-        commit=False,
         ip_address=ip_address,
     )
     await db.commit()
@@ -1558,20 +1717,17 @@ async def admin_deactivate_user(
     Returns:
         False if the user does not exist (nothing changed), otherwise True.
     """
-    await crud.invalidate_open_email_tokens(db, user_id, commit=False)
+    await crud.invalidate_open_email_tokens(db, user_id)
     user = await _lock_user_or_skip(db, user_id)
     if user is None:
         return False
     user.is_active = False
-    revoked = await crud.revoke_user_sessions(
-        db, user_id, reason="admin_deactivate", commit=False
-    )
+    revoked = await crud.revoke_user_sessions(db, user_id, reason="admin_deactivate")
     await _audit(
         db,
         AuditEventType.ACCOUNT_DEACTIVATED,
         user_id,
         detail=f"Deactivated by admin {actor}, revoked {revoked} session(s)",
-        commit=False,
         ip_address=ip_address,
     )
     await db.commit()
@@ -1606,7 +1762,6 @@ async def admin_reactivate_user(
         AuditEventType.ACCOUNT_REACTIVATED,
         user_id,
         detail=f"Reactivated by admin {actor}",
-        commit=False,
         ip_address=ip_address,
     )
     await db.commit()
@@ -1646,7 +1801,6 @@ async def admin_force_password_change(
         AuditEventType.PASSWORD_CHANGE_FORCED,
         user_id,
         detail=f"Password change forced by admin {actor}",
-        commit=False,
         ip_address=ip_address,
     )
     await db.commit()
@@ -1691,7 +1845,6 @@ async def admin_revoke_session(
         AuditEventType.SESSION_REVOKED,
         user_id,
         detail=f"Session {session_id} revoked by admin {actor}",
-        commit=False,
         ip_address=ip_address,
     )
     await db.commit()

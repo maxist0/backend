@@ -50,7 +50,7 @@ Every table of the built-in modules follows these rules, and a new module gets t
 
 ## Transactions
 
-The service owns the transaction: it calls `commit()` once its work is done, and enqueues background tasks only after that. A crud function does not commit in a new module ([modules.md](modules.md#step-5-the-queries)). The `users` and `auth` crud functions still commit themselves; moving that into the services is Roadmap Phase 4.
+The service owns the transaction: it calls `await db.commit()` once per use case, when its work is done, and enqueues background tasks only after that. A crud function never commits or rolls back; it may `flush()` to get generated values or to raise an `IntegrityError` where the service can map it ([modules.md](modules.md#step-5-the-queries)). `tests/unit/core/test_crud_transactions.py` checks every module's `crud.py`. A service commits a second time within a use case only on purpose, with a comment saying why: to keep writes that a following error would roll back, or to release a row lock before slow work such as Argon2 hashing. The `auth` flows that do this are listed in [authentication.md → Serialisation](authentication.md#serialisation). `get_db` never commits; it rolls back when the request raises.
 
 `expire_on_commit=False` means objects keep their loaded values after a commit, without a hidden reload. Re-read an object after a commit when another transaction may have changed it.
 
@@ -60,12 +60,12 @@ The service owns the transaction: it calls `commit()` once its work is done, and
 - Avoid lazy loads in async code (they raise): use `selectinload` or `joinedload` in the query, or `await db.refresh(obj, [...])`.
 - Return ORM objects from crud and service functions and convert them to response models in the service or router; never return an ORM object from a route.
 - Bound every list: a route takes `limit` and `offset` with a maximum; order by a stable key.
-- Lock rows in the documented order: `email_tokens` → `users` → `sessions` ([authentication.md](authentication.md#serialisation)).
+- Lock rows in the documented order: `email_tokens` → `users` → `sessions` → `password_credentials` ([authentication.md](authentication.md#serialisation)).
 - Database error text can contain user data. Code that reacts to a database error uses `constraint_name(exc)` or the SQLSTATE from `app.core`, and logs with `log_unexpected_error`.
 
 ## Schema: users and auth
 
-The five tables of the built-in `users` and `auth` modules. Source of truth: the models (`src/app/modules/users/models.py`, `src/app/modules/auth/models.py`) and the Alembic migration. This section was checked on 2026-11-22 against `\d <table>` of a database migrated to the head revision.
+The five tables of the built-in `users` and `auth` modules. Source of truth: the models (`src/app/modules/users/models.py`, `src/app/modules/auth/models.py`) and the Alembic migrations. This section was checked on 2026-11-22 against `\d <table>` of a database migrated to the head revision.
 
 All primary keys are UUIDv7 generated in the application (`pk_<table>`). `created_at` and `updated_at` have the server default `now()`; the other defaults (`uuid7()`, `False`, `0`) are set by SQLAlchemy, so those columns have no server default. Timestamps are `timestamptz` in UTC. Your own modules follow the same rules: see [Model conventions](#model-conventions).
 
@@ -91,6 +91,7 @@ The identity of an account.
 | `is_locked` | boolean | no | with `locked_until` NULL: admin lock; with a time: timed lock |
 | `failed_login_attempts` | integer | no | counter for the timed lock |
 | `locked_until` | timestamptz | yes | end of a timed lock |
+| `password_changed_at` | timestamptz | yes | credential version: set by every password change and reset, not by a rehash; NULL = never changed. A login succeeds only if it is unchanged since the login read the hash ([authentication.md](authentication.md#serialisation)) |
 | `created_at`, `updated_at` | timestamptz | no | |
 | `last_login_at` | timestamptz | yes | |
 
@@ -145,7 +146,7 @@ Single-use tokens mailed to a user. Only the SHA-256 hash of the token value is 
 | `expires_at` | timestamptz | no | index `ix_email_tokens_expires_at` |
 | `used_at` | timestamptz | yes | set when the token is redeemed |
 | `invalidated_at` | timestamptz | yes | set when a newer token or a security event closes it |
-| `created_at` | timestamptz | no | |
+| `created_at` | timestamptz | no | written by the application (`utcnow()`, the clock of `users.password_changed_at`); the server default only fills rows written outside the ORM. A token not created after the owner's `password_changed_at` is dead ([authentication.md](authentication.md#flows)) |
 
 The cleanup task deletes closed tokens, and with them `new_email` and `previous_email`, after the retention.
 
@@ -170,12 +171,20 @@ The column stores the values of `AuditEventType`: `register`, `login_success`, `
 | Revision | Message |
 |---|---|
 | `b799370af501` | baseline: the complete schema of `users` and `auth` |
+| `57d93cf19427` | add `users.password_changed_at` (nullable, no backfill, no table rewrite) |
 
 On 2026-11-22 this baseline replaced the revisions `37a0d49f8bbc`, `8b82d1b725c0` and `14e82733e84f`; no data existed on any of them. A local database created before that is still stamped with a deleted revision, and Alembic stops with "Can't locate revision". Recreate it; never `alembic stamp` it onto the baseline, because its schema differs from the baseline's (enum types, constraint names, columns) and `stamp` changes only the version row:
 
 ```bash
 docker compose -f compose.dev.yaml down -v
 docker compose -f compose.dev.yaml up -d --wait
+ENVIRONMENT=dev uv run alembic upgrade head
+```
+
+Against a natively installed PostgreSQL (for example the Windows service `postgresql-x64-18`) there is no volume to delete: drop and recreate the database instead. This deletes all its data. Adjust the database name to your `DATABASE_URL`:
+
+```bash
+psql -U postgres -h localhost -d postgres -c "DROP DATABASE api WITH (FORCE);" -c "CREATE DATABASE api;"
 ENVIRONMENT=dev uv run alembic upgrade head
 ```
 

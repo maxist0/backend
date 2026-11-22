@@ -135,7 +135,7 @@ Die Spalte „Rest“ stammt aus der Roadmap und den Known issues im [Backend-RE
 |---|---|---|
 | 0, 0b | umgesetzt, Commit `6c34199` | nichts |
 | 1 Fundament und Tooling | umgesetzt durch das Cleanup (Core/Module, Factory, Test-Harness, Upgrades, taskiq, ruff, mypy und pyright strict) | Task-Runner, pre-commit |
-| 2 Datenschicht | offen; der Cleanup-Job ist erledigt (S2.3) | Unit of Work, UUIDv7 (D10), neue Baseline, Constraint-Namen, absolute Session-Lebensdauer (Known issue 26) |
+| 2 Datenschicht | umgesetzt: Cleanup-Job (S2.3), Schema-Konventionen mit UUIDv7 (D10), Constraint-Namen, absoluter Session-Lebensdauer und neuer Baseline (`7ca76b7`), Unit of Work (Crud committet nie, der Service einmal pro Use Case; ohne `transaction()`-Helfer) | nichts |
 | 3 API-Vertrag | größtenteils umgesetzt durch S1.3 bis S1.5 (RFC 9457, `/api/v1`, `response_model`, E-Mail-Wechsel) | Cookie `Secure` (Known issue 8), `iss` und `aud`, eigene Token-Fehlercodes, Einladungen, `must_change` (Known issue 16) |
 | 4 Security-Features | offen | Rate-Limiting (D4, Known issues 17 und 23), Admin-Entscheidung (D2), RBAC (D3), HSTS und CSP, Body-Limit und Timeout |
 | 5 Observability | Middleware, Logging, Metriken und Health umgesetzt (S1.4) | Tracing, DB-Pool- und Cache-Metriken, Alerting |

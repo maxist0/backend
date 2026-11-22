@@ -258,15 +258,28 @@ class TestChangeMyEmail:
         assert client.post(VERIFY_URL, json={"token": second}).status_code == 204
         assert db.scalar("SELECT email FROM users") == "second@example.com"
 
+    @pytest.mark.parametrize("decided_by", ["recheck", "unique_constraint"])
     def test_address_taken_between_request_and_confirm_returns_409(
-        self, client: TestClient, captured_emails: CapturedEmails, db: Db
+        self,
+        client: TestClient,
+        captured_emails: CapturedEmails,
+        db: Db,
+        monkeypatch: pytest.MonkeyPatch,
+        decided_by: str,
     ) -> None:
+        """The re-check answers 409; in a race the unique constraint does."""
         token = register_and_login(client)
         change_email(client, token, "contested@example.com")
         mail_token = captured_emails.latest_token(
             "contested@example.com", "change_email"
         )
         register(client, username="bob", email="contested@example.com")
+        if decided_by == "unique_constraint":
+
+            async def _not_found(*_args: object, **_kwargs: object) -> None:
+                return None
+
+            monkeypatch.setattr("app.modules.users.crud.get_user_by_email", _not_found)
 
         r = client.post(VERIFY_URL, json={"token": mail_token})
 

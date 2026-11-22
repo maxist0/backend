@@ -218,6 +218,13 @@ class TestPasswordConfirmationLockout:
 
         # Locked: the correct password is refused too, here and at login.
         assert confirm(client, alice.access, PASSWORD).status_code == 400
+        assert (
+            db.scalar(
+                "SELECT count(*) FROM auth_audit_log "
+                "WHERE detail = 'Password confirmation, account locked'"
+            )
+            == 1
+        )
         assert login(client, username="alice").status_code == 401
         # Like a login lockout, the timed lock does not end the sessions.
         assert (

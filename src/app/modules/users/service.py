@@ -45,4 +45,5 @@ async def update_profile(
     if display_name is not None:
         user.display_name = display_name
     await crud.update_user(db, user)
+    await db.commit()
     return user

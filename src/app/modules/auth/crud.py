@@ -3,12 +3,26 @@
 Credentials, sessions, email tokens and the audit log, plus the lockout
 counters and the per-user lock on `users`. PostgreSQL is the single source
 of truth for sessions (refresh tokens); nothing is cached in Redis.
+
+No function here commits or rolls back: the calling service owns the
+transaction and decides when it ends.
 """
 
 import uuid
 from datetime import datetime, timedelta
 
-from sqlalchemy import and_, case, delete, func, not_, null, or_, select, update
+from sqlalchemy import (
+    ColumnElement,
+    and_,
+    case,
+    delete,
+    func,
+    not_,
+    null,
+    or_,
+    select,
+    update,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import get_logger, utcnow
@@ -34,10 +48,11 @@ async def lock_user(db: AsyncSession, user_id: uuid.UUID) -> None:
     and the next statement after the wait sees what the previous holder
     committed (READ COMMITTED takes a new snapshot per statement).
 
-    Lock order everywhere: `email_tokens` -> `users` -> `sessions`.
+    Lock order everywhere: `email_tokens` -> `users` -> `sessions` ->
+    `password_credentials`.
     `NO KEY UPDATE` (not `UPDATE`) leaves the `KEY SHARE` locks of
     foreign-key checks free: inserts into sessions or auth_audit_log for
-    this user do not wait. Does not commit. No-op for an unknown user.
+    this user do not wait. No-op for an unknown user.
     """
     await db.execute(
         select(User.id).where(User.id == user_id).with_for_update(key_share=True)
@@ -48,7 +63,7 @@ async def lock_and_get_user(db: AsyncSession, user_id: uuid.UUID) -> User | None
     """`lock_user` that also returns the current row (fresh, not cached).
 
     `populate_existing` overwrites an instance already in the session's
-    identity map with the values read under the lock. Does not commit.
+    identity map with the values read under the lock.
     """
     result = await db.execute(
         select(User)
@@ -77,14 +92,18 @@ async def get_lock_state(
 
 
 async def record_successful_login(
-    db: AsyncSession, user_id: uuid.UUID
+    db: AsyncSession, user_id: uuid.UUID, password_changed_at: datetime | None
 ) -> datetime | None:
-    """Reset the failure counter, but only if no lock is active right now.
+    """Reset the failure counter, unless locked or the password changed.
 
     One conditional `UPDATE ... RETURNING`: a lock committed by a parallel
-    wrong guess after this request checked the lock still wins. An expired
+    wrong guess after this request checked the lock still wins, and so does
+    a password change or reset committed after this request read the hash
+    it verified (`password_changed_at` is the value read with that hash).
+    Under READ COMMITTED a row changed by a concurrent transaction is
+    re-checked against the condition before it is updated. An expired
     timed lock is cleared. Returns the new `last_login_at`, or None when
-    the account is locked (or gone). Commits.
+    the account is locked, its password changed meanwhile, or it is gone.
     """
     lock_active = and_(
         User.is_locked.is_(True),
@@ -92,7 +111,11 @@ async def record_successful_login(
     )
     result = await db.execute(
         update(User)
-        .where(User.id == user_id, not_(lock_active))
+        .where(
+            User.id == user_id,
+            not_(lock_active),
+            User.password_changed_at.is_not_distinct_from(password_changed_at),
+        )
         .values(
             failed_login_attempts=0,
             is_locked=False,
@@ -104,7 +127,6 @@ async def record_successful_login(
         .execution_options(synchronize_session=False)
     )
     row = result.first()
-    await db.commit()
     return row[0] if row is not None else None
 
 
@@ -113,7 +135,7 @@ async def reset_failed_logins(db: AsyncSession, user_id: uuid.UUID) -> bool:
 
     The conditional `UPDATE` of `record_successful_login` without
     `last_login_at`: a lock committed meanwhile wins, an expired timed lock
-    is cleared. Returns False when the account is locked (or gone). Commits.
+    is cleared. Returns False when the account is locked (or gone).
     """
     lock_active = and_(
         User.is_locked.is_(True),
@@ -131,9 +153,35 @@ async def reset_failed_logins(db: AsyncSession, user_id: uuid.UUID) -> bool:
         .returning(User.id)
         .execution_options(synchronize_session=False)
     )
-    found = result.first() is not None
-    await db.commit()
-    return found
+    return result.first() is not None
+
+
+async def clear_expired_lock(db: AsyncSession, user_id: uuid.UUID) -> bool:
+    """Lift a timed lock that has run out, and reset the failure counter.
+
+    Conditional on the stored lock still being expired, so a lock committed
+    after the caller's check is never erased. Expiry is judged on the
+    application clock, like `User.is_lock_active`. Returns True if this
+    call lifted the lock.
+    """
+    result = await db.execute(
+        update(User)
+        .where(
+            User.id == user_id,
+            User.is_locked.is_(True),
+            User.locked_until.is_not(None),
+            User.locked_until <= utcnow(),
+        )
+        .values(
+            failed_login_attempts=0,
+            is_locked=False,
+            locked_until=None,
+            updated_at=func.now(),
+        )
+        .returning(User.id)
+        .execution_options(synchronize_session=False)
+    )
+    return result.first() is not None
 
 
 async def register_failed_login(
@@ -153,7 +201,7 @@ async def register_failed_login(
     The request whose failure reaches `max_attempts` is still exactly one.
 
     Returns `(failed_login_attempts, is_locked, locked_until)` or None if
-    the user does not exist. Commits.
+    the user does not exist.
     """
     # All SET expressions read the row as it was before this UPDATE.
     lock_expired = and_(
@@ -189,7 +237,6 @@ async def register_failed_login(
         .returning(User.failed_login_attempts, User.is_locked, User.locked_until)
     )
     row = result.first()
-    await db.commit()
     if row is None:
         return None
     return row[0], row[1], row[2]
@@ -198,38 +245,93 @@ async def register_failed_login(
 async def create_password_credential(
     db: AsyncSession, credential: PasswordCredential
 ) -> PasswordCredential:
-    """Insert a password credential and commit."""
+    """Add a password credential to the session."""
     db.add(credential)
-    await db.commit()
     return credential
 
 
-async def get_password_credential(
+async def get_password_version(
     db: AsyncSession, user_id: uuid.UUID
-) -> PasswordCredential | None:
-    """Return the user's password credential, or None."""
+) -> tuple[str, datetime | None] | None:
+    """Return `(password_hash, users.password_changed_at)` in one statement.
+
+    One statement reads both from one snapshot, so the version always
+    belongs to the hash. None if the user has no password credential.
+    """
     result = await db.execute(
-        select(PasswordCredential).where(PasswordCredential.user_id == user_id)
+        select(PasswordCredential.password_hash, User.password_changed_at)
+        .join(User, User.id == PasswordCredential.user_id)
+        .where(PasswordCredential.user_id == user_id)
     )
-    return result.scalars().first()
+    row = result.first()
+    if row is None:
+        return None
+    return row[0], row[1]
 
 
 async def update_password_hash(
-    db: AsyncSession, user_id: uuid.UUID, new_hash: str
-) -> None:
-    """Replace the user's password hash and commit."""
-    await db.execute(
+    db: AsyncSession,
+    user_id: uuid.UUID,
+    new_hash: str,
+    *,
+    expected_hash: str | None = None,
+) -> bool:
+    """Replace the user's password hash.
+
+    With `expected_hash` only that hash is replaced, so a rehash never
+    overwrites a password changed meanwhile. Returns True if a row changed.
+    """
+    conditions = [PasswordCredential.user_id == user_id]
+    if expected_hash is not None:
+        conditions.append(PasswordCredential.password_hash == expected_hash)
+    result = await db.execute(
         update(PasswordCredential)
-        .where(PasswordCredential.user_id == user_id)
+        .where(*conditions)
         .values(password_hash=new_hash, updated_at=utcnow())
+        .returning(PasswordCredential.id)
     )
-    await db.commit()
+    return result.first() is not None
+
+
+async def mark_password_changed(db: AsyncSession, user_id: uuid.UUID) -> None:
+    """Set `users.password_changed_at` to now: a new credential version.
+
+    The application clock, like the `iat` of the access tokens it is
+    compared with (`User.password_changed_after`).
+    """
+    await db.execute(
+        update(User)
+        .where(User.id == user_id)
+        .values(password_changed_at=utcnow(), updated_at=func.now())
+        .execution_options(synchronize_session=False)
+    )
+
+
+async def mark_password_changed_if_unchanged(
+    db: AsyncSession, user_id: uuid.UUID, seen: datetime | None
+) -> bool:
+    """`mark_password_changed`, only if the version is still `seen`.
+
+    Returns False, and changes nothing, if a password change or reset was
+    committed since `seen` was read.
+    """
+    result = await db.execute(
+        update(User)
+        .where(
+            User.id == user_id,
+            User.password_changed_at.is_not_distinct_from(seen),
+        )
+        .values(password_changed_at=utcnow(), updated_at=func.now())
+        .returning(User.id)
+        .execution_options(synchronize_session=False)
+    )
+    return result.first() is not None
 
 
 async def set_password_must_change(db: AsyncSession, user_id: uuid.UUID) -> bool:
     """Flag the user's password for a forced change.
 
-    Does not commit. Returns False if the user has no password credential.
+    Returns False if the user has no password credential.
     """
     result = await db.execute(
         update(PasswordCredential)
@@ -241,9 +343,8 @@ async def set_password_must_change(db: AsyncSession, user_id: uuid.UUID) -> bool
 
 
 async def create_session(db: AsyncSession, session: Session) -> Session:
-    """Insert a refresh-token session and commit."""
+    """Add a refresh-token session to the session."""
     db.add(session)
-    await db.commit()
     return session
 
 
@@ -285,9 +386,9 @@ async def rotate_session(db: AsyncSession, token_hash: str) -> datetime | None:
     current values. Returns the family's end (`family_expires_at`) or None
     if the token is unknown, revoked or expired.
 
-    The caller holds the user lock (`lock_user`) already. Does NOT commit:
-    the caller writes the successor session in the same transaction, so a
-    revocation or replay that queues on the user lock sees the successor.
+    The caller holds the user lock (`lock_user`) already and writes the
+    successor session in the same transaction, so a revocation or replay
+    that queues on the user lock sees the successor.
     """
     result = await db.execute(
         update(Session)
@@ -315,8 +416,6 @@ async def revoke_user_sessions(
     user_id: uuid.UUID,
     reason: str,
     except_family: uuid.UUID | None = None,
-    *,
-    commit: bool = True,
 ) -> int:
     """Revoke every active session of a user, optionally keeping one family.
 
@@ -328,8 +427,7 @@ async def revoke_user_sessions(
 
     Takes the user lock first, so a refresh rotating a session of this user
     right now finishes before, and its successor is revoked as well.
-    Returns the number of revoked sessions. Commits, unless `commit=False`:
-    then the caller's next commit includes the revocation.
+    Returns the number of revoked sessions.
     """
     await lock_user(db, user_id)
     conditions = [
@@ -345,10 +443,7 @@ async def revoke_user_sessions(
         .values(is_revoked=True, revoke_reason=reason, revoked_at=func.now())
         .returning(Session.id)
     )
-    revoked = len(result.all())
-    if commit:
-        await db.commit()
-    return revoked
+    return len(result.all())
 
 
 async def get_session_user_id(
@@ -368,8 +463,8 @@ async def revoke_active_session(
     """Revoke one session if it is still active.
 
     A session revoked earlier keeps its original reason and time. The
-    caller holds the user lock (`lock_user`). Does not commit. Returns True
-    if the session was revoked by this call.
+    caller holds the user lock (`lock_user`). Returns True if the session
+    was revoked by this call.
     """
     result = await db.execute(
         update(Session)
@@ -389,8 +484,7 @@ async def revoke_family(
     """Revoke all active sessions in a rotation family.
 
     Takes the user lock first (same order as every other revocation).
-    Returns the number of revoked sessions. Always commits, also when no
-    row was active, so earlier writes of the caller's transaction persist.
+    Returns the number of revoked sessions.
     """
     await lock_user(db, user_id)
     result = await db.execute(
@@ -403,19 +497,50 @@ async def revoke_family(
         .values(is_revoked=True, revoke_reason=reason, revoked_at=func.now())
         .returning(Session.id)
     )
-    revoked = len(result.all())
-    await db.commit()
-    return revoked
+    return len(result.all())
 
 
-async def create_email_token(
-    db: AsyncSession, token: EmailToken, *, commit: bool = True
-) -> EmailToken:
-    """Add an email token; with `commit=False` the caller's commit writes it."""
+async def create_email_token(db: AsyncSession, token: EmailToken) -> EmailToken:
+    """Add an email token to the session."""
     db.add(token)
-    if commit:
-        await db.commit()
     return token
+
+
+def _created_after_password_change() -> ColumnElement[bool]:
+    """Email-token condition: created after the owner's last password change.
+
+    A token created before it (or at the same instant) is dead, also when
+    the change did not see it to invalidate it. A plain sub-select on
+    `users`: it takes no lock there, so the lock order is unchanged.
+    """
+    return not_(
+        select(User.id)
+        .where(
+            User.id == EmailToken.user_id,
+            User.password_changed_at >= EmailToken.created_at,
+        )
+        .exists()
+    )
+
+
+async def email_token_is_open(
+    db: AsyncSession, token_hash: str, purpose: EmailTokenPurpose
+) -> bool:
+    """Tell whether a token of `purpose` with this hash is open, without locking.
+
+    A pre-check only: the redemption (`consume_email_token`) decides.
+    """
+    result = await db.execute(
+        select(EmailToken.id).where(
+            EmailToken.token_hash == token_hash,
+            EmailToken.purpose == purpose,
+            EmailToken.used_at.is_(None),
+            EmailToken.invalidated_at.is_(None),
+            EmailToken.expires_at > func.now(),
+            _created_after_password_change(),
+        )
+    )
+    return result.first() is not None
 
 
 async def lock_open_email_token(
@@ -423,12 +548,12 @@ async def lock_open_email_token(
 ) -> EmailToken | None:
     """Lock and return an email token if it is still open.
 
-    Open means not used, not invalidated and not expired. The row lock
+    Open means not used, not invalidated, not expired and created after
+    the owner's last password change. The row lock
     (`FOR NO KEY UPDATE`, held until the transaction ends) makes a
     redemption or an invalidation of this token wait, so it sees the hash
     the caller sets; a token that a committed change closed meanwhile is
-    not returned. `email_tokens` is first in the lock order. Does not
-    commit.
+    not returned. `email_tokens` is first in the lock order.
     """
     result = await db.execute(
         select(EmailToken)
@@ -437,8 +562,9 @@ async def lock_open_email_token(
             EmailToken.used_at.is_(None),
             EmailToken.invalidated_at.is_(None),
             EmailToken.expires_at > func.now(),
+            _created_after_password_change(),
         )
-        .with_for_update(key_share=True)
+        .with_for_update(key_share=True, of=EmailToken)
     )
     return result.scalars().first()
 
@@ -446,7 +572,7 @@ async def lock_open_email_token(
 async def set_email_token_hash(
     db: AsyncSession, token_id: uuid.UUID, token_hash: str
 ) -> None:
-    """Replace the stored hash of an email token. Does not commit."""
+    """Replace the stored hash of an email token."""
     await db.execute(
         update(EmailToken)
         .where(EmailToken.id == token_id)
@@ -456,7 +582,7 @@ async def set_email_token_hash(
 
 
 async def invalidate_email_token(db: AsyncSession, token_id: uuid.UUID) -> None:
-    """Soft-invalidate one email token. Does not commit."""
+    """Soft-invalidate one email token."""
     await db.execute(
         update(EmailToken)
         .where(EmailToken.id == token_id, EmailToken.invalidated_at.is_(None))
@@ -473,10 +599,12 @@ async def consume_email_token(
     `UPDATE ... SET used_at = now() WHERE <still valid> RETURNING`: of
     several concurrent redemptions exactly one gets a row. Returns
     `(token_id, user_id, purpose, new_email)` or None if the token is
-    unknown, used, invalidated, expired or of another purpose.
+    unknown, used, invalidated, expired, of another purpose, or created
+    before the owner's last password change. Such a token is refused, not
+    marked: the condition cannot become true again.
 
-    Does NOT commit: the caller's next write commits it together with the
-    effect of the token (a failure before that rolls the redemption back).
+    The caller commits it together with the effect of the token, so a
+    failure before that rolls the redemption back.
     """
     result = await db.execute(
         update(EmailToken)
@@ -486,6 +614,7 @@ async def consume_email_token(
             EmailToken.used_at.is_(None),
             EmailToken.invalidated_at.is_(None),
             EmailToken.expires_at > func.now(),
+            _created_after_password_change(),
         )
         .values(used_at=func.now())
         .returning(
@@ -501,7 +630,7 @@ async def consume_email_token(
 async def set_email_token_previous_email(
     db: AsyncSession, token_id: uuid.UUID, previous_email: str
 ) -> None:
-    """Store the address an email change replaces. Does not commit."""
+    """Store the address an email change replaces."""
     await db.execute(
         update(EmailToken)
         .where(EmailToken.id == token_id)
@@ -520,13 +649,8 @@ async def invalidate_tokens_for_user_purpose(
     db: AsyncSession,
     user_id: uuid.UUID,
     purpose: EmailTokenPurpose,
-    *,
-    commit: bool = True,
 ) -> None:
-    """Soft-invalidate the user's open tokens of `purpose`.
-
-    With `commit=False` the caller's next commit includes the invalidation.
-    """
+    """Soft-invalidate the user's open tokens of `purpose`."""
     await db.execute(
         update(EmailToken)
         .where(
@@ -539,18 +663,14 @@ async def invalidate_tokens_for_user_purpose(
         )
         .values(invalidated_at=utcnow())
     )
-    if commit:
-        await db.commit()
 
 
-async def invalidate_open_email_tokens(
-    db: AsyncSession, user_id: uuid.UUID, *, commit: bool = True
-) -> None:
+async def invalidate_open_email_tokens(db: AsyncSession, user_id: uuid.UUID) -> None:
     """Soft-invalidate every open email token of the user, of any purpose.
 
     Ends a pending verification, email change and password reset at once.
     `email_tokens` comes first in the lock order, so call this before the
-    user lock. With `commit=False` the caller's next commit includes it.
+    user lock.
     """
     await db.execute(
         update(EmailToken)
@@ -561,17 +681,11 @@ async def invalidate_open_email_tokens(
         )
         .values(invalidated_at=utcnow())
     )
-    if commit:
-        await db.commit()
 
 
-async def create_audit_log(
-    db: AsyncSession, log: AuthAuditLog, *, commit: bool = True
-) -> AuthAuditLog:
-    """Add an audit entry; with `commit=False` the caller's commit writes it."""
+async def create_audit_log(db: AsyncSession, log: AuthAuditLog) -> AuthAuditLog:
+    """Add an audit entry to the session."""
     db.add(log)
-    if commit:
-        await db.commit()
     return log
 
 
@@ -613,7 +727,7 @@ async def delete_ended_sessions(
 
     Rows locked by another transaction (a revocation, a second cleanup run)
     are skipped (`SKIP LOCKED`), so this never waits on a row lock and never
-    joins a deadlock. Takes no user lock. Does not commit.
+    joins a deadlock. Takes no user lock.
 
     Returns:
         The number of deleted sessions.
@@ -646,8 +760,8 @@ async def delete_closed_email_tokens(
     Closed means expired, and also last changed (used or invalidated)
     before the cutoff. Every token expires within a day of its request, so
     this removes used, invalidated and never redeemed tokens alike, together
-    with their `new_email` and `previous_email`. Rows locked by another transaction are
-    skipped (`SKIP LOCKED`). Does not commit.
+    with their `new_email` and `previous_email`. Rows locked by another
+    transaction are skipped (`SKIP LOCKED`).
 
     Returns:
         The number of deleted tokens.

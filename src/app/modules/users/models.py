@@ -57,6 +57,12 @@ class User(UUIDPrimaryKey, Timestamps, Base):
     locked_until: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Credential version: set by every password change or reset, never by a
+    # rehash. A login only succeeds if it is still the value read together
+    # with the hash it verified. NULL: never changed.
+    password_changed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     last_login_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
@@ -79,6 +85,18 @@ class User(UUIDPrimaryKey, Timestamps, Base):
         lock. A timed lock ends once `locked_until` lies in the past.
         """
         return lock_is_active(self.is_locked, self.locked_until, now)
+
+    def password_changed_after(self, issued_at: int) -> bool:
+        """Return True if the password changed after a token's `iat`.
+
+        `issued_at` is a JWT `iat` in whole seconds, so the change time is
+        cut to whole seconds too: a token issued in the same second as the
+        change counts as newer, even if it predates the change by up to a
+        second.
+        """
+        if self.password_changed_at is None:
+            return False
+        return issued_at < int(self.password_changed_at.timestamp())
 
     def is_admin_locked(self) -> bool:
         """Return True for the indefinite (admin) lock: `locked_until IS NULL`.

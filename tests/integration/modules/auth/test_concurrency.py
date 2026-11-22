@@ -8,8 +8,8 @@
 * `TestConcurrentRegistration`: a racing duplicate registration yields one 201
   and no 500, and the `IntegrityError` text (`DETAIL: Key (email)=(..)`) never
   reaches the log.
-* `TestAccountDisabledRefresh`: `revoke_family` commits only if it found rows,
-  so a retry after the denied refresh must not look like token reuse.
+* `TestAccountDisabledRefresh`: the denied refresh commits its revocation as
+  `account_disabled`, so a retry with the same token must not look like reuse.
 * `TestEmailTokensSingleUse`: parallel redemptions of one email token succeed
   exactly once.
 
@@ -577,10 +577,9 @@ class TestAccountDisabledRefresh:
         monkeypatch: pytest.MonkeyPatch,
         disable_sql: str,
     ) -> None:
-        """`revoke_family` commits the revocation on its own.
+        """The denied refresh commits the revocation, audit row or not.
 
-        `_audit` is stubbed, so no later audit insert can commit it as a side
-        effect.
+        `_audit` is stubbed, so no audit insert is part of the commit.
         """
         register_ok(client, username="alice")
         t0 = login_tokens(client, "alice")
@@ -596,6 +595,27 @@ class TestAccountDisabledRefresh:
 
         assert r.status_code == 401
         assert db.scalar("SELECT count(*) FROM sessions WHERE NOT is_revoked") == 0
+
+    @pytest.mark.usefixtures("captured_emails")
+    @pytest.mark.parametrize("disable_sql", _DISABLE.values(), ids=_DISABLE.keys())
+    def test_denied_refresh_commits_the_revocation_with_its_audit_row(
+        self, client: TestClient, db: Db, disable_sql: str
+    ) -> None:
+        register_ok(client, username="alice")
+        t0 = login_tokens(client, "alice")
+        db.execute(f"UPDATE users SET {disable_sql} WHERE username = 'alice'")
+
+        r = _refresh_raw(client, t0.refresh)[0]
+        client.cookies.clear()
+
+        assert r.status_code == 401
+        assert db.scalar("SELECT count(*) FROM sessions WHERE NOT is_revoked") == 0
+        assert (
+            db.scalar(
+                "SELECT detail FROM auth_audit_log WHERE event_type = 'session_revoked'"
+            )
+            == "Refresh denied: account inactive or locked, revoked 1 session(s)"
+        )
 
 
 class TestEmailTokensSingleUse:

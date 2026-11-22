@@ -35,6 +35,8 @@ class TokenData(BaseModel):
     jti: str
     # Refresh-token family id (claim `sid`); None for tokens issued before it existed.
     session_id: str | None = None
+    # Claim `iat` in whole seconds since the epoch (JWT NumericDate).
+    issued_at: int
 
 
 # Pinned in code, never taken from configuration or from the token header
@@ -141,6 +143,8 @@ def decode_token(token: str) -> TokenData | None:  # noqa: PLR0911 - one exit pe
         username=username if isinstance(username, str) else None,
         jti=jti,
         session_id=session_id,
+        # PyJWT has already checked that `iat` converts with int().
+        issued_at=int(payload["iat"]),
     )
 
 

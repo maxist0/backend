@@ -67,7 +67,7 @@ src/app/modules/<name>/
   router.py         HTTP routes: thin, typed, one service call each
   schemas.py        Pydantic request/response models
   service.py        business logic; owns the transaction
-  crud.py           database queries; no business rules
+  crud.py           database queries; no business rules, never commits
   models.py         SQLAlchemy models
   dependencies.py   FastAPI dependencies
   errors.py         AppError subclasses with the module's error codes
@@ -88,6 +88,7 @@ Step by step with a complete example: [documentation/modules.md](documentation/m
 ## Architecture rules
 
 - Layering inside a module: `router → service → crud → models`. Routers never query the DB; services never build HTTP responses; crud contains no business rules. Create only the files the module needs.
+- The service owns the transaction (unit of work). crud never calls `commit()` or `rollback()`; it may `flush()` to get generated values or to raise an `IntegrityError` where the service maps it. The service ends each use case with one `await db.commit()` and enqueues tasks after it. A second commit inside a use case needs a comment saying why: writes that a following error would roll back (failed-login counters, audit rows), a row lock that must not last over Argon2 or an enqueue, batches. `get_db` never commits. `tests/unit/core/test_crud_transactions.py` enforces the crud rule for every module.
 - Routers are thin: validate via Pydantic, call one service function, return a typed response. Every route declares `response_model` (or a return annotation), `status_code`, `summary` and the error `responses` it can produce.
 - Dependencies use `Annotated`: `db: DbSession`, `user: CurrentUser`. Never instantiate `AsyncSession` yourself. Use `Depends(..., scope="function")` only when cleanup must happen before the response is sent.
 - Lifespan is the only startup/shutdown mechanism. No `on_event`, no work at import time.

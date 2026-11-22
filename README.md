@@ -90,7 +90,7 @@ uv run python run.py dev
 
 Without `ENVIRONMENT=dev`, Alembic ignores `.env.local` and stops with "DATABASE_URL is not set" unless you export `DATABASE_URL`.
 
-**Database created before 2026-11-22?** The migrations were replaced by one baseline revision on that day, so an older local database is stamped with a revision that no longer exists, and Alembic stops with "Can't locate revision". Delete it with `docker compose -f compose.dev.yaml down -v`, start it again and migrate ([database.md → Revisions](documentation/database.md#revisions)). Do not `alembic stamp` it onto the baseline: its schema is not the baseline's.
+**Database created before 2026-11-22?** The migrations were replaced by one baseline revision on that day, so an older local database is stamped with a revision that no longer exists, and Alembic stops with "Can't locate revision". Delete it with `docker compose -f compose.dev.yaml down -v` (a natively installed PostgreSQL: `DROP DATABASE` and `CREATE DATABASE`), start it again and migrate ([database.md → Revisions](documentation/database.md#revisions)). Do not `alembic stamp` it onto the baseline: its schema is not the baseline's.
 
 `run.py dev` sets `ENVIRONMENT=dev` and starts three processes:
 
@@ -392,7 +392,7 @@ This is the original implementation plan. The re-prioritised plan from the Novem
 - [x] Startup guard: refuse to boot outside `dev`/`unittest` with a default or weak `JWT_SECRET_KEY`, with (admin panel enabled) a default or weak `ADMIN_PASSWORD`/`ADMIN_SECRET_KEY`, and with a default or non-https `FRONTEND_URL`. Partly: `DATABASE_URL` defaults are not checked.
 - [ ] JWT claims `iss` and `aud`. Done: algorithm pinned, claims `exp`/`iat`/`nbf`/`sub`/`jti` required, `type=access` verified, `sub` must be a UUID. *RFC 8725 checklist satisfied.*
 - [ ] Refresh cookie: `Secure=True` outside `dev`, `SameSite=Strict` where the frontend allows it, `__Secure-` prefix (`__Host-` requires `Path=/` and would widen the cookie's path), explicit `max_age`. The deletion (`_delete_refresh_cookie` in `modules/auth/router.py`) must carry the same attributes.
-- [x] Revoke all sessions on password reset and password change; `POST /auth/logout-all`. (Password change keeps the caller's session.)
+- [x] Revoke all sessions on password reset and password change, in the transaction that writes the new hash; a login or a second change racing it gets nothing, and access tokens issued before it get 401 (`users.password_changed_at`, [authentication.md](documentation/authentication.md#tokens)); `POST /auth/logout-all`. (Password change keeps the caller's session.)
 - [x] Email-change flow: `PUT /users/me/email` creates a pending change, `POST /auth/email/verify` consumes the `CHANGE_EMAIL` token, dedicated template, `EMAIL_CHANGED` audit event; confirming invalidates open password-reset tokens.
 - [ ] Rate limiting with `limits` and Redis: per IP on `/auth/*`, per account on login; `429` with `Retry-After` (D4). Partly mitigated: the timed account lock blocks only password login and leaves existing sessions valid, and a per-process admission limiter bounds login bursts; both remain no substitute for rate limits.
 - [x] Uniform credential error (`invalid_credentials`) for locked, inactive and unknown accounts; the real reason is logged and audited server-side only.
@@ -436,7 +436,7 @@ This is the original implementation plan. The re-prioritised plan from the Novem
 
 ### Phase 4: Data layer
 
-- [ ] Unit of work: crud functions stop committing; the service owns the transaction. Registration becomes atomic. (New modules already follow this: see [modules.md](documentation/modules.md).)
+- [x] Unit of work: crud functions never commit; the service commits once per use case and documents every intended second commit. Registration is atomic. A unit test checks every module's `crud.py` ([database.md → Transactions](documentation/database.md#transactions)).
 - [x] Base model mixins in the core: `UUIDPrimaryKey`, `CreatedAt`, `Timestamps` (server defaults). No `version` column and no soft delete until a module needs them (owner decision 2026-11-22).
 - [x] UUIDv7 primary keys, generated in Python (D10, [ADR 0012](documentation/adr/0012-schema-conventions-uuidv7-value-enums-usernames.md)).
 - [x] Enums as VARCHAR with a CHECK constraint on the values (`value_enum`); usernames unique regardless of case.

@@ -1,4 +1,8 @@
-"""Data-access layer of the users module: queries on `users`."""
+"""Data-access layer of the users module: queries on `users`.
+
+No function here commits or rolls back: the calling service owns the
+transaction.
+"""
 
 import uuid
 
@@ -34,15 +38,23 @@ async def get_user_by_email(db: AsyncSession, email: str) -> User | None:
 
 
 async def create_user(db: AsyncSession, user: User) -> User:
-    """Insert `user` and commit."""
+    """Insert `user` and flush.
+
+    The flush sets the id and raises a unique violation (`IntegrityError`)
+    here, where the caller can map it, rather than at its commit.
+    """
     db.add(user)
-    await db.commit()
+    await db.flush()
     return user
 
 
 async def update_user(db: AsyncSession, user: User) -> User:
-    """Stamp `updated_at` on `user` and commit."""
+    """Stamp `updated_at` on `user` and flush.
+
+    The flush raises a unique violation (`IntegrityError`) here, where the
+    caller can map it, rather than at its commit.
+    """
     user.updated_at = utcnow()
     db.add(user)
-    await db.commit()
+    await db.flush()
     return user

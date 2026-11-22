@@ -177,11 +177,9 @@ class TestRekeying:
         hashes: list[str] = []
         real_create = crud.create_email_token
 
-        async def _spy(
-            db_session: AsyncSession, token: EmailToken, *, commit: bool = True
-        ) -> EmailToken:
+        async def _spy(db_session: AsyncSession, token: EmailToken) -> EmailToken:
             hashes.append(token.token_hash)
-            return await real_create(db_session, token, commit=commit)
+            return await real_create(db_session, token)
 
         monkeypatch.setattr(crud, "create_email_token", _spy)
         register_ok(client, username="alice")

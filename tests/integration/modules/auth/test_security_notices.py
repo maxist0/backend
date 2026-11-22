@@ -696,6 +696,7 @@ class TestRelockAfterAnExpiredLock:
                 await crud.register_failed_login(
                     session, uuid.UUID(user_id), MAXIMUM_LOGIN_ATTEMPTS, 900
                 )
+                await session.commit()
 
         for _ in range(MAXIMUM_LOGIN_ATTEMPTS + 1):
             call_in_app(client, _fail)

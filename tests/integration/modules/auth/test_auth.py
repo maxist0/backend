@@ -7,14 +7,19 @@ in-process; the `captured_emails` fixture records every mail they send
 `captured_emails[addr]` returns the latest token.
 """
 
+from typing import Never
+
 import pytest
+from argon2 import PasswordHasher
 from fastapi.testclient import TestClient
 from httpx2 import Response
 
 from tests.helpers import (
     MAXIMUM_LOGIN_ATTEMPTS,
+    PASSWORD,
     CapturedEmails,
     Db,
+    audit_count,
     bearer,
     login,
     register,
@@ -137,6 +142,35 @@ class TestRegister:
         assert r.status_code == 201
         assert r.json()["email"] == "alice@example.com"
 
+    @pytest.mark.parametrize(
+        "failing_step",
+        ["create_password_credential", "create_email_token", "create_audit_log"],
+    )
+    def test_a_failing_later_step_leaves_no_account_behind(
+        self,
+        client: TestClient,
+        db: Db,
+        captured_emails: CapturedEmails,
+        monkeypatch: pytest.MonkeyPatch,
+        failing_step: str,
+    ) -> None:
+        """User, credential, verification token and audit rows commit together."""
+
+        async def _fail(*_args: object, **_kwargs: object) -> Never:
+            raise RuntimeError("store down")
+
+        monkeypatch.setattr(f"app.modules.auth.crud.{failing_step}", _fail)
+
+        assert register(client, username="alice").status_code == 500
+
+        assert db.scalar("SELECT count(*) FROM users") == 0
+        assert db.scalar("SELECT count(*) FROM password_credentials") == 0
+        assert db.scalar("SELECT count(*) FROM email_tokens") == 0
+        assert db.scalar("SELECT count(*) FROM auth_audit_log") == 0
+        assert captured_emails == []
+        monkeypatch.undo()
+        assert register(client, username="alice").status_code == 201
+
 
 class TestLogin:
     @pytest.mark.usefixtures("captured_emails")
@@ -227,6 +261,31 @@ class TestLogin:
         login(client, username="alice", password="badpass")
         r = login(client, username="alice")
         assert r.status_code == 200
+
+    @pytest.mark.usefixtures("captured_emails")
+    def test_login_rehashes_a_hash_with_outdated_parameters(
+        self, client: TestClient, db: Db
+    ) -> None:
+        from app.core import password_needs_rehash
+        from app.core.config import get_settings
+
+        settings = get_settings()
+        register(client, username="alice")
+        outdated = PasswordHasher(
+            time_cost=settings.ARGON2_TIME_COST + 1,
+            memory_cost=settings.ARGON2_MEMORY_KIB,
+            parallelism=settings.ARGON2_PARALLELISM,
+        ).hash(PASSWORD)
+        db.execute("UPDATE password_credentials SET password_hash = :h", h=outdated)
+
+        r = login(client, username="alice")
+
+        assert r.status_code == 200
+        stored = db.scalar("SELECT password_hash FROM password_credentials")
+        assert stored != outdated
+        assert not password_needs_rehash(stored)
+        assert audit_count(db, "login_success", "alice") == 1
+        assert login(client, username="alice").status_code == 200
 
     @pytest.mark.usefixtures("captured_emails")
     def test_inactive_account_returns_401(self, client: TestClient, db: Db) -> None:

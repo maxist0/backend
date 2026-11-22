@@ -152,7 +152,7 @@ class NoteNotFoundError(NotFound):
 
 ## Step 5: the queries
 
-`crud.py` contains queries and no business rules. It does not commit: the service owns the transaction.
+`crud.py` contains queries and no business rules. It never commits or rolls back: the service owns the transaction. It may `flush()` when it needs generated values or wants a constraint violation to surface at a known point. `tests/unit/core/test_crud_transactions.py` checks this for every module in `MODULES`.
 
 `src/app/modules/notes/crud.py`:
 
