@@ -59,14 +59,18 @@ def postgres_container() -> Iterator[PostgresContainer]:
     """The session's PostgreSQL container."""
     # driver="psycopg": the URL is postgresql+psycopg://, the app's only driver
     # (Settings refuse the testcontainers default +psycopg2).
-    with PostgresContainer(POSTGRES_IMAGE, driver="psycopg") as container:
+    # Fixed names make the containers easy to find in `docker ps`; a second
+    # run while one is active fails with a name conflict.
+    with PostgresContainer(POSTGRES_IMAGE, driver="psycopg").with_name(
+        "testing-postgres"
+    ) as container:
         yield container
 
 
 @pytest.fixture(scope="session")
 def redis_container() -> Iterator[RedisContainer]:
     """The session's Redis container."""
-    with RedisContainer(REDIS_IMAGE) as container:
+    with RedisContainer(REDIS_IMAGE).with_name("testing-redis") as container:
         yield container
 
 

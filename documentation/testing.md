@@ -39,7 +39,7 @@ The integration fixtures start the containers once per session and wire the real
 
 | Fixture | Scope | What it does |
 |---|---|---|
-| `postgres_container`, `redis_container` | session | Testcontainers with the images pinned in `tests/helpers.py` (the same as `compose.dev.yaml`; `test_dev_compose_parity.py` fails when they drift) |
+| `postgres_container`, `redis_container` | session | Testcontainers with the images pinned in `tests/helpers.py` (the same as `compose.dev.yaml`; `test_dev_compose_parity.py` fails when they drift), named `testing-postgres` and `testing-redis`; only one integration run at a time |
 | `test_environment` | session, autouse | points the settings at the containers, clears the settings cache |
 | `sync_engine`, `migrated_db` | session | schema from **Alembic** (`upgrade head`, no `create_all`), as a deployment creates it |
 | `clean_db`, `flush_redis` | function, autouse | `TRUNCATE` of every application table and `FLUSHALL`, **before** each test |
