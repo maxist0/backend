@@ -881,6 +881,10 @@ async def forgot_password(
     await hit("auth.password_forgot.email", "3/hour", key=email)
     user = await users_crud.get_user_by_email(db, email)
     if user is None:
+        # Nothing to write, but every path commits at the same point: with an
+        # Idempotency-Key the commit decides what a parallel retry sees (409
+        # or a replay), which must not tell known from unknown addresses.
+        await db.commit()
         return
 
     if not user.is_active or user.is_admin_locked():
@@ -937,8 +941,10 @@ async def reset_password(
         db, token_hash, EmailTokenPurpose.RESET_PASSWORD
     ):
         raise InvalidTokenError("Invalid or expired reset token")
-    # Ends the read transaction: no transaction stays open over Argon2.
-    await db.rollback()
+    # Ends the read transaction: no transaction stays open over Argon2. A
+    # commit, not a rollback: it keeps the request's idempotency key, which
+    # a rollback would discard (the reads have nothing else to commit).
+    await db.commit()
     new_hash = await hash_password(new_password)
 
     consumed = await crud.consume_email_token(

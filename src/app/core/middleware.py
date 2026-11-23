@@ -4,7 +4,9 @@ One pure ASGI middleware. It runs in the request's own task, so the request
 id it binds is in every log line and problem response of the request. It
 also renders the 500 for an unhandled exception and the 413 for a body above
 the limit, so those responses get the same headers, metrics and access log
-as every other one.
+as every other one. A dependency that needs the response a route sent (the
+idempotency guard) registers a `ResponseRecorder` under `RESPONSE_RECORDER`
+in the scope; the middleware hands it a copy of every response message.
 
 `create_app` adds it inside Starlette's `CORSMiddleware`: the 500 rendered
 here passes CORS on the way out and keeps the CORS headers. CORS preflights
@@ -14,7 +16,9 @@ are answered by `CORSMiddleware` itself and do not reach this middleware.
 import re
 import time
 import uuid
+import weakref
 from collections.abc import Iterable
+from typing import Protocol
 
 import structlog
 from fastapi.routing import iter_route_contexts
@@ -46,6 +50,45 @@ HTTP_REQUEST_DURATION = Histogram(
 )
 
 UNMATCHED_ROUTE = "unmatched"
+
+RESPONSE_RECORDER = "app.response_recorder"
+
+
+class ResponseRecorder(Protocol):
+    """Receives a copy of every response message of the request."""
+
+    def record(self, message: Message) -> None:
+        """Take a copy of `message` before the middleware adds its headers."""
+        ...
+
+
+# app -> {id(route): full path template}; built on the app's first lookup,
+# when every route is registered. Keyed by id because Starlette routes
+# define __eq__ and are unhashable; the app keeps them alive.
+_route_templates: weakref.WeakKeyDictionary[object, dict[int, str]] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def route_template(app: object, route: object | None) -> str:
+    """Full path template of `route`, `scope["route"]` of a request in `app`.
+
+    Unmatched requests (404 scans) and routes inside mounted sub-apps get
+    `unmatched`, so client paths never become a label or a key.
+    """
+    if route is None:
+        return UNMATCHED_ROUTE
+    templates = _route_templates.get(app)
+    if templates is None:
+        routes = getattr(app, "routes", [])
+        templates = {
+            id(context.original_route): context.path_format
+            for context in iter_route_contexts(routes)
+            if context.path_format
+        }
+        _route_templates[app] = templates
+    return templates.get(id(route), UNMATCHED_ROUTE)
+
 
 # The method is client-controlled; as a metric label it must come from a fixed
 # set, or invented methods create unbounded time series.
@@ -99,6 +142,16 @@ def content_length_of(scope: Scope) -> int | None:
     return None
 
 
+def _stamp_headers(start: Message, request_id: str, *, no_store: bool) -> None:
+    """Add the security headers, `X-Request-ID` and (API) `Cache-Control`."""
+    headers = MutableHeaders(scope=start)
+    for name, value in _SECURITY_HEADERS.items():
+        headers[name] = value
+    headers["X-Request-ID"] = request_id
+    if no_store and "cache-control" not in headers:
+        headers["Cache-Control"] = "no-store"
+
+
 class RequestMiddleware:
     """Request id, access log, HTTP metrics, security headers and the body limit.
 
@@ -129,10 +182,6 @@ class RequestMiddleware:
         self.access_log = access_log
         self.metrics = metrics
         self.max_body_bytes = max_body_bytes
-        # id(route) -> full path template; built on the first request, when
-        # every route is registered. Keyed by id because Starlette routes
-        # define __eq__ and are unhashable; the app keeps them alive.
-        self._templates: dict[int, str] | None = None
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         """Handle one ASGI connection; only HTTP requests are instrumented."""
@@ -152,15 +201,14 @@ class RequestMiddleware:
 
         async def send_with_headers(message: Message) -> None:
             nonlocal status, response_started
+            # Read per message: a dependency registers it while the request runs.
+            recorder: ResponseRecorder | None = scope.get(RESPONSE_RECORDER)
+            if recorder is not None:
+                recorder.record(message)
             if message["type"] == "http.response.start":
                 response_started = True
                 status = message["status"]
-                headers = MutableHeaders(scope=message)
-                for name, value in _SECURITY_HEADERS.items():
-                    headers[name] = value
-                headers["X-Request-ID"] = request_id
-                if no_store and "cache-control" not in headers:
-                    headers["Cache-Control"] = "no-store"
+                _stamp_headers(message, request_id, no_store=no_store)
             await send(message)
 
         received = 0
@@ -193,30 +241,12 @@ class RequestMiddleware:
                 await internal_error_response()(scope, receive, send_with_headers)
         finally:
             duration = time.perf_counter() - start
-            route = self._route_template(app, scope)
+            route = route_template(app, scope.get("route"))
             self._record(scope, route, status, duration)
             structlog.contextvars.clear_contextvars()
 
     def _under_api_prefix(self, path: str) -> bool:
         return path == self.api_prefix or path.startswith(f"{self.api_prefix}/")
-
-    def _route_template(self, app: object, scope: Scope) -> str:
-        """Full path template of the matched route, or `unmatched`.
-
-        Unmatched requests (404 scans) and routes inside mounted sub-apps
-        share one label, so client paths cannot create new label values.
-        """
-        route = scope.get("route")
-        if route is None:
-            return UNMATCHED_ROUTE
-        if self._templates is None:
-            routes = getattr(app, "routes", [])
-            self._templates = {
-                id(context.original_route): context.path_format
-                for context in iter_route_contexts(routes)
-                if context.path_format
-            }
-        return self._templates.get(id(route), UNMATCHED_ROUTE)
 
     def _record(self, scope: Scope, route: str, status: int, duration: float) -> None:
         if self.metrics and route != METRICS_PATH:

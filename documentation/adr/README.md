@@ -4,7 +4,7 @@ Decisions that shape the backend. Each record uses the [MADR 4.0](https://adr.gi
 
 Naming: `NNNN-kebab-title.md`, numbered in the order the decisions were taken. A record is never rewritten after acceptance. A later decision supersedes it with a new ADR and a status change.
 
-The first eight decisions were taken by the owner on 2026-11-16, the next two on 2026-11-17, ADR 0011 (open decision D6) was recorded on 2026-11-22, and ADR 0012 (open decision D10) the same day. ADRs 0001 to 0011 are implemented in steps S1–S3 of the 2026-11 cleanup (S1 structure, S2 taskiq reliability, S3 style pass, strict ruff/mypy, docs); ADR 0012 in step B1.1 of review phase 2 (data layer). ADR 0013 (open decision D4) was decided and implemented on 2026-11-23.
+The first eight decisions were taken by the owner on 2026-11-16, the next two on 2026-11-17, ADR 0011 (open decision D6) was recorded on 2026-11-22, and ADR 0012 (open decision D10) the same day. ADRs 0001 to 0011 are implemented in steps S1–S3 of the 2026-11 cleanup (S1 structure, S2 taskiq reliability, S3 style pass, strict ruff/mypy, docs); ADR 0012 in step B1.1 of review phase 2 (data layer). ADR 0013 (open decision D4) and ADR 0014 (open decision D9) were decided and implemented on 2026-11-23.
 
 | ADR | Title | Status | Date | Open decision |
 |---|---|---|---|---|
@@ -21,5 +21,6 @@ The first eight decisions were taken by the owner on 2026-11-16, the next two on
 | [0011](0011-type-checking-mypy-and-pyright-strict.md) | Type checking: mypy and pyright strict are gates, ty is informational | accepted | 2026-11-22 | D6 |
 | [0012](0012-schema-conventions-uuidv7-value-enums-usernames.md) | Schema conventions: UUIDv7 keys, model mixins, constraint names, checked VARCHAR enums, case-insensitive usernames | accepted | 2026-11-22 | D10 |
 | [0013](0013-rate-limiting-in-the-app-on-redis.md) | Rate limiting in the app on Redis, and a request body limit | accepted | 2026-11-23 | D4 |
+| [0014](0014-idempotency-keys-in-postgres-same-transaction.md) | Idempotency keys in PostgreSQL, in the transaction of the business write | accepted | 2026-11-23 | D9 |
 
 Conventions that follow from these decisions are in [AGENTS.md](../../AGENTS.md).

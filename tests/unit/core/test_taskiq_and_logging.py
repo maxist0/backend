@@ -13,6 +13,7 @@ import pytest
 from taskiq import ScheduledTask, TaskiqEvents, TaskiqState
 from taskiq.schedule_sources import LabelScheduleSource
 
+import app.core.idempotency as app_idempotency
 import app.core.tasks as app_tasks
 from app.core.config import get_settings
 from app.modules import MODULES
@@ -20,8 +21,9 @@ from tests.helpers import BACKEND_DIR, declared_tasks
 
 # The core's own tasks. Queued messages carry these names; renaming one
 # strands messages in Redis.
-CORE_TASK_NAMES = ["maintenance.taskiq_heartbeat"]
+CORE_TASK_NAMES = ["maintenance.taskiq_heartbeat", "maintenance.idempotency_cleanup"]
 HEARTBEAT_CRON = "*/5 * * * *"
+IDEMPOTENCY_CLEANUP_CRON = "23 * * * *"
 
 
 def _module_task_names() -> list[str]:
@@ -32,8 +34,10 @@ def _module_task_names() -> list[str]:
     ]
 
 
-def test_core_declares_only_the_heartbeat() -> None:
-    assert [t.task_name for t in declared_tasks(app_tasks)] == CORE_TASK_NAMES
+def test_core_declares_only_the_heartbeat_and_the_idempotency_cleanup() -> None:
+    declared = declared_tasks(app_tasks) + declared_tasks(app_idempotency)
+
+    assert [t.task_name for t in declared] == CORE_TASK_NAMES
 
 
 def test_core_and_module_task_names_are_unique() -> None:
@@ -105,7 +109,7 @@ def test_scheduler_finds_every_declared_schedule() -> None:
     """The scheduler schedules the shared tasks' `schedule` labels, only those.
 
     The tasks are shared, not the broker's own; the scheduler must still
-    find the heartbeat and every schedule a module task declares.
+    find the core's schedules and every schedule a module task declares.
     """
     broker = app_tasks.build_broker(get_settings())
     retry_source = app_tasks.build_retry_source(get_settings())
@@ -128,7 +132,11 @@ def test_scheduler_finds_every_declared_schedule() -> None:
     ]
     assert scheduler.broker is broker
     assert sorted((s.task_name, s.cron) for s in schedules) == sorted(
-        [("maintenance.taskiq_heartbeat", HEARTBEAT_CRON), *declared]
+        [
+            ("maintenance.taskiq_heartbeat", HEARTBEAT_CRON),
+            ("maintenance.idempotency_cleanup", IDEMPOTENCY_CLEANUP_CRON),
+            *declared,
+        ]
     )
 
 

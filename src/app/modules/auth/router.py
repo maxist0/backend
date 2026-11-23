@@ -53,7 +53,7 @@ from app.modules.auth.schemas import (
     RegisterRequest,
     TokenResponse,
 )
-from app.modules.users import CurrentUser, User, by_user
+from app.modules.users import CurrentUser, Idempotent, User, by_user
 from app.modules.users.dependencies import get_current_token_data
 from app.modules.users.schemas import UserResponse
 from app.modules.users.service import user_to_response
@@ -107,7 +107,7 @@ def _token_response(tokens: service.SessionTokens) -> TokenResponse:
     "/register",
     status_code=status.HTTP_201_CREATED,
     summary="Register an account",
-    dependencies=[rate_limit("auth.register.ip", "5/hour", key=by_ip)],
+    dependencies=[rate_limit("auth.register.ip", "5/hour", key=by_ip), Idempotent],
     responses=problem_responses(UserExistsError, 422, RateLimitedError),
 )
 async def register(
@@ -260,6 +260,7 @@ async def refresh_tokens(
     dependencies=[
         rate_limit("auth.password_forgot.ip", "5/15 minutes", key=by_ip),
         rate_limit("auth.password_forgot.ipv6_48", "25/15 minutes", key=by_ipv6_48),
+        Idempotent,
     ],
     responses=problem_responses(422, RateLimitedError),
 )
@@ -282,7 +283,10 @@ async def password_forgot(
     status_code=status.HTTP_204_NO_CONTENT,
     response_class=Response,
     summary="Reset the password",
-    dependencies=[rate_limit("auth.password_reset.ip", "10/15 minutes", key=by_ip)],
+    dependencies=[
+        rate_limit("auth.password_reset.ip", "10/15 minutes", key=by_ip),
+        Idempotent,
+    ],
     responses=problem_responses(InvalidTokenError, 422, RateLimitedError),
 )
 async def password_reset(
@@ -301,7 +305,10 @@ async def password_reset(
     status_code=status.HTTP_204_NO_CONTENT,
     response_class=Response,
     summary="Confirm an email address",
-    dependencies=[rate_limit("auth.email_verify.ip", "10/15 minutes", key=by_ip)],
+    dependencies=[
+        rate_limit("auth.email_verify.ip", "10/15 minutes", key=by_ip),
+        Idempotent,
+    ],
     responses=problem_responses(
         InvalidTokenError, EmailTakenError, 422, RateLimitedError
     ),
@@ -324,7 +331,10 @@ async def email_verify(
     status_code=status.HTTP_202_ACCEPTED,
     response_class=Response,
     summary="Resend the verification email",
-    dependencies=[rate_limit("auth.email_verify_resend.user", "3/hour", key=by_user)],
+    dependencies=[
+        rate_limit("auth.email_verify_resend.user", "3/hour", key=by_user),
+        Idempotent,
+    ],
     responses=problem_responses(
         EmailAlreadyVerifiedError, Unauthorized, RateLimitedError
     ),
@@ -382,7 +392,10 @@ async def verify_2fa() -> None:
     status_code=status.HTTP_204_NO_CONTENT,
     response_class=Response,
     summary="Change the password",
-    dependencies=[rate_limit("auth.password_change.user", "5/15 minutes", key=by_user)],
+    dependencies=[
+        rate_limit("auth.password_change.user", "5/15 minutes", key=by_user),
+        Idempotent,
+    ],
     responses=problem_responses(
         WrongPasswordError, Unauthorized, 422, RateLimitedError
     ),
@@ -417,7 +430,10 @@ async def change_my_password(
     status_code=status.HTTP_202_ACCEPTED,
     response_class=Response,
     summary="Change the email address",
-    dependencies=[rate_limit("auth.email_change.user", "5/15 minutes", key=by_user)],
+    dependencies=[
+        rate_limit("auth.email_change.user", "5/15 minutes", key=by_user),
+        Idempotent,
+    ],
     responses=problem_responses(
         WrongPasswordError,
         EmailUnchangedError,

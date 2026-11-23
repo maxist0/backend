@@ -6,9 +6,15 @@ email tokens, so the auth module serves them under the same path and tag.
 
 from fastapi import APIRouter, status
 
-from app.core import DbSession, Unauthorized, problem_responses
+from app.core import (
+    DbSession,
+    RateLimitedError,
+    Unauthorized,
+    problem_responses,
+    rate_limit,
+)
 from app.modules.users import service
-from app.modules.users.dependencies import CurrentUser
+from app.modules.users.dependencies import CurrentUser, Idempotent, by_user
 from app.modules.users.schemas import UpdateProfileRequest, UserResponse
 
 router = APIRouter(prefix="/users", tags=["users"])
@@ -29,7 +35,11 @@ async def get_me(current_user: CurrentUser) -> UserResponse:
     "/me",
     status_code=status.HTTP_200_OK,
     summary="Update the current user's profile",
-    responses=problem_responses(Unauthorized, 422),
+    dependencies=[
+        rate_limit("users.profile_update.user", "30/minute", key=by_user),
+        Idempotent,
+    ],
+    responses=problem_responses(Unauthorized, 422, RateLimitedError),
 )
 async def update_me(
     body: UpdateProfileRequest, db: DbSession, current_user: CurrentUser
@@ -37,7 +47,8 @@ async def update_me(
     """Update profile fields of the signed-in user.
 
     Omitted or null fields stay unchanged. The email address cannot be changed
-    here; use `PUT /users/me/email`.
+    here; use `PUT /users/me/email`. At most 30 updates per minute per user;
+    more get 429 with `Retry-After`.
     """
     user = await service.update_profile(
         db, current_user, display_name=body.display_name

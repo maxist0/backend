@@ -43,7 +43,7 @@ The error names the variables, not their values. Independent of the environment,
 
 | Secret | Variable | Notes |
 |---|---|---|
-| JWT signing key | `JWT_SECRET_KEY` | 256 bits of randomness. The algorithm is HS256, pinned in code. Changing it invalidates every access token already issued. A key derived from it (fixed label, domain-separated) also keys the HMACs that stand for addresses, usernames and email addresses in the rate-limit keys, so a change starts every rate-limit window afresh |
+| JWT signing key | `JWT_SECRET_KEY` | 256 bits of randomness. The algorithm is HS256, pinned in code. Changing it invalidates every access token already issued. Keys derived from it (fixed labels, domain-separated) also key the HMACs that stand for addresses, usernames and email addresses in the rate-limit keys, and the fingerprints of idempotency keys: a change starts every rate-limit window afresh, and a retry across the change with an `Idempotency-Key` gets 422 `idempotency_key_reused` |
 | Admin password and session key | `ADMIN_PASSWORD`, `ADMIN_SECRET_KEY` | only checked when the admin panel is enabled |
 | Database | `DATABASE_URL` (contains the password) | the password is masked in logs |
 | Redis | `CACHE_PASSWORD`, and the passwords inside `TASKIQ_BROKER_URL` and `TASKIQ_RESULT_BACKEND_URL` | |

@@ -276,7 +276,7 @@ Offene Punkte für die Deploy-Runde, festgestellt von deploy-engineer am 2026-11
 | D4 | Rate-Limits | **Beides**: Traefik grob pro IP, die App fein (Account+IP, E-Mail, Family) mit `limits` und Redis; Trusted Proxies vorher |
 | D6 | Type-Checker | **mypy strict** als Gate, `ty` (Beta) als Hinweis; kein Pyright als drittes Gate. **Entschieden am 22.11.2026 (anders als empfohlen):** mypy und pyright strict sind beide Gates, `ty` bleibt Hinweis, siehe [ADR 0011](../adr/0011-type-checking-mypy-and-pyright-strict.md) |
 | D8 | Compliance | **CRA/NIS2-Deliverables als Pflicht behandeln**: SECURITY.md, SBOM, `uv audit`, sichere Defaults, Log-Minimierung |
-| D9 | Idempotency | **Phase 6, opt-in**: Datensatz in Postgres in derselben Transaktion; 422 bei abweichendem Payload (IETF-Draft) statt der 409 aus der Roadmap |
+| D9 | Idempotency | **Phase 6, opt-in**: Datensatz in Postgres in derselben Transaktion; 422 bei abweichendem Payload (IETF-Draft) statt der 409 aus der Roadmap. **Entschieden und umgesetzt am 23.11.2026:** ohne Redis-Lock (parallele Requests warten am Unique-Index, 409 nach 500 ms), Marker `Idempotent`, siehe [ADR 0014](../adr/0014-idempotency-keys-in-postgres-same-transaction.md) |
 | D10 | Primärschlüssel | **UUIDv7** über `uuid.uuid7()`; DB-Default `uuidv7()` erst, wenn Postgres 18 überall gesetzt ist; v4 als Opt-out pro Tabelle |
 | D12 | Hashing | **argon2-cffi behalten**; Parameter in `Settings`, `check_needs_rehash`, Hashing außerhalb des Event-Loops |
 

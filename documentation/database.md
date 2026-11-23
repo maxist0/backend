@@ -52,6 +52,8 @@ Every table of the built-in modules follows these rules, and a new module gets t
 
 The service owns the transaction: it calls `await db.commit()` once per use case, when its work is done, and enqueues background tasks only after that. A crud function never commits or rolls back; it may `flush()` to get generated values or to raise an `IntegrityError` where the service can map it ([modules.md](modules.md#step-5-the-queries)). `tests/unit/core/test_crud_transactions.py` checks every module's `crud.py`. A service commits a second time within a use case only on purpose, with a comment saying why: to keep writes that a following error would roll back, or to release a row lock before slow work such as Argon2 hashing. The `auth` flows that do this are listed in [authentication.md → Serialisation](authentication.md#serialisation). `get_db` never commits; it rolls back when the request raises.
 
+On a route marked `Idempotent` the guard inserts the `idempotency_keys` row into the request's session before the service runs, so the row commits with the service's first commit, and commits once more after the route to store the response ([Schema: `idempotency_keys`](#schema-idempotency_keys-core)). The service of such a route ends a read transaction with `commit()`, never with `rollback()` on its success path: a rollback would discard the key row ([modules.md](modules.md#making-a-route-idempotent)).
+
 `expire_on_commit=False` means objects keep their loaded values after a commit, without a hidden reload. Re-read an object after a commit when another transaction may have changed it.
 
 ## Queries
@@ -60,7 +62,7 @@ The service owns the transaction: it calls `await db.commit()` once per use case
 - Avoid lazy loads in async code (they raise): use `selectinload` or `joinedload` in the query, or `await db.refresh(obj, [...])`.
 - Return ORM objects from crud and service functions and convert them to response models in the service or router; never return an ORM object from a route.
 - Bound every list: a route takes `limit` and `offset` with a maximum; order by a stable key.
-- Lock rows in the documented order: `email_tokens` → `users` → `sessions` → `password_credentials` ([authentication.md](authentication.md#serialisation)).
+- Lock rows in the documented order: `idempotency_keys` → `email_tokens` → `users` → `sessions` → `password_credentials` ([authentication.md](authentication.md#serialisation)). The key row of a marked route is always the request's first lock (taken by its insert, before the service runs), so a parallel request with the same key waits there and never holds a business lock while it waits.
 - Database error text can contain user data. Code that reacts to a database error uses `constraint_name(exc)` or the SQLSTATE from `app.core`, and logs with `log_unexpected_error`.
 
 ## Schema: users and auth
@@ -166,12 +168,30 @@ Append-only record of security-relevant events.
 
 The column stores the values of `AuditEventType`: `register`, `login_success`, `login_failed`, `account_locked`, `account_unlocked`, `email_verification_sent`, `email_verified`, `email_changed`, `password_changed`, `password_reset_requested`, `password_reset_completed`, `session_revoked`, `account_deactivated`, `account_reactivated`, `password_change_forced`, `account_locked_notice_sent`. The cleanup task does not touch this table.
 
-### Revisions
+## Schema: `idempotency_keys` (core)
+
+The core's own table behind `Idempotency-Key` ([ADR 0014](adr/0014-idempotency-keys-in-postgres-same-transaction.md), [api.md](api.md#idempotency-keys)). The model is `IdempotencyKey` in `src/app/core/idempotency.py`; importing `app.core` registers it, so Alembic sees it with the module tables. It has no foreign key: the core does not depend on a module's table.
+
+| Column | Type | Null | Notes |
+|---|---|---|---|
+| `id` | uuid | no | primary key (UUIDv7) |
+| `scope` | varchar(300) | no | `user:<user id>`, or `route:<METHOD> <path template>` for an anonymous request; unique with `key` (`uq_idempotency_keys_scope`) |
+| `key` | varchar(255) | no | the client's key as sent, without quotes |
+| `fingerprint` | bytea | no | HMAC-SHA256 (32 bytes) of method, path, query string and body, keyed from `JWT_SECRET_KEY`; it cannot be tested against guessed passwords without that key |
+| `response_status` | smallint | yes | CHECK `ck_idempotency_keys_response_status_range` (100 to 599); NULL while the request runs, or when its result was lost |
+| `response_headers` | jsonb | yes | `[[name, value], ...]` of `Content-Type`, `Location`, `WWW-Authenticate` only |
+| `response_body` | bytea | yes | the body as sent, at most 64 KiB; CHECK `ck_idempotency_keys_response_complete`: the three response columns are all NULL or all set |
+| `created_at` | timestamptz | no | server default `now()`; index `ix_idempotency_keys_created_at` for the cleanup |
+
+**Personal data.** A stored body can hold what the route returned, for example the `UserResponse` (username, email, display name) of a registration or a profile change, and the `scope` holds a user id. The rows are kept for `IDEMPOTENCY_RETENTION_HOURS` (24) and deleted within the following hour by the core task `maintenance.idempotency_cleanup` (hourly at minute 23, batches of 1000, `FOR UPDATE SKIP LOCKED`, at most 100 batches per run; a run that stops at that cap logs `idempotency.cleanup_done` with `capped=true` at warning level and counts `idempotency_cleanup_capped_total`, see [monitoring.md](monitoring.md#example-queries)). Deleting an account later must also delete `scope = 'user:<id>'`; the anonymous row of its registration cannot be linked to the account and disappears with the retention.
+
+## Revisions
 
 | Revision | Message |
 |---|---|
 | `b799370af501` | baseline: the complete schema of `users` and `auth` |
 | `57d93cf19427` | add `users.password_changed_at` (nullable, no backfill, no table rewrite) |
+| `a575b88f3e52` | add `idempotency_keys` (a new table; no lock on existing tables) |
 
 On 2026-11-22 this baseline replaced the revisions `37a0d49f8bbc`, `8b82d1b725c0` and `14e82733e84f`; no data existed on any of them. A local database created before that is still stamped with a deleted revision, and Alembic stops with "Can't locate revision". Recreate it; never `alembic stamp` it onto the baseline, because its schema differs from the baseline's (enum types, constraint names, columns) and `stamp` changes only the version row:
 

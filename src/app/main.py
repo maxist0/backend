@@ -32,6 +32,7 @@ from app.core.database import (
 )
 from app.core.errors import register_error_handlers
 from app.core.health import METRICS_PATH, include_health_routes
+from app.core.idempotency import REPLAYED_HEADER, register_idempotency
 from app.core.logging import get_logger, setup_logging
 from app.core.middleware import RequestMiddleware
 from app.core.rate_limiting import warn_if_disabled
@@ -168,6 +169,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         create_admin(app, settings, session_factory, views)
 
     register_error_handlers(app)
+    register_idempotency(app, settings)
 
     # The last middleware added runs first. CORS is outside the request
     # middleware so the 500 that the request middleware renders still gets
@@ -186,8 +188,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
         # Without this a browser on another origin cannot read them: the
-        # wait after a 429 and the id to quote in a support request.
-        expose_headers=["Retry-After", "X-Request-ID"],
+        # wait after a 429, the id to quote in a support request and the
+        # mark of a replayed response.
+        expose_headers=["Retry-After", "X-Request-ID", REPLAYED_HEADER],
     )
 
     include_health_routes(app, settings)

@@ -33,6 +33,7 @@ from app.core.errors import (
     log_unexpected_error,
     problem_responses,
 )
+from app.core.idempotency import idempotent
 from app.core.logging import get_logger
 from app.core.mail import get_mailer, mail_delivery_error, send_templated_email
 from app.core.module import Module
@@ -86,6 +87,7 @@ __all__ = [
     "hash_password",
     "hash_token",
     "hit",
+    "idempotent",
     "invalidate",
     "log_unexpected_error",
     "login_admission_limiter",

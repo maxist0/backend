@@ -161,6 +161,19 @@ class TestHit:
         assert maxvalue == 11
         assert expire == 900
 
+    def test_the_redis_key_is_pinned(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A changed derivation would silently start every window afresh.
+
+        The digest was computed with the derivation of ADR 0013 (HMAC of the
+        label under `JWT_SECRET_KEY`, then HMAC of policy and identifier).
+        """
+        store = _FakeStore()
+        _store(monkeypatch, store)
+
+        run_async(hit("probe.unit", "10/15 minutes", key="203.0.113.10"))
+
+        assert store.keys == ["rate_limit:probe.unit:6acc710c0fbff3b7c6427ff5eedc271b"]
+
     def test_above_the_limit_retry_after_comes_from_the_ttl(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

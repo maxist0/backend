@@ -16,7 +16,7 @@ The guide builds a `notes` module: each signed-in user has private notes, and a 
 | PATCH | `/api/v1/notes/{note_id}` | 200 | Change the title or the text |
 | DELETE | `/api/v1/notes/{note_id}` | 204 | Delete a note |
 
-**Verified.** On 2026-11-22 the code below was added to a throwaway git worktree of commit `6d01f6d`. `uv run ruff check`, `uv run ruff format --check`, `uv run mypy`, `uv run pyright` and the full `uv run pytest` suite passed. The same day, after the schema conventions of [ADR 0012](adr/0012-schema-conventions-uuidv7-value-enums-usernames.md) (mixins, naming convention, migration baseline `b799370af501`), the model and the migration were updated and checked again: the code blocks were written into the working tree with the module registered, `alembic revision --autogenerate` ran against a throwaway Postgres 18, the migration ran through `upgrade`, `downgrade -1`, `upgrade` and `alembic check`, and ruff, mypy, pyright and the notes tests passed. The code blocks are copies of those files.
+**Verified.** On 2026-11-22 the code below was added to a throwaway git worktree of commit `6d01f6d`. `uv run ruff check`, `uv run ruff format --check`, `uv run mypy`, `uv run pyright` and the full `uv run pytest` suite passed. The same day, after the schema conventions of [ADR 0012](adr/0012-schema-conventions-uuidv7-value-enums-usernames.md) (mixins, naming convention, migration baseline `b799370af501`), the model and the migration were updated and checked again: the code blocks were written into the working tree with the module registered, `alembic revision --autogenerate` ran against a throwaway Postgres 18, the migration ran through `upgrade`, `downgrade -1`, `upgrade` and `alembic check`, and ruff, mypy, pyright and the notes tests passed. The code blocks are copies of those files. The rate limits and `Idempotent` markers in Step 8 were added on 2026-11-23 and were not run through that check again.
 
 ## Step 1: create the package
 
@@ -377,7 +377,7 @@ A task that must run on a schedule adds `schedule=[{"cron": "0 3 * * *"}]` (UTC)
 
 ## Step 8: the routes
 
-`router.py` is thin: it validates through the models, calls one service function and returns a typed model. Every route declares `status_code`, a `summary` (imperative, at most 60 characters), a return annotation and the errors it can produce through `problem_responses(...)`. The docstring renders in Swagger, so write it for API consumers. The router carries its own `prefix` and `tags`; `create_app()` adds `API_PREFIX`.
+`router.py` is thin: it validates through the models, calls one service function and returns a typed model. Every route declares `status_code`, a `summary` (imperative, at most 60 characters), a return annotation and the errors it can produce through `problem_responses(...)`. The docstring renders in Swagger, so write it for API consumers. The router carries its own `prefix` and `tags`; `create_app()` adds `API_PREFIX`. The routes that create, change or delete a note carry a per-user rate limit and, last, the `Idempotent` marker, so a client can retry them safely ([Making a route idempotent](#making-a-route-idempotent)). The service still checks that the note belongs to the caller.
 
 `src/app/modules/notes/router.py`:
 
@@ -389,7 +389,13 @@ from typing import Annotated
 
 from fastapi import APIRouter, Query, Response, status
 
-from app.core import DbSession, Unauthorized, problem_responses
+from app.core import (
+    DbSession,
+    RateLimitedError,
+    Unauthorized,
+    problem_responses,
+    rate_limit,
+)
 from app.modules.notes import service
 from app.modules.notes.errors import NoteNotFoundError
 from app.modules.notes.schemas import (
@@ -397,7 +403,7 @@ from app.modules.notes.schemas import (
     NoteResponse,
     UpdateNoteRequest,
 )
-from app.modules.users import CurrentUser
+from app.modules.users import CurrentUser, Idempotent, by_user
 
 router = APIRouter(prefix="/notes", tags=["notes"])
 
@@ -406,7 +412,11 @@ router = APIRouter(prefix="/notes", tags=["notes"])
     "",
     status_code=status.HTTP_201_CREATED,
     summary="Create a note",
-    responses=problem_responses(Unauthorized, 422),
+    dependencies=[
+        rate_limit("notes.create.user", "30/minute", key=by_user),
+        Idempotent,
+    ],
+    responses=problem_responses(Unauthorized, 422, RateLimitedError),
 )
 async def create_note(
     body: CreateNoteRequest, db: DbSession, current_user: CurrentUser
@@ -455,7 +465,13 @@ async def get_note(
     "/{note_id}",
     status_code=status.HTTP_200_OK,
     summary="Update a note",
-    responses=problem_responses(Unauthorized, NoteNotFoundError, 422),
+    dependencies=[
+        rate_limit("notes.update.user", "60/minute", key=by_user),
+        Idempotent,
+    ],
+    responses=problem_responses(
+        Unauthorized, NoteNotFoundError, 422, RateLimitedError
+    ),
 )
 async def update_note(
     note_id: uuid.UUID,
@@ -479,7 +495,13 @@ async def update_note(
     status_code=status.HTTP_204_NO_CONTENT,
     response_class=Response,
     summary="Delete a note",
-    responses=problem_responses(Unauthorized, NoteNotFoundError, 422),
+    dependencies=[
+        rate_limit("notes.delete.user", "60/minute", key=by_user),
+        Idempotent,
+    ],
+    responses=problem_responses(
+        Unauthorized, NoteNotFoundError, 422, RateLimitedError
+    ),
 )
 async def delete_note(
     note_id: uuid.UUID, db: DbSession, current_user: CurrentUser
@@ -917,7 +939,8 @@ uv run pytest
 |---|---|
 | `tests/unit/core/test_module_layout.py` | A module contains only the vocabulary files and a flat `templates/` folder (no `base.html`). |
 | `tests/unit/core/test_import_direction.py` | Every module package is listed in `MODULES` under its folder name; modules import `app.core`, not its submodules; the core never imports `app.modules`; a module imports only modules listed before it. |
-| `tests/unit/core/test_model_registry.py` | Importing `app.modules` registers exactly the tables of the modules' `models` files, without `ENVIRONMENT` and without reading settings; no table exists outside a registered module; a declared `models` file maps at least one table. |
+| `tests/unit/core/test_model_registry.py` | Importing `app.modules` registers exactly the tables of the modules' `models` files plus the core's own (`idempotency_keys`), without `ENVIRONMENT` and without reading settings; no other table exists; a declared `models` file maps at least one table. |
+| `tests/unit/core/test_idempotency.py` | A route with `Idempotent` uses POST, PUT, PATCH or DELETE, takes no form body, has at least one `rate_limit` before the marker, lists the marker last in its `dependencies`, and its OpenAPI operation documents the header and the idempotency errors. |
 | `tests/unit/core/test_openapi_contract.py` | Every module path is under the prefix; every module route declares problem-detail errors; the document equals the snapshot. |
 | `tests/unit/core/test_taskiq_and_logging.py` | The worker serves exactly the core's tasks and the tasks of every `Module.tasks`, each name once; the scheduler finds every `schedule` label. |
 
@@ -970,6 +993,44 @@ async def send_invitation(db: AsyncSession, inviter: User, email: str) -> None:
 - A limit must not hide a security signal: do not count requests that a security check must see, as `auth.refresh.family` counts only live refresh tokens so that a replayed rotated token always reaches reuse detection.
 - Tests: the integration suite flushes Redis before each test. Choose client addresses with `behind_proxy(app)` and `forwarded_for(ip)`, and check a refusal with `assert_rate_limited(response, window=...)` from `tests/helpers.py`; `tests/integration/core/test_rate_limiting.py` shows each of them.
 
+## Making a route idempotent
+
+Every route that creates something or has a side effect (writes, sends mail, calls another system) accepts an `Idempotency-Key`, so a client can retry it after a lost response without doing the work twice ([ADR 0014](adr/0014-idempotency-keys-in-postgres-same-transaction.md), contract in [api.md](api.md#idempotency-keys)). Give it at least one rate limit (every keyed request writes a row) and mark it with `Idempotent` as the last entry of `dependencies`:
+
+```python
+from app.core import RateLimitedError, problem_responses, rate_limit
+from app.modules.users import CurrentUser, Idempotent, by_user
+
+
+@router.post(
+    "",
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a note",
+    dependencies=[rate_limit("notes.create.user", "30/minute", key=by_user), Idempotent],
+    responses=problem_responses(Unauthorized, 422, RateLimitedError),
+)
+async def create_note(
+    body: CreateNoteRequest, db: DbSession, current_user: CurrentUser
+) -> NoteResponse: ...
+```
+
+That is all. The service stays as it is: it commits its use case once, and the key row commits with it. The OpenAPI operation gets the `Idempotency-Key` header and the errors 400 `idempotency_key_invalid`, 409 `idempotency_key_in_use` and `idempotency_outcome_unknown`, and 422 `idempotency_key_reused` on its own; do not list them in `responses`.
+
+Rules for the service and the route behind the marker:
+
+- **Checks a replay must pass go before the marker.** A replay skips everything after the marker: the endpoint's own dependencies (`CurrentUser`, a permission check), the route and the service. The marker itself checks only the account state of the bearer token's user (active, not admin-locked, token not older than the last password change). So every authorisation check that must hold for a retry too (a role, a permission, a membership) is a route-level dependency listed before `Idempotent`, which is the last entry of `dependencies`. Object-level checks in the service still protect the first execution; a replay only returns the same user's earlier answer.
+- **Only for answers that depend on the user, method, path, query and body.** The key's scope is the signed-in user or, without a valid access token, the route; the fingerprint covers method, path, query and body. Other credentials (an API-key header, a cookie) are not part of either, so on such a route all their holders would share the route scope. Do not mark it.
+- **The same commit point on every success path when the answer must not reveal state.** A parallel request with the same key sees the first one's key row when that request first commits: before the response is stored it gets 409 `idempotency_key_in_use`, after it a replay. If one success path commits early and another only at the end (the guard then commits the row with the response), the pair answers differently and tells the paths apart. `forgot_password` therefore commits on the unknown-address path too.
+- **Never on a route whose response carries credentials** (an access or refresh token, `Set-Cookie`): a stored response is replayed to whoever repeats the request. Such a response is never stored anyway, but the route would then not be protected. GET routes and routes that are idempotent by nature (a logout) need no marker.
+- **No rollback on the success path.** A `db.rollback()` discards the key row with everything else. End a read transaction, for example before Argon2, with `await db.commit()`. A rollback right before raising an error is fine: the error leaves no key, and a retry runs again.
+- **No uncommitted writes left on purpose.** The guard commits after the route (for a route that wrote nothing, that commits the key row and the stored response). A route that leaves pending ORM changes gets no stored response, and the guard logs `idempotency.response_not_stored`.
+- **`hit()` before the work.** A 429 is never stored: the guard deletes the key so the retry runs again. That is only correct if the limit refuses before the use case wrote anything, which the rate-limit rules already require.
+- **Errors are stored once something was committed.** A refusal after an early commit (a failure counter, an audit row) is replayed to a retry instead of running again. A 5xx is never stored; a retry then gets 409 `idempotency_outcome_unknown`.
+- **JSON or no body.** The fingerprint covers the raw body; a form body is not supported.
+- Responses up to 64 KiB are stored; a larger one is sent but not stored.
+
+Tests: send `headers=keyed(new_idempotency_key())` and check a replay with `assert_replayed(first, retry)`; `idempotency_rows(db)` reads the stored keys (`tests/helpers.py`). `tests/integration/modules/auth/test_idempotent_routes.py` shows each case on the built-in routes.
+
 ## More module features
 
 | Need | How |
@@ -978,6 +1039,7 @@ async def send_invitation(db: AsyncSession, inviter: User, email: str) -> None:
 | Email | Put Jinja templates into `templates/` (never `base.html`; that is the core layout in `src/app/core/templates/`) and call `send_templated_email(..., template_dir=...)` from a task. It returns `False` when mail is not configured. See `src/app/modules/auth/tasks.py` |
 | Caching | `@cached(ttl, key)` and `invalidate(pattern)` from `app.core`; the key holds every input that changes the result, `{user_id}` included ([redis.md](redis.md)) |
 | Rate limits | `rate_limit(...)` on a route or `hit(...)` in a service, see [Rate-limiting a route](#rate-limiting-a-route) |
+| Safe retries | `Idempotent` from `app.modules.users` on every route that creates something or has a side effect, see [Making a route idempotent](#making-a-route-idempotent) |
 | Roles and permissions, user events, per-module settings | Not offered yet (open decision D3, [ADR 0001](adr/0001-core-and-module-contract.md)). A new setting is an edit to `src/app/core/config.py`, which needs the owner's approval. Do not build workarounds. |
 
 If a task seems to need an edit to the core, stop and ask: either the core has a gap, which is a core change with an ADR, or the code belongs in a module.

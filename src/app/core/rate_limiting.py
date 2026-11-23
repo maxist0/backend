@@ -45,6 +45,7 @@ from app.core.cache import rate_limit_store
 from app.core.config import Environment, Settings, get_settings
 from app.core.errors import RateLimitedError
 from app.core.logging import get_logger
+from app.core.security import derive_key
 
 logger = get_logger(__name__)
 
@@ -67,8 +68,7 @@ _LIMIT = re.compile(r"([1-9][0-9]*)/(?:([1-9][0-9]*) )?(second|minute|hour|day)s
 _UNIT_SECONDS = {"second": 1, "minute": 60, "hour": 3_600, "day": 86_400}
 
 # Domain separation: the HMAC key for rate-limit identifiers is derived from
-# JWT_SECRET_KEY under this label and is used for nothing else. A JWT
-# signature is an HMAC over `<header>.<payload>`, which this label cannot be.
+# JWT_SECRET_KEY under this label (`derive_key`) and is used for nothing else.
 _KEY_LABEL = b"rate-limit identifier key v1"
 # 128 bits of the HMAC: collisions between identifiers stay negligible.
 _DIGEST_HEX_LENGTH = 32
@@ -177,7 +177,7 @@ def by_ipv6_48(request: Request) -> str | None:
 
 
 def _redis_key(policy: str, identifier: str, secret: str) -> str:
-    derived = hmac.new(secret.encode(), _KEY_LABEL, hashlib.sha256).digest()
+    derived = derive_key(secret, _KEY_LABEL)
     message = f"{policy}\0{identifier}".encode(errors="surrogatepass")
     digest = hmac.new(derived, message, hashlib.sha256).hexdigest()
     return f"rate_limit:{policy}:{digest[:_DIGEST_HEX_LENGTH]}"

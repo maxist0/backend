@@ -725,3 +725,33 @@ def forge_access_token(
     for name in drop:
         claims.pop(name, None)
     return jwt.encode(claims, secret, algorithm=algorithm)
+
+
+def new_idempotency_key() -> str:
+    """A fresh key as the frontend makes one: a UUIDv7 string."""
+    return str(uuid.uuid7())
+
+
+def keyed(key: str, headers: dict[str, str] | None = None) -> dict[str, str]:
+    """`headers` plus `Idempotency-Key: <key>`."""
+    return {**(headers or {}), "Idempotency-Key": key}
+
+
+def idempotency_rows(db: Db, key: str | None = None) -> Sequence[RowMapping]:
+    """The `idempotency_keys` rows, all or those of one key, oldest first."""
+    if key is None:
+        return db.rows("SELECT * FROM idempotency_keys ORDER BY created_at, id")
+    return db.rows(
+        "SELECT * FROM idempotency_keys WHERE key = :k ORDER BY created_at, id", k=key
+    )
+
+
+def assert_replayed(first: Response, retry: Response) -> None:
+    """`retry` repeats `first` byte for byte, marked as a replay."""
+    assert retry.status_code == first.status_code, retry.text
+    assert retry.content == first.content
+    assert retry.headers.get("content-type") == first.headers.get("content-type")
+    assert retry.headers["Idempotent-Replayed"] == "true"
+    assert "Idempotent-Replayed" not in first.headers
+    assert retry.headers["X-Request-ID"] != first.headers["X-Request-ID"]
+    assert "set-cookie" not in retry.headers

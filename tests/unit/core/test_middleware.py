@@ -1,7 +1,7 @@
 """The request middleware on a tiny Starlette app.
 
-Request id, access log, security headers, Cache-Control, metric labels and
-the 500 path.
+Request id, access log, security headers, Cache-Control, metric labels,
+the response recorder hook and the 500 path.
 """
 
 import logging
@@ -14,8 +14,9 @@ from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse, Response
 from starlette.routing import Route
+from starlette.types import Message
 
-from app.core.middleware import RequestMiddleware, metric_method
+from app.core.middleware import RESPONSE_RECORDER, RequestMiddleware, metric_method
 from tests.helpers import (
     log_events,
     new_test_client,
@@ -287,3 +288,39 @@ class TestUnhandledException:
         assert _requests("/api/v1/mw-crash", status="500") == before + 1
         [event] = log_events(caplog, "http.access")
         assert event["status"] == 500
+
+
+class TestResponseRecorder:
+    def test_a_registered_recorder_gets_the_response_before_the_headers(
+        self,
+    ) -> None:
+        recorded: list[Message] = []
+
+        class Recorder:
+            def record(self, message: Message) -> None:
+                headers: list[tuple[bytes, bytes]] = list(message.get("headers", []))
+                recorded.append({**message, "headers": headers})
+
+        async def endpoint(request: Request) -> Response:
+            request.scope[RESPONSE_RECORDER] = Recorder()
+            return PlainTextResponse("recorded", headers={"Location": "/x"})
+
+        app = Starlette(routes=[Route("/api/v1/mw-recorded", endpoint)])
+        app.add_middleware(
+            RequestMiddleware,
+            api_prefix="/api/v1",
+            access_log=False,
+            metrics=False,
+            max_body_bytes=BODY_LIMIT,
+        )
+
+        r = new_test_client(app).get("/api/v1/mw-recorded")
+
+        start, body = recorded
+        assert (start["type"], start["status"]) == ("http.response.start", 200)
+        names = {name for name, _ in start["headers"]}
+        assert b"location" in names
+        assert b"x-request-id" not in names
+        assert (body["type"], body["body"]) == ("http.response.body", b"recorded")
+        assert r.headers["x-request-id"]
+        assert r.text == "recorded"

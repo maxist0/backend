@@ -124,7 +124,7 @@ def _paths(routes: Sequence[BaseRoute]) -> set[str]:
 
 
 class TestCors:
-    def test_retry_after_and_the_request_id_are_exposed(
+    def test_retry_after_the_request_id_and_the_replay_mark_are_exposed(
         self, settings_factory: SettingsFactory
     ) -> None:
         """A browser app on another origin may read them (`Retry-After` on 429)."""
@@ -138,7 +138,7 @@ class TestCors:
             name.strip().lower()
             for name in r.headers["access-control-expose-headers"].split(",")
         }
-        assert {"retry-after", "x-request-id"} <= exposed
+        assert {"retry-after", "x-request-id", "idempotent-replayed"} <= exposed
 
 
 class TestModuleMounting:

@@ -108,3 +108,22 @@ class TestVerifiesFeedTheAverage:
         anyio.run(security.equalize_password_timing, "pw")
 
         assert fresh_average.seconds == 0.077
+
+
+class TestDeriveKey:
+    @pytest.mark.parametrize(
+        ("label", "expected"),
+        [
+            (
+                b"rate-limit identifier key v1",
+                "c9e1bbe703ef6bbe49825b170ffffb4f4db53a13e5ba7bb352023beb4afd4a02",
+            ),
+            (
+                b"idempotency fingerprint key v1",
+                "fa0733b78baaffc49252a8395bb40603b3aa160db0a244da8574178a5c4aea96",
+            ),
+        ],
+    )
+    def test_pinned_vectors(self, label: bytes, expected: str) -> None:
+        """HMAC-SHA256 of the label under the secret, one key per purpose."""
+        assert security.derive_key("k" * 32, label).hex() == expected

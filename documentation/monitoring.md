@@ -26,6 +26,8 @@ The metrics, health endpoints and the monitoring stack of the backend. Form: ref
 | `auth_refresh_token_reuse_total` | counter | none | `src/app/modules/auth/service.py` |
 | `rate_limit_rejections_total` | counter | `policy` (fixed names such as `auth.login.ip`) | `src/app/core/rate_limiting.py` |
 | `rate_limit_fail_open_total` | counter | `policy`; requests let through unchecked because Redis was unreachable | `src/app/core/rate_limiting.py` |
+| `idempotency_requests_total` | counter | `outcome`: `stored` (ran, response stored), `not_stored` (ran or refused; nothing stored), `replayed`, `in_use` (409), `outcome_unknown` (409, a lost result), `reused` (422), `invalid` (400) | `src/app/core/idempotency.py` |
+| `idempotency_cleanup_capped_total` | counter | none; hourly cleanup runs that stopped at their cap (100 batches of 1000 rows) with expired keys left; counted in the worker | `src/app/core/idempotency.py` |
 | `process_*`, `python_gc_*` | standard collectors | | `prometheus_client` |
 
 - `route` is the route template (`/api/v1/users/me`, `/api/v1/notes/{note_id}`) or `unmatched`, so arbitrary request paths cannot create label values.
@@ -79,6 +81,15 @@ sum by (policy) (rate(rate_limit_rejections_total[5m]))
 # Rate limits not enforced because Redis failed (alert on > 0; pair it with an
 # alert on Redis used_memory, since eviction resets limits without this signal)
 sum(increase(rate_limit_fail_open_total[5m]))
+
+# Requests whose result was lost after their commit (alert on > 0: a crash,
+# a failed store or a 5xx after a write; see logs idempotency.store_failed)
+sum(increase(idempotency_requests_total{outcome="outcome_unknown"}[1h]))
+
+# The idempotency cleanup hit its cap in two hourly runs within 3 h: keys
+# arrive faster than 100,000 an hour, so expired rows (and the personal data
+# in stored responses) outlive IDEMPOTENCY_RETENTION_HOURS
+increase(idempotency_cleanup_capped_total[3h]) >= 2
 
 # Any reuse of a rotated refresh token
 increase(auth_refresh_token_reuse_total[1h]) > 0

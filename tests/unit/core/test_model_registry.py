@@ -1,7 +1,8 @@
 """Alembic sees every table through `MODULES`, without application settings.
 
 The expected tables come from the modules' own `models` files, so a new
-module needs no edit here. Each module's tests name its concrete tables.
+module needs no edit here, plus the core's own tables. Each module's tests
+name its concrete tables.
 """
 
 import os
@@ -23,8 +24,16 @@ _ALEMBIC_IMPORTS = (
 )
 
 
+# Tables the core defines itself; importing `app.core` registers them.
+CORE_TABLES = {"idempotency_keys"}
+
+
 def _tables_of_all_modules() -> set[str]:
     return {table for module in MODULES for table in module_tables(module)}
+
+
+def _expected_tables() -> set[str]:
+    return CORE_TABLES | _tables_of_all_modules()
 
 
 def test_modules_register_every_table_without_environment() -> None:
@@ -42,13 +51,13 @@ def test_modules_register_every_table_without_environment() -> None:
 
     assert proc.returncode == 0, proc.stderr[-1500:]
     tables, settings_built = proc.stdout.strip().splitlines()
-    assert tables == str(sorted(_tables_of_all_modules()))
+    assert tables == str(sorted(_expected_tables()))
     assert settings_built == "SETTINGS_BUILT 0"
 
 
-def test_every_table_belongs_to_a_registered_module() -> None:
-    """No orphan models: a table outside every `Module.models` fails here."""
-    orphans = set(Base.metadata.tables) - _tables_of_all_modules()
+def test_every_table_belongs_to_a_registered_module_or_the_core() -> None:
+    """No orphan models: a table outside every `Module.models` and the core fails."""
+    orphans = set(Base.metadata.tables) - _expected_tables()
 
     assert orphans == set()
 

@@ -70,6 +70,7 @@ Use the helpers in `tests/helpers.py`; add a shared helper there instead of copy
 | Redis | `redis_from_env`, `redis_keys`, `redis_dump`, `assert_nothing_personal_in_redis` |
 | Admin | `admin_login`, `run_action` |
 | Concurrency | `run_parallel` (threads released by a barrier) |
+| Idempotency keys | `new_idempotency_key`, `keyed` (adds `Idempotency-Key`), `assert_replayed`, `idempotency_rows` |
 | Settings, tokens | `build_settings`, `forge_access_token`, `jwt_secret` |
 
 ## What each endpoint test covers

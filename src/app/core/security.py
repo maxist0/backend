@@ -6,6 +6,7 @@ hashed with Argon2id in worker threads, bounded per event loop. Opaque tokens
 """
 
 import hashlib
+import hmac
 import secrets
 import time
 import uuid
@@ -312,3 +313,14 @@ def hash_token(raw_token: str) -> str:
         The 64-character hex digest.
     """
     return hashlib.sha256(raw_token.encode()).hexdigest()
+
+
+def derive_key(secret: str, label: bytes) -> bytes:
+    """Derive a purpose-bound HMAC key from a secret (domain separation).
+
+    The key is HMAC-SHA256 of a fixed, versioned `label` under `secret`, so
+    each purpose (rate-limit identifiers, idempotency fingerprints) gets its
+    own key and none of them is the secret itself. A JWT signature is an
+    HMAC over `<header>.<payload>`, which a label cannot be.
+    """
+    return hmac.new(secret.encode(), label, hashlib.sha256).digest()

@@ -267,7 +267,7 @@ def field_errors(errors: Sequence[Any]) -> list[dict[str, str]]:
     return result
 
 
-async def _app_error_handler(_request: Request, exc: AppError) -> Response:
+def _app_error_response(exc: AppError) -> Response:
     return problem_response(
         exc.status,
         exc.code,
@@ -276,6 +276,10 @@ async def _app_error_handler(_request: Request, exc: AppError) -> Response:
         headers=exc.headers,
         extensions=exc.extensions,
     )
+
+
+async def _app_error_handler(_request: Request, exc: AppError) -> Response:
+    return _app_error_response(exc)
 
 
 async def _validation_error_handler(
@@ -289,9 +293,7 @@ async def _validation_error_handler(
     )
 
 
-async def _http_exception_handler(
-    _request: Request, exc: StarletteHTTPException
-) -> Response:
+def _http_exception_response(exc: StarletteHTTPException) -> Response:
     # Same rule as Starlette's own handler: these statuses carry no body.
     if exc.status_code in {204, 304}:
         return Response(status_code=exc.status_code, headers=exc.headers)
@@ -305,6 +307,27 @@ async def _http_exception_handler(
         detail or HTTPStatus(exc.status_code).phrase,
         headers=exc.headers,
     )
+
+
+async def _http_exception_handler(
+    _request: Request, exc: StarletteHTTPException
+) -> Response:
+    return _http_exception_response(exc)
+
+
+def render_handled_error(exc: Exception) -> Response | None:
+    """The response the exception handlers give `exc`, rendered now.
+
+    For code that must know an error response before the handler sends it
+    (the idempotency guard stores it). The problem's `request_id` comes from
+    the same log context, so the result equals what the client receives.
+    None for an exception no handler renders (a 500).
+    """
+    if isinstance(exc, AppError):
+        return _app_error_response(exc)
+    if isinstance(exc, StarletteHTTPException):
+        return _http_exception_response(exc)
+    return None
 
 
 def internal_error_response() -> JSONResponse:

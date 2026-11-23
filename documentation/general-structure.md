@@ -78,8 +78,9 @@ The last middleware added runs first. For a request the effective order is:
    - validates the client's `X-Request-ID` (1 to 128 characters of `A-Za-z0-9._-`) or generates one, binds it to the structlog context and returns it as `X-Request-ID`;
    - sets `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy` and `Permissions-Policy`, and `Cache-Control: no-store` under `API_PREFIX` unless the route set one;
    - records `http_requests_total` and `http_request_duration_seconds` (never for `/metrics`) and writes one `http.access` event;
-   - logs an unhandled exception with `log_unexpected_error` and answers with the generic 500 problem, so the 500 carries the same headers and a `request_id`.
-4. Router, then dependencies (`DbSession`, `CurrentUser`), the route function, the service and crud.
+   - logs an unhandled exception with `log_unexpected_error` and answers with the generic 500 problem, so the 500 carries the same headers and a `request_id`;
+   - hands a copy of each response message to a recorder a dependency registered in the scope (`RESPONSE_RECORDER`); the idempotency guard stores the response that way.
+4. Router, then dependencies (`DbSession`, the route's rate limits, `Idempotent`, `CurrentUser`), the route function, the service and crud. On a marked route the guard inserts the key row into the request's session before the route runs and stores the response after it ([api.md](api.md#idempotency-keys)).
 5. Exception handlers turn `AppError`, `RequestValidationError` and Starlette `HTTPException` into RFC 9457 problem responses ([api.md](api.md)).
 
 ## Layers in a module

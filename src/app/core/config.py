@@ -219,6 +219,12 @@ class Settings(BaseSettings):
     # kept for good; at least a day, so a recent incident can be inspected.
     AUTH_CLEANUP_RETENTION_DAYS: int = Field(default=30, ge=1, le=365)
 
+    # Hours an `Idempotency-Key` and the stored response are kept; the hourly
+    # cleanup deletes them within the next hour. Stored responses can hold
+    # personal data (a registration's user), so the window stays short; a
+    # week at most.
+    IDEMPOTENCY_RETENTION_HOURS: int = Field(default=24, ge=1, le=168)
+
     # Logging (stdout only)
     LOG_LEVEL: str = "INFO"
     ACCESS_LOG_ENABLED: bool = True
