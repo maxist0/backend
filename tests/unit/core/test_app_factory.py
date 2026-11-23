@@ -16,7 +16,7 @@ from opentelemetry.util.types import AnyValue, Attributes
 from starlette.routing import BaseRoute
 
 from app import main
-from app.core import Module
+from app.core import Module, rate_limiting
 from app.core.config import Environment, Settings
 from app.modules import MODULES
 from tests.helpers import (
@@ -121,6 +121,24 @@ def _paths(routes: Sequence[BaseRoute]) -> set[str]:
         for context in iter_route_contexts(routes)
         if context.path is not None
     }
+
+
+class TestCors:
+    def test_retry_after_and_the_request_id_are_exposed(
+        self, settings_factory: SettingsFactory
+    ) -> None:
+        """A browser app on another origin may read them (`Retry-After` on 429)."""
+        app = main.create_app(settings_factory())
+
+        r = new_test_client(app).get(
+            "/health", headers={"Origin": "http://localhost:5173"}
+        )
+
+        exposed = {
+            name.strip().lower()
+            for name in r.headers["access-control-expose-headers"].split(",")
+        }
+        assert {"retry-after", "x-request-id"} <= exposed
 
 
 class TestModuleMounting:
@@ -229,6 +247,10 @@ class TestNativeTelemetryIsOff:
         # What set_logger_provider() does, but undone after the test (the
         # public setter works only once per process).
         monkeypatch.setattr("opentelemetry._logs._internal._LOGGER_PROVIDER", provider)
+        # The login's rate limit runs before validation and needs the Redis
+        # store, which only a lifespan sets up; a unit test has neither.
+        no_limits = settings_factory(RATE_LIMIT_ENABLED=False)
+        monkeypatch.setattr(rate_limiting, "get_settings", lambda: no_limits)
         app = main.create_app(settings_factory())
 
         r = new_test_client(app).post("/api/v1/auth/login", data={})

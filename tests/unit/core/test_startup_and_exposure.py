@@ -120,6 +120,33 @@ class TestStartupGuard:
 
     @pytest.mark.parametrize("env", ["prod", "stage", "test"])
     @pytest.mark.parametrize(
+        "value", ["*", "0.0.0.0/0", "::/0", "10.0.0.2, *", "10.0.0.2,::0/0"]
+    )
+    def test_forwarded_allow_ips_trusting_every_peer_refuses_to_start(
+        self, settings_factory: SettingsFactory, env: str, value: str
+    ) -> None:
+        """Else every client chooses its own address in `X-Forwarded-For`."""
+        with pytest.raises(ValueError, match="FORWARDED_ALLOW_IPS trusts every"):
+            settings_factory(ENVIRONMENT=env, FORWARDED_ALLOW_IPS=value, **STRONG)
+
+    @pytest.mark.parametrize(
+        "value", ["127.0.0.1", "10.0.0.0/8, 172.16.0.0/12", "fd00::/8", "proxy"]
+    )
+    def test_forwarded_allow_ips_of_proxies_starts(
+        self, settings_factory: SettingsFactory, value: str
+    ) -> None:
+        s = settings_factory(ENVIRONMENT="prod", FORWARDED_ALLOW_IPS=value, **STRONG)
+        assert value == s.FORWARDED_ALLOW_IPS
+
+    @pytest.mark.parametrize("env", ["dev", "unittest"])
+    def test_forwarded_allow_ips_star_is_allowed_in_dev_and_unittest(
+        self, settings_factory: SettingsFactory, env: str
+    ) -> None:
+        s = settings_factory(ENVIRONMENT=env, FORWARDED_ALLOW_IPS="*")
+        assert s.FORWARDED_ALLOW_IPS == "*"
+
+    @pytest.mark.parametrize("env", ["prod", "stage", "test"])
+    @pytest.mark.parametrize(
         ("frontend_url", "problem"),
         [
             (None, "FRONTEND_URL is the development default"),

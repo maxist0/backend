@@ -119,14 +119,18 @@ def migrated_db(sync_engine: Engine) -> str:
 
     Returns the comma-separated, quoted table list that `clean_db` truncates.
     """
-    cfg = Config(str(BACKEND_DIR / "alembic.ini"))
+    # No ini file: its logging section would run fileConfig(), which disables
+    # every logger that exists at that moment. Which loggers exist depends on
+    # what ran before (structlog creates a stdlib logger on its first event),
+    # so a later assertion on such a logger would depend on the test order.
+    # `upgrade` needs only the script location from the ini.
+    cfg = Config()
     cfg.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
     # alembic/env.py reads DATABASE_URL from the environment.
     command.upgrade(cfg, "head")
 
     # Like a process start: code tested outside a lifespan logs through the
-    # configured structlog/stdlib chain. After alembic, whose fileConfig
-    # replaces the root handlers.
+    # configured structlog/stdlib chain.
     setup_logging(get_settings())
 
     # Every table except alembic's own bookkeeping, so new models are reset
@@ -162,6 +166,27 @@ def flush_redis() -> Callable[[], None]:
     """
     _flushall()
     return _flushall
+
+
+@pytest.fixture
+def without_rate_limits() -> Iterator[None]:
+    """`RATE_LIMIT_ENABLED=false` for one test, as an operator would set it.
+
+    For tests of the mechanisms behind the limits (account lock, admission
+    limiter, single-use tokens under concurrency): those must hold while the
+    limits are off, which is also the state during a Redis outage
+    (fail-open). The limits themselves stay on everywhere else. The checks
+    read the settings per request, so the order of the fixtures does not
+    matter; the environment and the settings cache are restored together.
+    """
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("RATE_LIMIT_ENABLED", "false")
+        get_settings.cache_clear()
+        try:
+            yield
+        finally:
+            mp.undo()
+            get_settings.cache_clear()
 
 
 @pytest.fixture(autouse=True)

@@ -925,6 +925,51 @@ uv run pytest
 
 House style ([AGENTS.md → Comments and docstrings](../AGENTS.md#comments-and-docstrings)), as in the example: English, Google-style docstrings with single backticks, `Args:`, `Returns:` and `Raises:` where they add something, and an inline comment only for a WHY the code cannot express. Public functions and classes need a docstring (ruff `D`, google convention); route docstrings are user-facing. No ADR, review or phase IDs in code: they belong in commit messages and ADRs.
 
+## Rate-limiting a route
+
+A route that is expensive or can be abused (it sends mail, checks a secret, creates accounts or other costly rows) gets a rate limit from the core ([ADR 0013](adr/0013-rate-limiting-in-the-app-on-redis.md)). Nothing in the core changes for it.
+
+Per client address or per signed-in user, add a dependency to the route and list the 429 in its `responses`:
+
+```python
+from app.core import RateLimitedError, by_ip, problem_responses, rate_limit
+from app.modules.users import CurrentUser, by_user
+
+
+@router.post(
+    "",
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a note",
+    dependencies=[rate_limit("notes.create.user", "30/minute", key=by_user)],
+    responses=problem_responses(Unauthorized, 422, RateLimitedError),
+)
+async def create_note(
+    body: CreateNoteRequest, db: DbSession, current_user: CurrentUser
+) -> NoteResponse: ...
+```
+
+Per value from the request (an email address, a code, a referenced object), call `hit` in the service before the work it protects, with the value normalised the way the lookup compares it:
+
+```python
+from app.core import hit
+
+
+async def send_invitation(db: AsyncSession, inviter: User, email: str) -> None:
+    """Invite `email`; at most 5 invitations per hour per address."""
+    email = email.lower()
+    await hit("notes.invite.email", "5/hour", key=email)
+    ...  # lookup, insert, commit, enqueue
+```
+
+- **Policy names** are fixed, lower-case and dotted: `<module>.<action>.<key>`. They become a metric label and part of the Redis key, so never build them from input, and give every limit its own name: two limits with one name share one counter.
+- **Limits** are `"<count>/<unit>"` or `"<count>/<number> <unit>s"` with the units `second`, `minute`, `hour` and `day`: `"20/minute"`, `"10/15 minutes"`. A malformed name or limit fails when the module is imported (`rate_limit`) or on the first call (`hit`).
+- **Keys:** `by_ip` counts the client address from the trusted proxy (IPv6 per /64), `by_ipv6_48` the client's IPv6 /48 for a coarser second policy (IPv4 clients are not counted by it), `by_user` the signed-in user (a request without a valid token gets 401 and is not counted). Any FastAPI dependency that returns a string can be a key; a key that returns `None` skips the policy for that request. The identifier is stored only as an HMAC, so an email address as a key is fine.
+- A refused request raises `RateLimitedError` (429 `rate_limited`, `Retry-After`). Do not catch it. Count before the expensive part, and before anything that would tell an attacker more than the 429 does (an account lookup, for example).
+- `hit` works only in the API process: the API lifespan sets up the store, and a call from a worker task raises `NotConfiguredError`.
+- When Redis fails, the check lets requests through, skips Redis for 5 s and counts them in `rate_limit_fail_open_total`. `RATE_LIMIT_ENABLED=false` turns every limit off.
+- A limit must not hide a security signal: do not count requests that a security check must see, as `auth.refresh.family` counts only live refresh tokens so that a replayed rotated token always reaches reuse detection.
+- Tests: the integration suite flushes Redis before each test. Choose client addresses with `behind_proxy(app)` and `forwarded_for(ip)`, and check a refusal with `assert_rate_limited(response, window=...)` from `tests/helpers.py`; `tests/integration/core/test_rate_limiting.py` shows each of them.
+
 ## More module features
 
 | Need | How |
@@ -932,6 +977,7 @@ House style ([AGENTS.md → Comments and docstrings](../AGENTS.md#comments-and-d
 | A FastAPI dependency | `dependencies.py` with `Annotated` aliases, for example `CurrentUser` in `src/app/modules/users/dependencies.py` |
 | Email | Put Jinja templates into `templates/` (never `base.html`; that is the core layout in `src/app/core/templates/`) and call `send_templated_email(..., template_dir=...)` from a task. It returns `False` when mail is not configured. See `src/app/modules/auth/tasks.py` |
 | Caching | `@cached(ttl, key)` and `invalidate(pattern)` from `app.core`; the key holds every input that changes the result, `{user_id}` included ([redis.md](redis.md)) |
+| Rate limits | `rate_limit(...)` on a route or `hit(...)` in a service, see [Rate-limiting a route](#rate-limiting-a-route) |
 | Roles and permissions, user events, per-module settings | Not offered yet (open decision D3, [ADR 0001](adr/0001-core-and-module-contract.md)). A new setting is an edit to `src/app/core/config.py`, which needs the owner's approval. Do not build workarounds. |
 
 If a task seems to need an edit to the core, stop and ask: either the core has a gap, which is a core change with an ADR, or the code belongs in a module.

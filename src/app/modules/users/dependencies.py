@@ -1,6 +1,7 @@
 """FastAPI dependencies of the users module: the current user.
 
-Other modules use only the `CurrentUser` and `OptionalUser` aliases. The
+Other modules use the `CurrentUser` and `OptionalUser` aliases and the
+rate-limit key `by_user`. The
 token is decoded by the core (`app.core.security`), so resolving the user
 needs nothing from the auth module.
 """
@@ -125,3 +126,13 @@ async def get_optional_user(
 CurrentUser = Annotated[User, Depends(get_current_user)]
 # The user of a valid bearer token, or None without one.
 OptionalUser = Annotated[User | None, Depends(get_optional_user)]
+
+
+def by_user(user: CurrentUser) -> str:
+    """Rate-limit key of a route: the signed-in user's id.
+
+    For `rate_limit(..., key=by_user)` from `app.core`. It resolves
+    `CurrentUser` first, so a request without a valid token gets 401 and is
+    not counted; FastAPI reuses the resolved user for the route.
+    """
+    return str(user.id)

@@ -317,6 +317,9 @@ def verify_spy(monkeypatch: pytest.MonkeyPatch, db: Db) -> _LoginBurstSpy:
     return state
 
 
+# Many requests from one client: this tests the mechanism behind the rate
+# limits, which must also hold while they are off (fail-open).
+@pytest.mark.usefixtures("without_rate_limits")
 class TestLoginBurst:
     @pytest.mark.usefixtures("captured_emails")
     def test_burst_at_the_threshold_evaluates_few_guesses_and_never_logs_in(
@@ -405,6 +408,9 @@ class TestLoginBurst:
         assert audit_count(db, "login_success", "alice") == 0
 
 
+# Many requests from one client: this tests the mechanism behind the rate
+# limits, which must also hold while they are off (fail-open).
+@pytest.mark.usefixtures("without_rate_limits")
 class TestConcurrentRegistration:
     @pytest.mark.parametrize("duplicate", ["email", "username"])
     def test_parallel_duplicate_registration_yields_one_201_and_no_500(
@@ -618,6 +624,9 @@ class TestAccountDisabledRefresh:
         )
 
 
+# Many requests from one client: this tests the mechanism behind the rate
+# limits, which must also hold while they are off (fail-open).
+@pytest.mark.usefixtures("without_rate_limits")
 class TestEmailTokensSingleUse:
     def test_parallel_redemption_of_reset_token_succeeds_exactly_once(
         self, client: TestClient, captured_emails: CapturedEmails, db: Db

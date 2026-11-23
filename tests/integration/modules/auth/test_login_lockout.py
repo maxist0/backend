@@ -188,7 +188,9 @@ class TestUniformLoginRefusal:
 
 
 class TestLockout:
-    @pytest.mark.usefixtures("captured_emails")
+    # Many requests from one client: this tests the mechanism behind the rate
+    # limits, which must also hold while they are off (fail-open).
+    @pytest.mark.usefixtures("captured_emails", "without_rate_limits")
     def test_parallel_failed_logins_lock_the_account(
         self, client: TestClient, db: Db
     ) -> None:

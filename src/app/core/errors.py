@@ -121,6 +121,22 @@ class Conflict(AppError):
     detail = "The request conflicts with the current state of the resource."
 
 
+class RateLimitedError(AppError):
+    """429: a rate limit refused the request; `Retry-After` says for how long.
+
+    Args:
+        retry_after: Whole seconds after which the same request is accepted
+            again (RFC 9110 section 10.2.3).
+    """
+
+    status = 429
+    code = "rate_limited"
+    detail = "Too many requests. Try again later."
+
+    def __init__(self, retry_after: int) -> None:
+        super().__init__(headers={"Retry-After": str(retry_after)})
+
+
 class FieldError(BaseModel):
     """One invalid input of a 422 problem."""
 
@@ -294,6 +310,26 @@ async def _http_exception_handler(
 def internal_error_response() -> JSONResponse:
     """Render the generic 500 problem; it never contains exception details."""
     return problem_response(500, "internal_error", _INTERNAL_ERROR_DETAIL)
+
+
+_BODY_TOO_LARGE_DETAIL = "The request body is larger than the server accepts."
+
+
+class BodyTooLargeError(StarletteHTTPException):
+    """413: the request body grew past the limit while it was being read.
+
+    An `HTTPException` on purpose: FastAPI's body parsing passes those on
+    unchanged (it turns any other error into a 400), and the handler above
+    renders it as a problem with the framework code `content_too_large`.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(status_code=413, detail=_BODY_TOO_LARGE_DETAIL)
+
+
+def body_too_large_response() -> JSONResponse:
+    """Render the 413 problem of a body above the limit, before any routing."""
+    return problem_response(413, _code_for_status(413), _BODY_TOO_LARGE_DETAIL)
 
 
 def register_error_handlers(app: FastAPI) -> None:

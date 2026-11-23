@@ -21,6 +21,8 @@ from tests.helpers import (
     new_test_client,
 )
 
+BODY_LIMIT = 64
+
 SECURITY_HEADERS = {
     "x-content-type-options": "nosniff",
     "x-frame-options": "DENY",
@@ -61,7 +63,11 @@ def tiny_client() -> TestClient:
         ]
     )
     app.add_middleware(
-        RequestMiddleware, api_prefix="/api/v1", access_log=True, metrics=True
+        RequestMiddleware,
+        api_prefix="/api/v1",
+        access_log=True,
+        metrics=True,
+        max_body_bytes=BODY_LIMIT,
     )
     return new_test_client(app)
 
@@ -158,7 +164,11 @@ class TestAccessLog:
     ) -> None:
         app = Starlette(routes=[Route("/health", _health)])
         app.add_middleware(
-            RequestMiddleware, api_prefix="/api/v1", access_log=False, metrics=False
+            RequestMiddleware,
+            api_prefix="/api/v1",
+            access_log=False,
+            metrics=False,
+            max_body_bytes=BODY_LIMIT,
         )
         caplog.set_level(logging.INFO)
 

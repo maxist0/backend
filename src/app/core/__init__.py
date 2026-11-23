@@ -27,6 +27,7 @@ from app.core.errors import (
     Forbidden,
     NotFound,
     ProblemDetail,
+    RateLimitedError,
     Unauthorized,
     constraint_name,
     log_unexpected_error,
@@ -35,6 +36,7 @@ from app.core.errors import (
 from app.core.logging import get_logger
 from app.core.mail import get_mailer, mail_delivery_error, send_templated_email
 from app.core.module import Module
+from app.core.rate_limiting import by_ip, by_ipv6_48, hit, rate_limit
 from app.core.security import (
     TokenData,
     create_access_token,
@@ -60,6 +62,7 @@ __all__ = [
     "Module",
     "NotFound",
     "ProblemDetail",
+    "RateLimitedError",
     "RedisDep",
     "Settings",
     "SettingsDep",
@@ -70,6 +73,8 @@ __all__ = [
     "UUIDPrimaryKey",
     "Unauthorized",
     "back_to_list",
+    "by_ip",
+    "by_ipv6_48",
     "cached",
     "constraint_name",
     "create_access_token",
@@ -80,12 +85,14 @@ __all__ = [
     "get_settings",
     "hash_password",
     "hash_token",
+    "hit",
     "invalidate",
     "log_unexpected_error",
     "login_admission_limiter",
     "mail_delivery_error",
     "password_needs_rehash",
     "problem_responses",
+    "rate_limit",
     "selected_ids",
     "send_templated_email",
     "session_factory",

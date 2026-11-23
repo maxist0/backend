@@ -10,6 +10,12 @@ unpickling data read from Redis runs code chosen by whoever can write to
 Redis. A cached function therefore returns JSON types only (`dict`, `list`,
 `str`, `int`, `float`, `bool`, `None`); cache `model.model_dump(mode="json")`
 instead of a Pydantic model.
+
+The rate limiter (`app.core.rate_limiting`) keeps its counters in a second
+cashews `Cache` on the same server and database, `rate_limit_store`. It
+raises on a Redis error instead of answering `None` like the cache, so an
+outage is seen and counted instead of being logged by cashews once per
+command.
 """
 
 from collections.abc import Awaitable, Callable
@@ -28,6 +34,14 @@ logger = get_logger(__name__)
 # cashews binds decorators to a `Cache` object at import; the lifespan
 # configures its backend.
 _cache = Cache(name="app")
+rate_limit_store = Cache(name="rate_limit")
+
+# Bound, in seconds, for opening a connection to Redis and for waiting for a
+# free one in the rate limiter's pool. A limit check fails open when Redis is
+# unreachable, and without these bounds every request would first wait for
+# redis-py's 5 s connect timeout or cashews' 10 s pool wait. Commands are
+# bounded by cashews' default socket timeout of 1 s.
+_RATE_LIMIT_STORE_TIMEOUT = 1.0
 
 
 async def open_redis(settings: Settings) -> redis.Redis:
@@ -70,22 +84,35 @@ RedisDep = Annotated[redis.Redis, Depends(get_redis)]
 
 
 def setup_cache(settings: Settings) -> None:
-    """Point the cache at the same Redis server and database as `RedisDep`.
+    """Point the cache and the rate-limit store at the server of `RedisDep`.
 
-    cashews builds its own connection pool from the URL (its Redis backend
-    takes no client), bounded by `CACHE_MAX_CONNECTIONS`. Opens no connection.
+    Both use the same Redis server and database as `RedisDep`. cashews
+    builds its own connection pool per `Cache` from the URL (its Redis
+    backend takes no client), each bounded by `CACHE_MAX_CONNECTIONS`.
+    Opens no connection.
     """
+    url = f"redis://{settings.CACHE_HOST}:{settings.CACHE_PORT}/{settings.CACHE_DB}"
     _cache.setup(
-        f"redis://{settings.CACHE_HOST}:{settings.CACHE_PORT}/{settings.CACHE_DB}",
+        url,
         password=settings.CACHE_PASSWORD,
         max_connections=settings.CACHE_MAX_CONNECTIONS,
         pickle_type=PicklerType.JSON.value,
     )
+    rate_limit_store.setup(
+        url,
+        password=settings.CACHE_PASSWORD,
+        max_connections=settings.CACHE_MAX_CONNECTIONS,
+        pickle_type=PicklerType.JSON.value,
+        suppress=False,
+        socket_connect_timeout=_RATE_LIMIT_STORE_TIMEOUT,
+        wait_for_connection_timeout=_RATE_LIMIT_STORE_TIMEOUT,
+    )
 
 
 async def close_cache() -> None:
-    """Close the cache's connection pool."""
+    """Close the connection pools of the cache and the rate-limit store."""
     await _cache.close()
+    await rate_limit_store.close()
 
 
 def cached[**P, R](

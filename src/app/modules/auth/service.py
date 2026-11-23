@@ -38,6 +38,7 @@ from app.core import (
     get_settings,
     hash_password,
     hash_token,
+    hit,
     login_admission_limiter,
     password_needs_rehash,
     utcnow,
@@ -692,13 +693,24 @@ async def refresh_session(
         InvalidRefreshTokenError: The token is unknown, expired (its family
             ended included), revoked or reused, or the account is inactive
             or admin-locked.
+        RateLimitedError: More than 10 refreshes in a minute for the
+            token's session family; nothing was changed. Only live tokens
+            are counted and refused; a rotated one always gets the reuse
+            check.
     """
     token_hash_val = hash_token(raw_token)
 
     owner = await crud.get_session_owner(db, token_hash_val)
     if owner is None:
         raise InvalidRefreshTokenError()
-    owner_id, family_id = owner
+    owner_id, family_id, live = owner
+    # Only a live token is counted. A rotated one must always reach the reuse
+    # check below: whoever keeps the family's window full (the thief) must
+    # not turn the victim's replay into a 429 that revokes nothing. Counted
+    # before the user lock, so a refused refresh takes no lock and rotates
+    # nothing; the cookie stays valid.
+    if live:
+        await hit("auth.refresh.family", "10/minute", key=str(family_id))
 
     user = await crud.lock_and_get_user(db, owner_id)
     # Only the indefinite (admin) lock ends sessions; a timed lock from
@@ -801,7 +813,7 @@ async def logout_session(
     owner = await crud.get_session_owner(db, token_hash_val)
     if owner is None:
         raise SessionNotFoundError()
-    await crud.lock_user(db, owner[0])
+    await crud.lock_user(db, owner.user_id)
     sess = await crud.get_session_by_token_hash(db, token_hash_val)
     if sess is None:
         await db.rollback()
@@ -859,8 +871,15 @@ async def forgot_password(
     tokens of such accounts as well. The mail goes to the stored address,
     never to the request input. The response time still differs between
     known and unknown addresses (README, Known issues).
+
+    Raises:
+        RateLimitedError: More than 3 requests in an hour for this address,
+            counted before the lookup, so the refusal does not tell whether
+            the address belongs to an account.
     """
-    user = await users_crud.get_user_by_email(db, email.lower())
+    email = email.lower()
+    await hit("auth.password_forgot.email", "3/hour", key=email)
+    user = await users_crud.get_user_by_email(db, email)
     if user is None:
         return
 
@@ -1063,9 +1082,13 @@ async def resend_verification_email(
 
     Raises:
         EmailAlreadyVerifiedError: The address is verified already.
+        RateLimitedError: More than 3 mails in an hour to this address.
     """
     if user.is_email_verified:
         raise EmailAlreadyVerifiedError()
+    # Per recipient as well as per user: an address freed by an email
+    # change and registered again must not get a fresh allowance.
+    await hit("auth.email_verify_resend.email", "3/hour", key=user.email)
 
     token_id = await _open_email_token(
         db, user.id, EmailTokenPurpose.VERIFY_EMAIL, _EMAIL_TOKEN_LIFETIME
@@ -1554,12 +1577,17 @@ async def request_email_change(
         WrongPasswordError: `current_password` is wrong, the user has no
             password credential, or the account is locked.
         EmailUnchangedError: `new_email` is the current address.
+        RateLimitedError: More than 3 requests in an hour for `new_email`,
+            from all accounts together.
         EmailTakenError: `new_email` belongs to another account.
     """
     user_id = user.id
     seen = await _confirm_password(db, user_id, current_password, request)
     if new_email == user.email:
         raise EmailUnchangedError()
+    # Per recipient, from all accounts together, against mail bombing; before
+    # the lookup, so a 429 does not tell whether the address is registered.
+    await hit("auth.email_change.new_email", "3/hour", key=new_email)
     if await users_crud.get_user_by_email(db, new_email) is not None:
         raise EmailTakenError()
 

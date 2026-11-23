@@ -6,7 +6,7 @@ import structlog
 from fastapi import Depends, Request
 from fastapi.security import OAuth2PasswordRequestForm
 
-from app.core import DbSession
+from app.core import DbSession, by_ip, hit
 from app.modules.auth.errors import InvalidRefreshTokenError
 from app.modules.auth.service import authenticate_user
 from app.modules.users import User
@@ -19,7 +19,20 @@ async def authenticate_form_user(
     db: DbSession,
     form_data: Annotated[OAuth2PasswordRequestForm, Depends()],
 ) -> User:
-    """Authenticate via the OAuth2 password form (`/auth/login`, Swagger)."""
+    """Authenticate via the OAuth2 password form (`/auth/login`, Swagger).
+
+    Raises:
+        RateLimitedError: More than 10 attempts in 15 minutes for this
+            username from this client address.
+    """
+    # Before any lookup, admission slot or Argon2: a refused guess costs no
+    # hash, and the count is the same whether the account exists or not.
+    # Lower case, as the lookup compares usernames.
+    await hit(
+        "auth.login.ip_username",
+        "10/15 minutes",
+        key=f"{by_ip(request)}\0{form_data.username.lower()}",
+    )
     user = await authenticate_user(db, form_data.username, form_data.password, request)
 
     # Stamp every subsequent log in this request with the authenticated user.

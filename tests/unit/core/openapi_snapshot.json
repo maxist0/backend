@@ -675,7 +675,7 @@
     },
     "/api/v1/auth/email/verify": {
       "post": {
-        "description": "Redeem the token of a verification or email-change link.\n\nA verification link marks the address verified. An email-change link\nswitches the account to the new address (409 `email_taken` if another\naccount took it meanwhile). Each token works once.",
+        "description": "Redeem the token of a verification or email-change link.\n\nA verification link marks the address verified. An email-change link\nswitches the account to the new address (409 `email_taken` if another\naccount took it meanwhile). Each token works once. At most 10 attempts\nper 15 minutes from one client address; more get 429 with `Retry-After`.",
         "operationId": "email_verify_api_v1_auth_email_verify_post",
         "requestBody": {
           "content": {
@@ -720,6 +720,16 @@
               }
             },
             "description": "Unprocessable Content: `validation_error`"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description": "Too Many Requests: `rate_limited`"
           }
         },
         "summary": "Confirm an email address",
@@ -730,7 +740,7 @@
     },
     "/api/v1/auth/email/verify/resend": {
       "post": {
-        "description": "Send a new verification link to the signed-in user's address.\n\nEarlier links stop working.",
+        "description": "Send a new verification link to the signed-in user's address.\n\nEarlier links stop working. At most 3 requests per hour per user and 3\nper hour to one address; more get 429 with `Retry-After`.",
         "operationId": "email_verify_resend_api_v1_auth_email_verify_resend_post",
         "responses": {
           "202": {
@@ -755,6 +765,16 @@
               }
             },
             "description": "Unauthorized: `unauthorized`"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description": "Too Many Requests: `rate_limited`"
           }
         },
         "security": [
@@ -770,7 +790,7 @@
     },
     "/api/v1/auth/login": {
       "post": {
-        "description": "Sign in with the OAuth2 password form (`username`, `password`).\n\nReturns an access token and the user. The refresh token is set as an\nhttpOnly cookie for the auth routes. A wrong password, an unknown user and\na locked or deactivated account all get the same 401.",
+        "description": "Sign in with the OAuth2 password form (`username`, `password`).\n\nReturns an access token and the user. The refresh token is set as an\nhttpOnly cookie for the auth routes. A wrong password, an unknown user and\na locked or deactivated account all get the same 401.\n\nAt most 20 attempts per minute from one client address (an IPv6 client\nper /64, and 100 per minute per /48), and 10 per 15 minutes for one\nusername from one address, whether the account exists or not; more get\n429 with `Retry-After`.",
         "operationId": "login_api_v1_auth_login_post",
         "requestBody": {
           "content": {
@@ -812,6 +832,16 @@
               }
             },
             "description": "Unprocessable Content: `validation_error`"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description": "Too Many Requests: `rate_limited`"
           }
         },
         "summary": "Sign in",
@@ -887,7 +917,7 @@
     },
     "/api/v1/auth/password/forgot": {
       "post": {
-        "description": "Send a password-reset link if the address belongs to an account.\n\nThe answer is the same whether or not it does.",
+        "description": "Send a password-reset link if the address belongs to an account.\n\nThe answer is the same whether or not it does. At most 5 requests per\n15 minutes from one client address (an IPv6 client per /64, and 25 per\n/48) and 3 per hour for one email address, whether it belongs to an\naccount or not; more get 429 with `Retry-After`.",
         "operationId": "password_forgot_api_v1_auth_password_forgot_post",
         "requestBody": {
           "content": {
@@ -912,6 +942,16 @@
               }
             },
             "description": "Unprocessable Content: `validation_error`"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description": "Too Many Requests: `rate_limited`"
           }
         },
         "summary": "Request a password-reset email",
@@ -922,7 +962,7 @@
     },
     "/api/v1/auth/password/reset": {
       "post": {
-        "description": "Set a new password with the token from the reset email.\n\nEvery session of the account is signed out.",
+        "description": "Set a new password with the token from the reset email.\n\nEvery session of the account is signed out. At most 10 attempts per 15\nminutes from one client address; more get 429 with `Retry-After`.",
         "operationId": "password_reset_api_v1_auth_password_reset_post",
         "requestBody": {
           "content": {
@@ -957,6 +997,16 @@
               }
             },
             "description": "Unprocessable Content: `validation_error`"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description": "Too Many Requests: `rate_limited`"
           }
         },
         "summary": "Reset the password",
@@ -967,7 +1017,7 @@
     },
     "/api/v1/auth/refresh": {
       "post": {
-        "description": "Exchange the refresh cookie for a new access token.\n\nThe refresh token is rotated: the cookie is replaced and the old token\nstops working. Presenting a rotated token again revokes all sessions of\nits family. No access token is needed. A refused cookie (unknown,\nexpired, revoked or reused) is cleared with the 401.",
+        "description": "Exchange the refresh cookie for a new access token.\n\nThe refresh token is rotated: the cookie is replaced and the old token\nstops working. Presenting a rotated token again revokes all sessions of\nits family. No access token is needed. A refused cookie (unknown,\nexpired, revoked or reused) is cleared with the 401.\n\nAt most 60 refreshes per minute from one client address and 10 per\nminute for one login session; more get 429 with `Retry-After`, and the\ncookie stays valid.",
         "operationId": "refresh_tokens_api_v1_auth_refresh_post",
         "responses": {
           "200": {
@@ -989,6 +1039,16 @@
               }
             },
             "description": "Unauthorized: `invalid_refresh_token`"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description": "Too Many Requests: `rate_limited`"
           }
         },
         "summary": "Get a new access token",
@@ -999,7 +1059,7 @@
     },
     "/api/v1/auth/register": {
       "post": {
-        "description": "Create an account and send a verification email to its address.\n\nThe account can sign in right away; the address stays unverified until\nthe link in the email is used.",
+        "description": "Create an account and send a verification email to its address.\n\nThe account can sign in right away; the address stays unverified until\nthe link in the email is used. At most 5 registrations per hour from one\nclient address; more get 429 with `Retry-After`.",
         "operationId": "register_api_v1_auth_register_post",
         "requestBody": {
           "content": {
@@ -1041,6 +1101,16 @@
               }
             },
             "description": "Unprocessable Content: `validation_error`"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description": "Too Many Requests: `rate_limited`"
           }
         },
         "summary": "Register an account",
@@ -1143,7 +1213,7 @@
     },
     "/api/v1/users/me/email": {
       "put": {
-        "description": "Request a new email address; requires the current password.\n\nA confirmation link goes to the new address. The account keeps its\ncurrent address until the link is used (`POST /auth/email/verify`); a\nnew request replaces the previous link.",
+        "description": "Request a new email address; requires the current password.\n\nA confirmation link goes to the new address. The account keeps its\ncurrent address until the link is used (`POST /auth/email/verify`); a\nnew request replaces the previous link. At most 5 attempts per 15\nminutes per user, and 3 links per hour to one new address from all\naccounts together (counted before the address is checked); more get 429\nwith `Retry-After`.",
         "operationId": "change_my_email_api_v1_users_me_email_put",
         "requestBody": {
           "content": {
@@ -1198,6 +1268,16 @@
               }
             },
             "description": "Unprocessable Content: `validation_error`"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description": "Too Many Requests: `rate_limited`"
           }
         },
         "security": [
@@ -1213,7 +1293,7 @@
     },
     "/api/v1/users/me/password": {
       "put": {
-        "description": "Change the signed-in user's password; requires the current password.\n\nEvery other session of the user is signed out; the calling session stays.",
+        "description": "Change the signed-in user's password; requires the current password.\n\nEvery other session of the user is signed out; the calling session stays.\nAt most 5 attempts per 15 minutes per user; more get 429 with\n`Retry-After`.",
         "operationId": "change_my_password_api_v1_users_me_password_put",
         "requestBody": {
           "content": {
@@ -1258,6 +1338,16 @@
               }
             },
             "description": "Unprocessable Content: `validation_error`"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description": "Too Many Requests: `rate_limited`"
           }
         },
         "security": [

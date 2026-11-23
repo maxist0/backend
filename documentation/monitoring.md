@@ -24,6 +24,8 @@ The metrics, health endpoints and the monitoring stack of the backend. Form: ref
 | `auth_login_failures_total` | counter | `reason`: `invalid_password`, `unknown_user`, `locked`, `inactive` | `src/app/modules/auth/service.py` |
 | `auth_lockouts_total` | counter | none | `src/app/modules/auth/service.py` |
 | `auth_refresh_token_reuse_total` | counter | none | `src/app/modules/auth/service.py` |
+| `rate_limit_rejections_total` | counter | `policy` (fixed names such as `auth.login.ip`) | `src/app/core/rate_limiting.py` |
+| `rate_limit_fail_open_total` | counter | `policy`; requests let through unchecked because Redis was unreachable | `src/app/core/rate_limiting.py` |
 | `process_*`, `python_gc_*` | standard collectors | | `prometheus_client` |
 
 - `route` is the route template (`/api/v1/users/me`, `/api/v1/notes/{note_id}`) or `unmatched`, so arbitrary request paths cannot create label values.
@@ -70,6 +72,13 @@ histogram_quantile(0.95, sum by (le, route) (rate(http_request_duration_seconds_
 
 # Refused logins by reason
 sum by (reason) (rate(auth_login_failures_total[5m]))
+
+# Requests refused by a rate limit, by policy
+sum by (policy) (rate(rate_limit_rejections_total[5m]))
+
+# Rate limits not enforced because Redis failed (alert on > 0; pair it with an
+# alert on Redis used_memory, since eviction resets limits without this signal)
+sum(increase(rate_limit_fail_open_total[5m]))
 
 # Any reuse of a rotated refresh token
 increase(auth_refresh_token_reuse_total[1h]) > 0

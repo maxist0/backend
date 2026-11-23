@@ -10,6 +10,7 @@ transaction and decides when it ends.
 
 import uuid
 from datetime import datetime, timedelta
+from typing import NamedTuple
 
 from sqlalchemy import (
     ColumnElement,
@@ -348,22 +349,31 @@ async def create_session(db: AsyncSession, session: Session) -> Session:
     return session
 
 
-async def get_session_owner(
-    db: AsyncSession, token_hash: str
-) -> tuple[uuid.UUID, uuid.UUID] | None:
-    """Return `(user_id, family_id)` of a session (any state) without locking.
+class SessionOwner(NamedTuple):
+    """Owner and family of a session, and whether the rotation gate would pass."""
+
+    user_id: uuid.UUID
+    family_id: uuid.UUID
+    live: bool
+
+
+async def get_session_owner(db: AsyncSession, token_hash: str) -> SessionOwner | None:
+    """Return the owner and family of a session (any state) without locking.
 
     Both columns never change, so reading them before the user lock is safe.
+    `live` uses the predicate and the database clock of `rotate_session`; it
+    can turn false before the gate runs, never true.
     """
+    live = and_(Session.is_revoked.is_(False), Session.expires_at > func.now())
     result = await db.execute(
-        select(Session.user_id, Session.family_id).where(
+        select(Session.user_id, Session.family_id, live).where(
             Session.token_hash == token_hash
         )
     )
     row = result.first()
     if row is None:
         return None
-    return row[0], row[1]
+    return SessionOwner(row[0], row[1], bool(row[2]))
 
 
 async def get_session_by_token_hash(

@@ -34,6 +34,7 @@ from app.core.errors import register_error_handlers
 from app.core.health import METRICS_PATH, include_health_routes
 from app.core.logging import get_logger, setup_logging
 from app.core.middleware import RequestMiddleware
+from app.core.rate_limiting import warn_if_disabled
 from app.core.tasks import build_broker
 from app.modules import MODULES
 
@@ -70,6 +71,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         host=settings.HOST,
         port=settings.PORT,
     )
+    warn_if_disabled(settings)
 
     async with AsyncExitStack() as stack:
         # Database: loop check (Windows), engine, connectivity check, bind
@@ -175,6 +177,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         api_prefix=settings.API_PREFIX,
         access_log=settings.ACCESS_LOG_ENABLED,
         metrics=settings.METRICS_ENABLED,
+        max_body_bytes=settings.MAX_REQUEST_BODY_BYTES,
     )
     app.add_middleware(
         CORSMiddleware,
@@ -182,6 +185,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+        # Without this a browser on another origin cannot read them: the
+        # wait after a 429 and the id to quote in a support request.
+        expose_headers=["Retry-After", "X-Request-ID"],
     )
 
     include_health_routes(app, settings)

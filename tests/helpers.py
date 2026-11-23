@@ -33,6 +33,7 @@ from httpx2 import Response
 from sqlalchemy import Engine, RowMapping, Table, text
 from starlette.types import ASGIApp
 from taskiq import AsyncTaskiqDecoratedTask, AsyncTaskiqTask
+from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 from app.core import Base, Module
 from app.core.config import Settings, get_settings
@@ -618,6 +619,56 @@ def redis_dump() -> bytes:
                 else:
                     raise AssertionError(f"unexpected Redis type {kind!r}")
     return b"\n".join(c if isinstance(c, bytes) else c.encode() for c in chunks)
+
+
+def redis_from_cache_env() -> redis_sync.Redis:
+    """A sync client for the cache database of the test environment."""
+    port = int(os.environ["CACHE_PORT"])
+    return redis_sync.Redis(port=port, db=int(os.environ.get("CACHE_DB", "0")))
+
+
+def set_cache_redis_config(name: str, value: int | str) -> None:
+    """`CONFIG SET` on the cache's Redis (the session container)."""
+    with redis_from_cache_env() as r:
+        r.config_set(name, value)  # pyright: ignore[reportUnknownMemberType] - redis-py leaves `**kwargs` of config_set() unannotated
+
+
+def replace_with_string(key: bytes) -> None:
+    """Overwrite `key` in the cache database with a plain string value."""
+    with redis_from_cache_env() as r:
+        r.set(key, b"not a sorted set")
+
+
+def rate_limit_keys() -> list[bytes]:
+    """The rate-limit keys in the cache database (`rate_limit:*`)."""
+    with redis_from_cache_env() as r:
+        return redis_keys(r, "rate_limit:*")
+
+
+def behind_proxy(app: ASGIApp) -> ASGIApp:
+    """`app` behind uvicorn's proxy-header middleware, as `run.py` serves it.
+
+    The test client is the trusted proxy, so each request chooses its client
+    address with `forwarded_for(ip)`; without the header it is `testclient`.
+    """
+    # uvicorn types its middleware with its own ASGI protocol classes; at
+    # run time both sides are plain ASGI callables.
+    return cast("ASGIApp", ProxyHeadersMiddleware(cast("Any", app), trusted_hosts="*"))
+
+
+def forwarded_for(ip: str) -> dict[str, str]:
+    """The header that makes `behind_proxy` use `ip` as the client address."""
+    return {"X-Forwarded-For": ip}
+
+
+def assert_rate_limited(r: Response, *, window: int) -> None:
+    """`r` is a 429 problem `rate_limited` with a `Retry-After` within `window`."""
+    assert r.status_code == 429, f"{r.status_code} {r.text[:200]}"
+    assert r.headers["content-type"] == "application/problem+json"
+    assert r.json()["code"] == "rate_limited"
+    retry_after = r.headers["retry-after"]
+    assert retry_after.isdigit(), retry_after
+    assert 1 <= int(retry_after) <= window, retry_after
 
 
 def assert_nothing_personal_in_redis(*secrets: str) -> None:

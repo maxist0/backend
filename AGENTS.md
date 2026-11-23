@@ -141,6 +141,7 @@ House style, enforced by ruff (rule sets `D` with the google convention, and `ER
 - Auth-protected routes use `CurrentUser` (or `OptionalUser`); do not re-implement token parsing. Do not change `src/app/modules/auth/`, `src/app/modules/users/` or `src/app/core/security.py` internals unless the task is about auth.
 - Error messages must not reveal whether an account exists (see [Known issues](README.md#known-issues) for the accepted gaps).
 - Validate and bound every input (`max_length`, ranges, enums). Reject unknown fields.
+- Routes that send mail, check a secret or create accounts get a rate limit: `rate_limit(...)` on the route or `hit(...)` in the service before the lookup or the hash ([ADR 0013](documentation/adr/0013-rate-limiting-in-the-app-on-redis.md), [modules.md](documentation/modules.md#rate-limiting-a-route)). A 429 must not tell more than the normal answer would, so count submitted identifiers before any lookup.
 - CORS, cookies and headers are configured centrally (`create_app()` and `src/app/core/middleware.py`); do not set them per route. The client IP comes only from the ASGI scope; uvicorn's proxy headers are enabled with trusted `FORWARDED_ALLOW_IPS`.
 - Do not log request bodies, query strings, `Authorization`, cookies, emails or usernames. User context in logs is `user_id` only.
 - Log unexpected exceptions with `log_unexpected_error(logger, event, exc)` or `error_type=type(exc).__name__`, never `error=str(e)`: database error text can contain user data.

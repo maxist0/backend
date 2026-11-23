@@ -8,7 +8,7 @@ One Redis server, three databases:
 
 | Database | Settings | Holds |
 |---|---|---|
-| db 0 | `CACHE_HOST`, `CACHE_PORT`, `CACHE_DB` (default `0`), `CACHE_PASSWORD` | The `@cached` values and anything you store through `RedisDep` |
+| db 0 | `CACHE_HOST`, `CACHE_PORT`, `CACHE_DB` (default `0`), `CACHE_PASSWORD` | The `@cached` values, the rate-limit logs (`rate_limit:<policy>:<hmac>`, sorted sets of timestamps that expire one window after their newest entry; [ADR 0013](adr/0013-rate-limiting-in-the-app-on-redis.md)) and anything you store through `RedisDep`. The `rate_limit:` prefix is reserved |
 | db 1 | `TASKIQ_BROKER_URL` | The task stream `taskiq:tasks` (consumer group `taskiq`) and the retry schedules (keys `taskiq_retry:*`) |
 | db 2 | `TASKIQ_RESULT_BACKEND_URL` | Task results, JSON, 1 hour TTL |
 
@@ -38,7 +38,7 @@ async def rename(user_id: str) -> None:
 - There is no HTTP response cache and no ETag middleware.
 - No built-in route uses `@cached` today.
 
-`RedisDep` (`Annotated[redis.Redis, Depends(get_redis)]`) gives a route or dependency the async client for direct commands. The lifespan opens the client with a ping and closes it on shutdown. The cache opens its own connection pool from the same host, port and database, bounded by `CACHE_MAX_CONNECTIONS`.
+`RedisDep` (`Annotated[redis.Redis, Depends(get_redis)]`) gives a route or dependency the async client for direct commands. The lifespan opens the client with a ping and closes it on shutdown. The cache opens its own connection pool from the same host, port and database, bounded by `CACHE_MAX_CONNECTIONS`, and so does the rate-limit store. Unlike the cache, the rate-limit store raises on a Redis error instead of logging it per command, so `app.core.rate_limiting` can count the outage, let the request through and skip Redis for 5 s ([api.md](api.md#limits)). Eviction is the quiet failure: under `allkeys-lru` a full Redis evicts rate-limit logs and the counting starts again, without any error; the counters therefore belong on their own instance in production (README known issue 31).
 
 ## Background jobs
 

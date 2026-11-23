@@ -29,7 +29,8 @@ Decoding reads the algorithm from a fixed list, never from the token. It require
 
 ```
 register ──▶ user + argon2id credential + VERIFY_EMAIL token ──▶ mail task
-login    ──▶ username lookup ignoring case (a name outside the username pattern counts as unknown), lock check, admission limiter (PASSWORD_HASH_CONCURRENCY), lock re-check,
+login    ──▶ rate limits (per address; per address and username), then
+             username lookup ignoring case (a name outside the username pattern counts as unknown), lock check, admission limiter (PASSWORD_HASH_CONCURRENCY), lock re-check,
              verify password (Argon2 in a thread pool; dummy verify for unknown or inactive users),
              success = conditional atomic UPDATE (refused once locked)
              ──▶ access token (15 min)
@@ -50,7 +51,7 @@ password change ──▶ revoke all sessions except the caller's (`sid`), inval
 
 A refresh that fails with 401 clears the refresh cookie (known issue 25).
 
-**Login answers.** A wrong password, an unknown user and a locked or inactive account all get the same 401 `invalid_credentials`. A locked account waits a calibrated time instead of running Argon2, so the response time does not reveal the lock (known issue 17 for the remaining gap). `POST /auth/password/forgot` answers 202 for every address, also when enqueueing the mail fails (known issue 23 for the timing gap).
+**Login answers.** A wrong password, an unknown user and a locked or inactive account all get the same 401 `invalid_credentials`. A locked account waits a calibrated time instead of running Argon2, so the response time does not reveal the lock (known issue 17 for the remaining gap). `POST /auth/password/forgot` answers 202 for every address, also when enqueueing the mail fails (known issue 23 for the timing gap). Above a rate limit both answer 429 `rate_limited` (see [Rate limits](#rate-limits)), the same for every username and address.
 
 **Duplicate registrations.** Usernames are unique regardless of case (`Alice` and `alice` are one name) and keep the casing given at registration; login accepts any casing. A username consists of ASCII letters, digits, `-` and `_` only (the whole value; a trailing line break is refused with 422). A login name that does not match that pattern is treated as an unknown user without a database lookup, because PostgreSQL's `lower()` folds some non-ASCII letters onto ASCII ones (the Kelvin sign, U+212A, onto `k`). Two parallel registrations with the same username or email are decided by the unique index `uq_users_lower_username` and the constraint `uq_users_email`. The loser gets 409 `user_exists`, never 500.
 
@@ -73,7 +74,21 @@ A refresh that fails with 401 clears the refresh cookie (known issue 25).
 
 A timed lock blocks only password login. Anyone who knows a username could otherwise trigger it and log that user out, so it must not end sessions. Source: `User.is_admin_locked()` and `User.is_lock_active()` in `src/app/modules/users/models.py`, used by `CurrentUser` in `src/app/modules/users/dependencies.py` and by the refresh gate in `src/app/modules/auth/service.py`.
 
-**Login burst protection.** Each process admits at most `PASSWORD_HASH_CONCURRENCY` password evaluations at a time. A login re-reads the lock state after it is admitted, so guesses queued behind the one that locked the account are refused without an Argon2 evaluation. A successful login is one conditional atomic `UPDATE`: no login succeeds once a lock is committed. An expired timed lock is lifted by a conditional `UPDATE` as well, so a lock committed by a parallel guess after the check is never erased. With N processes the bound is N × `PASSWORD_HASH_CONCURRENCY`. Rate limiting (D4) is the main control and is still open.
+**Login burst protection.** Each process admits at most `PASSWORD_HASH_CONCURRENCY` password evaluations at a time. A login re-reads the lock state after it is admitted, so guesses queued behind the one that locked the account are refused without an Argon2 evaluation. A successful login is one conditional atomic `UPDATE`: no login succeeds once a lock is committed. An expired timed lock is lifted by a conditional `UPDATE` as well, so a lock committed by a parallel guess after the check is never erased. With N processes the bound is N × `PASSWORD_HASH_CONCURRENCY`. The rate limits below run in front of all of this and are the main control.
+
+## Rate limits
+
+The auth routes are rate limited in the app on Redis ([ADR 0013](adr/0013-rate-limiting-in-the-app-on-redis.md)); the policies and their values are listed in [api.md](api.md#limits). How they meet the flows above:
+
+- **Login.** Two policies: 20 attempts a minute per client address (route dependency), and 10 per 15 minutes per client address and lower-case submitted username (`authenticate_form_user` in `src/app/modules/auth/dependencies.py`, before `authenticate_user`). Both are counted before the lookup, the lock check, the admission limiter and Argon2, so a refused attempt costs one Redis round trip and no hash, and the count is the same whether the account exists, is locked or not. The account lock still applies to every attempt that gets through: five failures lock the account long before the per-username limit (10) is reached, and the lock mail is unchanged. An IPv6 client is counted per /64; a third policy counts 100 attempts a minute per /48, so a client that rotates through the /64s of its site is bounded too (IPv4 clients are not counted by it).
+- **Forgot password.** 5 requests per 15 minutes per client address, and 3 per hour per lower-case email address from any client, counted at the start of `forgot_password` before the account lookup. The second limit caps the reset mails one address can receive and the timing samples one address yields (known issue 23). IPv6 clients are also limited to 25 per 15 minutes per /48.
+- **Refresh.** 60 per minute per client address, and 10 per minute per session family, counted in `refresh_session` after the token's family is read and before the user lock. Only a live token (not revoked, not expired) is counted: a rotated token is never refused with 429 but always reaches the reuse check, so whoever keeps the family's window full (a thief) cannot hide the victim's replay ([RFC 9700 section 4.14.2](https://www.rfc-editor.org/rfc/rfc9700#section-4.14.2)). A refused refresh rotates nothing, takes no lock and leaves the cookie valid. An unknown token never reaches the family limit; it gets 401.
+- **Reset and verification tokens.** 10 attempts per 15 minutes per client address on each of `POST /auth/password/reset` and `POST /auth/email/verify`. Tokens are 256-bit random values, so the limit guards the database, not the token.
+- **Signed-in users.** The verification resend (3 per hour) and the password and email changes (5 per 15 minutes) count per user (`by_user`). A request without a valid token gets 401 and is not counted. The password confirmation still counts towards the account lock. Mails are also limited per recipient, from all accounts together: 3 email-change links an hour to one new address, counted after the password check and before the address is looked up (the 429 does not tell whether it is registered), and 3 verification mails an hour to one address.
+
+- **Admin panel.** The admin login counts 10 attempts per 15 minutes per client address before it compares the credentials; a refused attempt gets sqladmin's normal login failure and logs `admin.login_rate_limited`.
+
+Keys hold no address, username or email in clear text, only an HMAC keyed from `JWT_SECRET_KEY`. When Redis fails the limits let requests through (fail-open), and each process skips Redis for 5 s after an error, so an outage adds about a second to one request per process every 5 s instead of to every request (known issue 31). `rate_limit_fail_open_total` and the log event `rate_limit.fail_open` show it, and the account lock and the admission limiter still work. `RATE_LIMIT_ENABLED=false` outside `dev` and `unittest` logs `rate_limit.disabled` at startup.
 
 ## Serialisation
 
@@ -127,6 +142,8 @@ Implemented:
 
 - Argon2id with parameters from `Settings`, a thread pool with a concurrency limiter, rehash on login, and a dummy verify for unknown and inactive users.
 - Account lockout after 5 failed logins for 15 minutes with an atomic counter, audit-logged, with a mail to the user (at most one a day). The admin lock is indefinite.
+- Rate limits per client address, per address and username, per email address, per user and per session family, counted before any lookup or Argon2; keys stored only as HMACs ([Rate limits](#rate-limits)).
+- A request body limit (`MAX_REQUEST_BODY_BYTES`, 413).
 - An atomic refresh gate in Postgres; reuse of a rotated token revokes the family; refresh and bulk revocations are serialised per user.
 - Session revocation on password reset (all) and password change (all except the caller's); `POST /auth/logout-all`.
 - Tokens (refresh, email) are stored only as SHA-256 hashes; email tokens are atomic and single use.
@@ -140,7 +157,7 @@ Implemented:
 Not yet implemented (see the [Roadmap](../README.md#roadmap)):
 
 - `Secure` flag and `__Secure-` prefix on the refresh cookie (known issue 8).
-- Rate limiting per IP and per account, a request body size limit, a request timeout (D4).
+- A request timeout and a coarse per-address limit at the proxy (deploy round).
 - JWT `iss` and `aud` claims, and removing the `username` claim (personal data inside the token).
 - HSTS (owned by the TLS-terminating proxy) and CSP `frame-ancestors 'none'`.
 - Authentication on `/metrics`.

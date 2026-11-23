@@ -195,7 +195,9 @@ def _change_email(client: TestClient, access: str, current: str) -> Response:
 
 
 class TestPasswordConfirmationLockout:
-    @pytest.mark.usefixtures("captured_emails")
+    # Many requests from one client: this tests the mechanism behind the rate
+    # limits, which must also hold while they are off (fail-open).
+    @pytest.mark.usefixtures("captured_emails", "without_rate_limits")
     @pytest.mark.parametrize("confirm", [_change_password, _change_email])
     def test_wrong_passwords_lock_the_account_like_failed_logins(
         self,

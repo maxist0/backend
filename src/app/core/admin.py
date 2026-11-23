@@ -29,7 +29,9 @@ from starlette.responses import PlainTextResponse, RedirectResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from app.core.config import Environment, Settings
+from app.core.errors import RateLimitedError
 from app.core.logging import get_logger
+from app.core.rate_limiting import by_ip, hit
 
 logger = get_logger(__name__)
 
@@ -164,6 +166,14 @@ class AdminAuth(AuthenticationBackend):
 
     @override
     async def login(self, request: Request) -> bool:
+        client_ip = request.client.host if request.client else None
+        # Before the form and the compare: a refused guess costs nothing, and
+        # sqladmin shows its usual failure for it.
+        try:
+            await hit("admin.login.ip", "10/15 minutes", key=by_ip(request))
+        except RateLimitedError:
+            logger.warning("admin.login_rate_limited", client_ip=client_ip)
+            return False
         form = await request.form()
         username, password = form.get("username"), form.get("password")
         if not isinstance(username, str) or not isinstance(password, str):
@@ -173,7 +183,6 @@ class AdminAuth(AuthenticationBackend):
         password_ok = hmac.compare_digest(
             password.encode(), self._password.get_secret_value().encode()
         )
-        client_ip = request.client.host if request.client else None
         if username_ok and password_ok:
             request.session.update({"admin": True})
             # The configured admin name is not a user's personal data; a

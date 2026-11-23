@@ -59,10 +59,10 @@ The names that exist in the code (extracted from `src/app` on 2026-11-22; run `g
 | Area | Events |
 |---|---|
 | App | `app.startup`, `app.shutdown`, `app.shutdown_complete`, `app.unhandled_exception` |
-| HTTP and health | `http.access`, `health.check_failed` |
+| HTTP and health | `http.access`, `health.check_failed`, `rate_limit.fail_open` (at most once a minute per process, with `policy`, `error_type` and `suppressed`), `rate_limit.disabled` (startup, limits off outside `dev`/`unittest`) |
 | Database and cache | `db.engine_creating`, `db.pool_init`, `db.pool_init_failed`, `db.pool_closed`, `cache.redis_connected`, `cache.connect_failed`, `cache.redis_closed` |
 | Auth | `auth.user_registered`, `auth.register_conflict`, `auth.user_logged_in`, `auth.login_success`, `auth.login_failed`, `auth.login_attempt_unknown_user`, `auth.login_attempt_inactive_account`, `auth.login_attempt_locked_account`, `auth.password_confirmation_failed`, `auth.account_locked`, `auth.account_unlocked`, `auth.token_refreshed`, `auth.token_reuse_detected`, `auth.refresh_denied_account_disabled`, `auth.user_logged_out`, `auth.logout_all`, `auth.password_changed`, `auth.password_rehashed`, `auth.password_reset_completed`, `auth.password_reset_refused_account_blocked`, `auth.email_change_requested`, `auth.email_change_conflict`, `auth.email_changed`, `auth.email_verified`, `auth.email_token_refused_account_blocked`, `auth.verification_email_resent`, `auth.email_enqueue_failed`, `auth.cleanup_done`, `auth.optional_auth_failed`, `jwt.decode_error`, `jwt.invalid_token`, `jwt.token_expired` |
-| Admin | `admin.login_succeeded`, `admin.login_failed`, `admin.cross_site_request_rejected`, `admin.user_locked`, `admin.user_unlocked`, `admin.user_deactivated`, `admin.user_reactivated`, `admin.password_change_forced`, `admin.session_revoked` |
+| Admin | `admin.login_succeeded`, `admin.login_failed`, `admin.login_rate_limited`, `admin.cross_site_request_rejected`, `admin.user_locked`, `admin.user_unlocked`, `admin.user_deactivated`, `admin.user_reactivated`, `admin.password_change_forced`, `admin.session_revoked` |
 | Mail | `mail.configured`, `mail.not_configured`, `email.sent`, `email.not_sent` (with `reason`), `email.send_failed` |
 | Tasks | `taskiq.heartbeat`, `taskiq.broker_unavailable`, `taskiq.broker_reconnected` |
 

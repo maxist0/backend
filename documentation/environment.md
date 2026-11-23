@@ -34,6 +34,7 @@ Outside `dev` and `unittest` the application refuses to start when:
 
 - `JWT_SECRET_KEY` is the public default or shorter than 32 characters;
 - `FRONTEND_URL` is the development default (`http://localhost:5173`) or does not use `https`, because email links carry tokens;
+- `FORWARDED_ALLOW_IPS` contains `*` or a catch-all network (`0.0.0.0/0`, `::/0`): uvicorn would then take any client's `X-Forwarded-For` as its address, so every per-address rate limit and every logged IP would be client-controlled;
 - the admin panel is enabled and `ADMIN_PASSWORD` or `ADMIN_SECRET_KEY` is a public default or shorter than 32 characters.
 
 The error names the variables, not their values. Independent of the environment, the validators also refuse `CORS_ORIGINS` entries that are `*` or carry a path, a `DATABASE_URL` with another driver than psycopg, and Argon2 costs below the OWASP minimum.
@@ -42,7 +43,7 @@ The error names the variables, not their values. Independent of the environment,
 
 | Secret | Variable | Notes |
 |---|---|---|
-| JWT signing key | `JWT_SECRET_KEY` | 256 bits of randomness. The algorithm is HS256, pinned in code. Changing it invalidates every access token already issued |
+| JWT signing key | `JWT_SECRET_KEY` | 256 bits of randomness. The algorithm is HS256, pinned in code. Changing it invalidates every access token already issued. A key derived from it (fixed label, domain-separated) also keys the HMACs that stand for addresses, usernames and email addresses in the rate-limit keys, so a change starts every rate-limit window afresh |
 | Admin password and session key | `ADMIN_PASSWORD`, `ADMIN_SECRET_KEY` | only checked when the admin panel is enabled |
 | Database | `DATABASE_URL` (contains the password) | the password is masked in logs |
 | Redis | `CACHE_PASSWORD`, and the passwords inside `TASKIQ_BROKER_URL` and `TASKIQ_RESULT_BACKEND_URL` | |
@@ -57,7 +58,7 @@ The error names the variables, not their values. Independent of the environment,
 
 **Development.** `docker compose -f compose.dev.yaml up -d --wait`, then `run.py dev` ([README → Quick start](../README.md#quick-start)). The defaults match the compose file. Use a second compose project and other ports for experiments that must not touch your data: `DEV_POSTGRES_PORT` and `DEV_REDIS_PORT`, with matching `DATABASE_URL`, `CACHE_PORT` and `TASKIQ_*_URL`.
 
-**Tests.** `tests/conftest.py` sets `ENVIRONMENT=unittest` and `ADMIN_ENABLED=true` and points every service address at a closed port. The integration fixtures then wire the Testcontainers addresses. See [testing.md](testing.md).
+**Tests.** `tests/conftest.py` sets `ENVIRONMENT=unittest` and `ADMIN_ENABLED=true` and points every service address at a closed port. The integration fixtures then wire the Testcontainers addresses. Rate limits stay on in the tests; Redis is flushed before each test. See [testing.md](testing.md).
 
 **Test and prod.** The runtime injects every variable. They differ from `dev` in the table above and from each other only in what you set: `prod` hides the API docs. See [docker.md](docker.md).
 

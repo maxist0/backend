@@ -1,9 +1,10 @@
-"""The request middleware: request id, access log, HTTP metrics, security headers.
+"""The request middleware: request id, access log, metrics, headers, body limit.
 
 One pure ASGI middleware. It runs in the request's own task, so the request
 id it binds is in every log line and problem response of the request. It
-also renders the 500 for an unhandled exception, so that response gets the
-same headers, metrics and access log as every other one.
+also renders the 500 for an unhandled exception and the 413 for a body above
+the limit, so those responses get the same headers, metrics and access log
+as every other one.
 
 `create_app` adds it inside Starlette's `CORSMiddleware`: the 500 rendered
 here passes CORS on the way out and keeps the CORS headers. CORS preflights
@@ -21,7 +22,12 @@ from prometheus_client import Counter, Histogram
 from starlette.datastructures import MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from app.core.errors import internal_error_response, log_unexpected_error
+from app.core.errors import (
+    BodyTooLargeError,
+    body_too_large_response,
+    internal_error_response,
+    log_unexpected_error,
+)
 from app.core.health import METRICS_PATH
 from app.core.logging import get_logger
 
@@ -77,8 +83,24 @@ def request_id_from(scope: Scope) -> str:
     return str(uuid.uuid4())
 
 
+def content_length_of(scope: Scope) -> int | None:
+    """The declared `Content-Length`, or None if absent or not a number.
+
+    The server refuses a malformed value before the app sees the request;
+    without one (a chunked body) only the received bytes count.
+    """
+    headers: Iterable[tuple[bytes, bytes]] = scope["headers"]
+    for name, value in headers:
+        if name == b"content-length":
+            try:
+                return int(value)
+            except ValueError:
+                return None
+    return None
+
+
 class RequestMiddleware:
-    """Request id, access log, HTTP metrics and security headers for HTTP requests.
+    """Request id, access log, HTTP metrics, security headers and the body limit.
 
     Args:
         app: The wrapped ASGI app.
@@ -87,15 +109,26 @@ class RequestMiddleware:
         access_log: Emit one `http.access` event per request.
         metrics: Record `http_requests_total` and
             `http_request_duration_seconds` (never for `/metrics` itself).
+        max_body_bytes: Largest request body accepted. A larger declared
+            `Content-Length` is answered with 413 before the app runs; a body
+            without one (chunked) is cut off with 413 once the bytes read
+            exceed the limit.
     """
 
     def __init__(
-        self, app: ASGIApp, *, api_prefix: str, access_log: bool, metrics: bool
+        self,
+        app: ASGIApp,
+        *,
+        api_prefix: str,
+        access_log: bool,
+        metrics: bool,
+        max_body_bytes: int,
     ) -> None:
         self.app = app
         self.api_prefix = api_prefix
         self.access_log = access_log
         self.metrics = metrics
+        self.max_body_bytes = max_body_bytes
         # id(route) -> full path template; built on the first request, when
         # every route is registered. Keyed by id because Starlette routes
         # define __eq__ and are unhashable; the app keeps them alive.
@@ -130,8 +163,28 @@ class RequestMiddleware:
                     headers["Cache-Control"] = "no-store"
             await send(message)
 
+        received = 0
+
+        async def receive_with_limit() -> Message:
+            nonlocal received
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > self.max_body_bytes:
+                    raise BodyTooLargeError
+            return message
+
         try:
-            await self.app(scope, receive, send_with_headers)
+            declared = content_length_of(scope)
+            if declared is not None and declared > self.max_body_bytes:
+                await body_too_large_response()(scope, receive, send_with_headers)
+            else:
+                await self.app(scope, receive_with_limit, send_with_headers)
+        except BodyTooLargeError:
+            # Only a body read outside FastAPI's routing (no exception
+            # handler on the way) gets here; a started response cannot change.
+            if not response_started:
+                await body_too_large_response()(scope, receive, send_with_headers)
         except Exception as exc:  # noqa: BLE001 - this is the app's last error boundary
             # Not re-raised: the server would log it a second time, with the
             # database error text that log_unexpected_error leaves out.

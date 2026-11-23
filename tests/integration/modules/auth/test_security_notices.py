@@ -207,6 +207,9 @@ class TestAccountLockedNotice:
         assert captured_emails == []
         assert _not_sent_reasons(caplog, "account_locked") == ["admin_locked"]
 
+    # Many requests from one client: this tests the mechanism behind the rate
+    # limits, which must also hold while they are off (fail-open).
+    @pytest.mark.usefixtures("without_rate_limits")
     def test_throttle_holds_across_two_locks_and_ends_after_a_day(
         self,
         client: TestClient,
@@ -642,6 +645,9 @@ class TestRelockAfterAnExpiredLock:
         # The second notice is enqueued and throttled by the first one.
         assert _not_sent_reasons(caplog, "account_locked") == ["recently_notified"]
 
+    # Many requests from one client: this tests the mechanism behind the rate
+    # limits, which must also hold while they are off (fail-open).
+    @pytest.mark.usefixtures("without_rate_limits")
     def test_password_confirmations_lock_again(
         self,
         client: TestClient,

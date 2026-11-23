@@ -58,6 +58,27 @@ _HOSTNAME = re.compile(
 )
 
 
+def _trusts_every_proxy(forwarded_allow_ips: str) -> bool:
+    """Whether the value lets any client set its own address.
+
+    uvicorn takes the client address from `X-Forwarded-For` of a trusted
+    peer. Trusting every peer (`*` or a catch-all network) hands that choice
+    to the client, so every per-address rate limit and the audit IPs become
+    whatever the client sends.
+    """
+    for raw in forwarded_allow_ips.split(","):
+        entry = raw.strip()
+        if entry == "*":
+            return True
+        try:
+            network = ipaddress.ip_network(entry, strict=False)
+        except ValueError:
+            continue
+        if network.prefixlen == 0:
+            return True
+    return False
+
+
 def _installed_version() -> str:
     """Return the installed distribution version, or a visible sentinel."""
     try:
@@ -187,6 +208,11 @@ class Settings(BaseSettings):
     LOGIN_MAX_ATTEMPTS: int = Field(default=5, ge=1, le=100)
     LOGIN_LOCKOUT_SECONDS: int = Field(default=900, ge=1, le=86_400)
 
+    # Rate limits of the routes (policies are in code next to the routes).
+    # Off only for diagnosis: the limits are the main control against
+    # credential guessing and mail flooding.
+    RATE_LIMIT_ENABLED: bool = True
+
     # Days that ended refresh sessions and closed email tokens are kept
     # before the nightly cleanup task deletes them. They hold IP addresses,
     # user agents and old or requested email addresses, so they are not
@@ -240,6 +266,12 @@ class Settings(BaseSettings):
     # Browser origins allowed to call the API with credentials (CORS). A JSON
     # list in the environment: CORS_ORIGINS='["https://app.example.com"]'.
     CORS_ORIGINS: list[str] = ["http://localhost:5173"]
+
+    # Largest accepted request body (413 above it). The API takes JSON and
+    # forms of a few kilobytes; 1 KiB still fits every built-in request, and
+    # 100 MiB keeps a typo from switching the limit off. Large uploads belong
+    # in object storage, not in a request body.
+    MAX_REQUEST_BODY_BYTES: int = Field(default=1_048_576, ge=1_024, le=104_857_600)
 
     # Server
     HOST: str = "0.0.0.0"  # noqa: S104 - a container must accept the proxy's connections
@@ -325,8 +357,9 @@ class Settings(BaseSettings):
     def _refuse_insecure_defaults(self) -> Self:
         """Startup guard: no public defaults outside dev and unittest.
 
-        Covers the secrets and `FRONTEND_URL`, which must be an https URL
-        other than the dev server: email links carry tokens. Admin secrets
+        Covers the secrets, `FRONTEND_URL`, which must be an https URL
+        other than the dev server (email links carry tokens), and
+        `FORWARDED_ALLOW_IPS`, which must not trust every peer. Admin secrets
         are only checked when the admin panel is enabled, because they are
         not used otherwise.
         """
@@ -345,6 +378,11 @@ class Settings(BaseSettings):
             problems.append("FRONTEND_URL is the development default")
         elif not self.FRONTEND_URL.startswith("https://"):
             problems.append("FRONTEND_URL must use https")
+        if _trusts_every_proxy(self.FORWARDED_ALLOW_IPS):
+            problems.append(
+                "FORWARDED_ALLOW_IPS trusts every address ('*', 0.0.0.0/0 or ::/0); "
+                "list the reverse proxy's addresses"
+            )
         if self.admin_enabled:
             admin_secrets = (
                 ("ADMIN_PASSWORD", self.ADMIN_PASSWORD, _DEFAULT_ADMIN_PASSWORD),
